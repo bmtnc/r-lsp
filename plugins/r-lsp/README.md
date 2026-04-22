@@ -21,6 +21,6 @@ Rscript --vanilla -e 'install.packages("lintr", repos = "https://cloud.r-project
 ## Installation
 
 ```
-/plugin marketplace add bmtnc/r-lsp-setup
+/plugin marketplace add bmtnc/r-lsp
 /plugin install r-lsp
 ```

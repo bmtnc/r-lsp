@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "r-lsp-setup",
+  "name": "r-lsp",
   "version": "1.0.0",
   "description": "R language server for Claude Code with renv support.",
   "owner": {

@@ -39,7 +39,7 @@ Rscript --vanilla -e 'install.packages("lintr", repos = "https://cloud.r-project
 In Claude Code, run:
 
 ```
-/plugin marketplace add bmtnc/r-lsp-setup
+/plugin marketplace add bmtnc/r-lsp
 /plugin install r-lsp
 ```
 
@@ -54,7 +54,7 @@ Open any R project and ask Claude Code to hover over a function. If you get docu
 ## Repository structure
 
 ```
-r-lsp-setup/
+r-lsp/
 ├── .claude-plugin/
 │   └─��� marketplace.json        # Marketplace manifest
 ├── plugins/
@@ -65,7 +65,7 @@ r-lsp-setup/
 │       ├── bin/
 │       │   └── r-lsp-wrapper   # Wrapper script (renv-aware)
 │       └── README.md
-└── r-lsp-setup.md              # This file
+└── README.md                   # This file
 ```
 
 ## How it works
