@@ -1,0 +1,37 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "r-lsp-setup",
+  "version": "1.0.0",
+  "description": "R language server for Claude Code with renv support.",
+  "owner": {
+    "name": "Barry Matanic",
+    "url": "https://github.com/bmtnc"
+  },
+  "plugins": [
+    {
+      "name": "r-lsp",
+      "version": "1.0.0",
+      "source": "./plugins/r-lsp",
+      "description": "R language server for Claude Code with renv support. Provides diagnostics, hover, go-to-definition, find-references, and outgoing calls for R, R Markdown, and Quarto files.",
+      "category": "development",
+      "tags": ["r", "lsp", "language-server", "renv"],
+      "author": {
+        "name": "Barry Matanic",
+        "url": "https://github.com/bmtnc"
+      },
+      "lspServers": {
+        "r": {
+          "command": "${CLAUDE_PLUGIN_ROOT}/bin/r-lsp-wrapper",
+          "args": [],
+          "extensionToLanguage": {
+            ".R": "r",
+            ".Rmd": "rmd",
+            ".qmd": "rmd"
+          },
+          "startupTimeout": 60000,
+          "maxRestarts": 3
+        }
+      }
+    }
+  ]
+}

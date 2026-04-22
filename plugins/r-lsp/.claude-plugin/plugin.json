@@ -1,0 +1,9 @@
+{
+  "name": "r-lsp",
+  "version": "1.0.0",
+  "description": "R language server for Claude Code with renv support.",
+  "author": {
+    "name": "Barry Matanic",
+    "url": "https://github.com/bmtnc"
+  }
+}

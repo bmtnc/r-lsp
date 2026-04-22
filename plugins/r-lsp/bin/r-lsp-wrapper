@@ -1,0 +1,32 @@
+#!/bin/bash
+# R LSP wrapper for Claude Code.
+#
+# Launches the R language server with renv-aware library paths.
+# --vanilla prevents renv from hijacking .libPaths() at startup (before
+# the workspace root is known). A patch on the initialized handler
+# activates renv once the LSP learns the project root, giving it
+# visibility into both the project's renv library (pinned versions)
+# and the global library (where languageserver is installed).
+
+exec R --vanilla --no-echo -e "
+  original <- languageserver:::on_initialized
+  patched <- function(self, params) {
+    if (!is.null(self\$rootPath)) {
+      af <- file.path(self\$rootPath, 'renv', 'activate.R')
+      if (file.exists(af)) {
+        gl <- .libPaths()
+        old_wd <- getwd()
+        setwd(self\$rootPath)
+        sink(stderr())
+        tryCatch(
+          suppressMessages(source(af, echo = FALSE, print.eval = FALSE)),
+          finally = { sink(); setwd(old_wd) }
+        )
+        .libPaths(c(.libPaths(), gl))
+      }
+    }
+    original(self, params)
+  }
+  assignInNamespace('on_initialized', patched, ns = 'languageserver')
+  languageserver::run()
+"

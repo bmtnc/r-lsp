@@ -1,0 +1,13 @@
+{
+  "r": {
+    "command": "${CLAUDE_PLUGIN_ROOT}/bin/r-lsp-wrapper",
+    "args": [],
+    "extensionToLanguage": {
+      ".R": "r",
+      ".Rmd": "rmd",
+      ".qmd": "rmd"
+    },
+    "startupTimeout": 60000,
+    "maxRestarts": 3
+  }
+}
