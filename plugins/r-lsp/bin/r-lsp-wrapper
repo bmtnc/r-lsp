@@ -7,6 +7,25 @@
 # activates renv once the LSP learns the project root, giving it
 # visibility into both the project's renv library (pinned versions)
 # and the global library (where languageserver is installed).
+#
+# Multi-repo note: Claude Code runs ONE language server per session,
+# rooted at the session's launch directory, and the R `languageserver`
+# package only *indexes* that single root. So cross-file navigation
+# (go-to-definition / find-references / workspace-symbol) only works for
+# the repo you launched the session in. For full intelligence across
+# several repos, run one session per repo (see README).
+#
+# What the didOpen patch below CAN do for a single session: when a file
+# from a *different* renv project is opened, resolve that project's renv
+# library and append it to .libPaths(), so package-aware diagnostics and
+# hover for that file resolve against the right packages instead of
+# emitting spurious "no such package / object" errors. It does NOT enable
+# cross-repo navigation (that needs the repo to be the indexed root).
+#
+# We resolve the library path with renv::paths$library() rather than
+# sourcing each project's renv/activate.R: activation assumes one project
+# per R session and starts a watchdog, so re-activating per file would
+# corrupt renv state and leak processes. Path resolution is side-effect free.
 
 exec R --vanilla --no-echo -e "
   original <- languageserver:::on_initialized
@@ -28,5 +47,37 @@ exec R --vanilla --no-echo -e "
     original(self, params)
   }
   assignInNamespace('on_initialized', patched, ns = 'languageserver')
+
+  # Per-file renv library resolution for files outside the indexed root.
+  # Wrapped so a future languageserver that renames these internals disables
+  # this convenience rather than failing to start the whole server.
+  tryCatch({
+    seen_roots <- new.env(parent = emptyenv())
+    orig_open <- languageserver:::text_document_did_open
+    patched_open <- function(self, params) {
+      tryCatch({
+        uri <- params\$textDocument\$uri
+        if (!is.null(uri) && requireNamespace('renv', quietly = TRUE)) {
+          path <- languageserver:::path_from_uri(uri)
+          dir <- dirname(path)
+          root <- NULL
+          while (nzchar(dir) && dir != dirname(dir)) {
+            if (file.exists(file.path(dir, 'renv', 'activate.R'))) { root <- dir; break }
+            dir <- dirname(dir)
+          }
+          if (!is.null(root) && is.null(seen_roots[[root]])) {
+            seen_roots[[root]] <- TRUE
+            lib <- tryCatch(renv::paths\$library(project = root), error = function(e) NULL)
+            if (!is.null(lib) && dir.exists(lib) && !(lib %in% .libPaths())) {
+              .libPaths(c(.libPaths(), lib))
+            }
+          }
+        }
+      }, error = function(e) NULL)
+      orig_open(self, params)
+    }
+    assignInNamespace('text_document_did_open', patched_open, ns = 'languageserver')
+  }, error = function(e) NULL)
+
   languageserver::run()
 "
