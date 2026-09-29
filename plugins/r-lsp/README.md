@@ -12,11 +12,7 @@ Install the [`languageserver`](https://github.com/REditorSupport/languageserver)
 Rscript --vanilla -e 'install.packages("languageserver", repos = "https://cloud.r-project.org")'
 ```
 
-Optionally install [`lintr`](https://github.com/r-lib/lintr) globally for linting diagnostics:
-
-```bash
-Rscript --vanilla -e 'install.packages("lintr", repos = "https://cloud.r-project.org")'
-```
+This also installs [`lintr`](https://github.com/r-lib/lintr), which produces the diagnostics.
 
 If diagnostics report `.onLoad failed in loadNamespace() for 'lintr'` naming a
 missing package (e.g. `there is no package called 'lazyeval'`), a transitive
@@ -25,6 +21,15 @@ dependency is absent from your global library — install the named package:
 ```bash
 Rscript --vanilla -e 'install.packages("lazyeval", repos = "https://cloud.r-project.org")'
 ```
+
+## Diagnostics
+
+In projects without a `.lintr` file, diagnostics use the plugin's profile (`lintr/agent_linters.R`):
+likely bugs only, no style. It understands tidyverse code: `library(tidyverse)`
+attaches its core packages, and bare column names in dplyr/tidyr/ggplot2 calls are
+not reported. It flags deprecated and superseded functions, and functions missing
+from the package versions renv pins for the project. Set `R_LSP_AGENT_LINTERS=false`
+to use lintr's defaults instead. See the repository README for details.
 
 ## Installation
 

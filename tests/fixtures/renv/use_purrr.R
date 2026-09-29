@@ -1,0 +1,5 @@
+library(purrr)
+parts <- map_dfr(1:3, function(i) data.frame(i = i))
+stacked <- list_rbind(map(1:3, function(i) data.frame(i = i)))
+g <- function(xs) purrr::list_rbind(xs)
+h <- function(xs) list_rbind(xs)

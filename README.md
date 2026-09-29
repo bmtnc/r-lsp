@@ -8,7 +8,7 @@ An LSP (Language Server Protocol) gives Claude Code a direct line to R's own par
 
 The practical difference: Claude makes fewer mistakes, finds things faster, and catches errors earlier. It understands your code structurally — which packages you use, what functions they export, how your functions relate to each other — rather than just pattern-matching against text.
 
-Gives Claude Code live diagnostics, hover documentation, go-to-definition, find-references, and completions for R code. Works with renv projects — the LSP sees your pinned package versions, not just globally installed packages.
+Gives Claude Code live diagnostics, hover documentation, go-to-definition, find-references, and completions for R code. Works with renv projects — the LSP sees your pinned package versions, not just globally installed packages. Diagnostics report likely bugs only, and understand tidyverse code (see [Diagnostics](#diagnostics)).
 
 ## Setup
 
@@ -28,11 +28,7 @@ Rscript --vanilla -e 'install.packages("languageserver", repos = "https://cloud.
 
 `--vanilla` is important — without it, running this inside an renv project would install into the project library instead of the global library.
 
-Optionally, install `lintr` for linting diagnostics:
-
-```bash
-Rscript --vanilla -e 'install.packages("lintr", repos = "https://cloud.r-project.org")'
-```
+This also installs `lintr`, which produces the diagnostics.
 
 ### Step 2: Install the plugin
 
@@ -56,7 +52,7 @@ Open any R project and ask Claude Code to hover over a function. If you get docu
 ```
 r-lsp/
 ├── .claude-plugin/
-│   └─��� marketplace.json        # Marketplace manifest
+│   └── marketplace.json        # Marketplace manifest
 ├── plugins/
 │   └── r-lsp/
 │       ├── .claude-plugin/
@@ -64,7 +60,16 @@ r-lsp/
 │       ├── .lsp.json           # LSP server config
 │       ├── bin/
 │       │   └── r-lsp-wrapper   # Wrapper script (renv-aware)
+│       ├── lintr/
+│       │   ├── agent_linters.R # Diagnostics profile (bugs only, tidyverse-aware)
+│       │   └── user-config/    # Points lintr at the profile
 │       └── README.md
+├── tests/
+│   ├── smoke_test.py           # End-to-end test through the LSP
+│   ├── lsp_client.py           # Minimal LSP client used by the test
+│   └── fixtures/
+├── .github/workflows/
+│   └── smoke-test.yml          # Runs the test on push and weekly
 └── README.md                   # This file
 ```
 
@@ -74,20 +79,45 @@ The R language server (`REditorSupport/languageserver`) communicates with Claude
 
 The wrapper script solves a problem with renv: the LSP process starts before it knows which project you're working on, so renv can't activate at startup. The wrapper patches the server's initialization handler to activate renv once the project root is known, giving the LSP visibility into both the project's renv library (pinned versions) and the global library (where `languageserver` is installed).
 
-For projects without renv, the wrapper has no effect — the LSP uses the global library as normal.
+For projects without renv, the renv part has no effect — the LSP uses the global library as normal.
+
+The wrapper also points lintr at the plugin's diagnostics profile (see [Diagnostics](#diagnostics)).
 
 ## What this gives Claude Code
 
-- **Diagnostics**: After every `.R` file edit, reports syntax errors, warnings, and linting issues (if `lintr` is installed globally).
+- **Diagnostics**: After every `.R` file edit, reports syntax errors and likely bugs (see [Diagnostics](#diagnostics)).
 - **Hover**: Documentation for any function, including from renv-pinned packages.
 - **Go-to-definition**: Jump to where a function is defined within the package's `R/` directory.
 - **Find references**: Find all usages of a function within `R/`.
 - **Completions**: Function and symbol name completions based on what's in scope.
 - **Outgoing calls**: Trace which functions a given function calls, including namespaced calls like `dplyr::mutate()`.
 
+## Diagnostics
+
+When a project has no `.lintr` file (and you have no `~/.lintr`), diagnostics come from the plugin's profile in `plugins/r-lsp/lintr/agent_linters.R` instead of lintr's defaults. lintr's defaults are mostly style rules. For an agent those are noise: they push Claude to reformat code it wasn't asked to touch, and they bury real errors. On a 44-line tidyverse script, the defaults gave 49 diagnostics, and 48 were false or style-only. The profile gives 10, all real.
+
+The profile reports:
+
+- **Undefined functions**, in top-level script code as well as inside functions: `could not find function "filterr"`. lintr's own check only looks inside function bodies. Names defined anywhere in the project count as defined, so helpers from another script don't trigger it.
+- **Undefined variables** inside functions, and **non-exported** `pkg::fun` calls.
+- **Deprecated, defunct and superseded functions**, judged against the version installed for the project. The profile reads each function's `lifecycle` signal (or its help page badge), e.g. `cur_data() is deprecated as of dplyr 1.1.0; use pick() instead`. Superseded functions show as information (they still work), deprecated as warnings, defunct as errors.
+- **Functions missing from the project's pinned version**, e.g. `list_rbind() is not in purrr 0.3.5, the version installed for this project`. This catches new APIs written into a project that renv pins to an older release.
+- lintr's `correctness` and `common_mistakes` rules: `x == NA`, missing packages, duplicate arguments, and similar.
+
+It understands tidyverse code:
+
+- `library(tidyverse)` (and other meta-packages built the same way, like `tidymodels`) attaches its core packages, so `mutate()`, `ggplot()` and `%>%` are known.
+- Bare column names inside dplyr, tidyr, ggplot2 and similar calls are not reported. Undefined *functions* inside those calls still are.
+- Variables used only inside glue or cli strings (`"{n} rows"`) are not reported as unused.
+- cli-style message bullets (`c(i = "...", i = "...")`) are not reported as duplicate arguments.
+
+To turn the profile off and get lintr's defaults, set `R_LSP_AGENT_LINTERS=false` in the environment Claude Code runs in. A project `.lintr` always wins, and so does `~/.lintr`. The profile is found through `R_USER_CONFIG_DIR`, so while it is active lintr does not read a user config at `~/.config/R/lintr/config`; move that to `~/.lintr` to keep it. If you set `R_USER_CONFIG_DIR` yourself, the wrapper leaves it alone and the profile is not used.
+
 ## Known limitations
 
-- **`R/` only**: The language server indexes `R/` in R packages. Functions defined in `scripts/` or `tests/` are not included in workspace-wide queries like find-references.
+- **References cover `R/`, open files and `source()`d files**: Since `languageserver` 0.3.19, workspace symbol search covers every `.R` file in the project, packages or not. Find-references and go-to-definition still only see a package's `R/` directory, files that are open, and files linked by static `source()` calls. Calls in unopened `tests/` or `scripts/` files are missed.
+- **No argument checks**: A wrong argument name or too many arguments (`f(a = 1, bb = 2)`) is not reported.
+- **Dynamic scope**: Files that use `attach()`, `list2env()`, `sys.source()` or `box::use()`, or that load a package that isn't installed, skip the undefined-function check. The check can't know what those put in scope.
 - **Single workspace**: Each LSP instance serves one project. It can't cross-reference between two of your packages simultaneously.
 - **Hover gaps**: Some namespaced calls may not return hover docs depending on how the package structures its help pages.
 
@@ -131,32 +161,28 @@ There are five layers between Claude Code and R code intelligence:
 1. `setwd(self$rootPath)` — changes to the project directory (renv determines its project from the working directory)
 2. `source(renv/activate.R)` — activates renv, which sets `.libPaths()` to the project library
 3. Appends the global library back to `.libPaths()` — so `languageserver` (and its dependencies) remain findable
-4. Restores the original working directory
-5. Calls the original `on_initialized` handler
+4. Puts a private library first on `.libPaths()`, holding symlinks to `languageserver` and everything it imports, so a project that pins an old `lintr`, `xml2`, etc. in renv cannot break the server
+5. Restarts the idle helper processes (see below)
+6. Restores the original working directory
+7. Calls the original `on_initialized` handler
+
+**Helper processes:** `languageserver` parses files and runs lintr in separate R processes (callr sessions). They start with the server, before renv is activated, and keep the library paths they started with. Without a restart, diagnostics never see the renv library. Every function from a renv-only package is reported as "no visible global function definition", and hover fails on functions attached with `library()`. After changing `.libPaths()`, the wrapper retires the helpers that aren't running a task, and their replacements inherit the new paths.
+
+**Versions the server loads itself:** A helper process loads `languageserver` and its imports, such as purrr, stringr, rlang and cli, from the global library, and R can't load two versions of a package in one process. So the diagnostics profile reads package facts (exports, lifecycle stage, version) from the project's installed copy on disk, not from what is loaded.
 
 **Critical detail — stdout protection:** renv's `activate.R` can produce output. The LSP communicates over stdout using JSON-RPC, so any stray output corrupts the protocol (symptoms: `Header must provide a Content-Length property` errors, concatenated responses). The wrapper uses `sink(stderr())` to redirect all output during activation.
 
 ### What the LSP indexes
 
-The `load_workspace` function in `languageserver` is hardcoded to scan only `R/`:
+Since `languageserver` 0.3.19 (setting `index_mode`, default `"auto"`), indexing has two levels:
 
-```r
-source_dir <- file.path(workspace$root, "R")
-files <- list.files(source_dir, pattern = "\\.r$", ignore.case = TRUE)
-```
-
-And it only runs for R packages:
-
-```r
-if (!is_package(workspace$root)) { return(invisible(NULL)) }
-```
+- **Full parse**: a package's `R/` files, open files, and files linked by static `source()` calls. These feed find-references, go-to-definition, incoming calls and completion.
+- **Shallow summary**: every other `.R` file in the workspace, packages or not. The summary stores definitions and `source()` edges but not call sites. So those files appear in workspace symbol search, but calls inside them are not found by find-references.
 
 This means:
-- `scripts/`, `tests/`, `inst/` are never indexed
-- Non-package projects (no `DESCRIPTION` file) get no workspace indexing at all
-- `findReferences`, `incomingCalls`, and `workspaceSymbol` only cover `R/`
-- Individual files outside `R/` still get local analysis (diagnostics, document symbols) when opened, but aren't part of cross-file queries
-- There is no configuration option to change which directories are indexed — it's baked into the `languageserver` source code
+- `workspaceSymbol` covers the whole project
+- `findReferences` and `incomingCalls` miss calls in unopened `tests/` and `scripts/` files. For example, find-references on dplyr's `compute_by()` returns the 10 uses in `R/` and none of the ~20 in `tests/`
+- The only index settings are `index_mode` (`"auto"` or `"off"`) and include/exclude globs; there is no "fully parse everything" mode
 
 ### How namespace resolution works
 
@@ -177,13 +203,13 @@ For hover on `pkg::fun()`:
 - `documentSymbol` — listing functions in any `.R` file
 - `hover` — documentation for local functions and `pkg::fun()` namespaced calls (with renv fix)
 - `goToDefinition` — for functions defined in the project's `R/` directory
-- `findReferences` — within `R/` only
+- `findReferences` — within `R/`, open files and `source()`d files
 - `outgoingCalls` — traces calls including through `pkg::fun()` namespaced calls (with renv fix)
 - `diagnostics` — syntax errors and lintr warnings after every edit
 - `completions` — function names, parameters, symbols in scope
 
 **Does not work:**
-- `findReferences` across `scripts/` or `tests/` — those directories are not indexed
+- `findReferences` into unopened `scripts/` or `tests/` files — those get only a shallow summary
 - `goToDefinition` into external package source — jumps to the installed copy, not a local clone
 - Multi-root workspace — `workspace/didChangeWorkspaceFolders` is a no-op in `languageserver`
 - `hover` on column names inside tidy evaluation (e.g., `mutate(data, new_col = old_col + 1)`) — `old_col` is data-masked, not a real R symbol, so static analysis can't resolve it
@@ -219,6 +245,15 @@ To confirm the LSP can see renv packages, not just global ones:
 
 ### Dependencies
 
-The only external dependency is the `languageserver` R package (and its dependency `collections`). Both are on CRAN. No marketplace, no fork, no custom builds. The wrapper script is plain bash. The plugin config is plain JSON.
+The only external dependency is the `languageserver` R package, from CRAN; it installs `lintr` and its other dependencies. No fork, no custom builds. The wrapper script is plain bash, the diagnostics profile is plain R, and the plugin config is plain JSON.
 
-If `lintr` is installed globally, the language server will use it for linting diagnostics. This is optional — without it, you still get syntax error detection but not style/quality warnings.
+### Testing
+
+`tests/smoke_test.py` starts the wrapper on scratch projects and talks to it over LSP, the way Claude Code does. It checks planted bugs, a tidyverse script, renv-only packages, a project pinning an old `lintr`, and a project pinning an old `purrr`. It needs R with `languageserver`, `lintr` and `renv` installed (plus `tidyverse` for the tidyverse scenario):
+
+```bash
+python3 tests/smoke_test.py            # all scenarios
+python3 tests/smoke_test.py -k renv    # scenarios whose name contains "renv"
+```
+
+CI runs it on every push and weekly, because a new `languageserver` release can break the wrapper's patches without any change here. Set `R_LSP_WRAPPER` to test a different wrapper script.

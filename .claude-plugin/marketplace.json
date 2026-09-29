@@ -10,9 +10,9 @@
   "plugins": [
     {
       "name": "r-lsp",
-      "version": "1.0.0",
+      "version": "1.2.0",
       "source": "./plugins/r-lsp",
-      "description": "R language server for Claude Code with renv support. Provides diagnostics, hover, go-to-definition, find-references, and outgoing calls for R, R Markdown, and Quarto files.",
+      "description": "R language server for Claude Code with renv support. Provides tidyverse-aware bug diagnostics, hover, go-to-definition, find-references, and outgoing calls for R, R Markdown, and Quarto files.",
       "category": "development",
       "tags": ["r", "lsp", "language-server", "renv"],
       "author": {

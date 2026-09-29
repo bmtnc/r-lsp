@@ -8,6 +8,18 @@
 # visibility into both the project's renv library (pinned versions)
 # and the global library (where languageserver is installed).
 #
+# The server runs parsing and linting in helper R processes (callr
+# sessions). Those start before renv is activated and keep the library
+# paths they started with, so after changing .libPaths() the wrapper
+# retires the idle helpers; their replacements inherit the new paths.
+# Without this, diagnostics and library()-attached symbols never see the
+# renv library.
+#
+# The server's own packages (languageserver and everything it imports) are
+# put first on the library path, ahead of the renv library, through a
+# private library of symlinks. Otherwise a project that pins an old lintr,
+# xml2, etc. in renv breaks every diagnostics run.
+#
 # Multi-repo note: Claude Code runs ONE language server per session,
 # rooted at the session's launch directory, and the R `languageserver`
 # package only *indexes* that single root. So cross-file navigation
@@ -26,14 +38,60 @@
 # sourcing each project's renv/activate.R: activation assumes one project
 # per R session and starts a watchdog, so re-activating per file would
 # corrupt renv state and leak processes. Path resolution is side-effect free.
+#
+# Lint profile: when a project has no .lintr (and there is no ~/.lintr),
+# lintr falls back to the plugin's agent profile (lintr/agent_linters.R):
+# likely bugs only, no style, tidyverse-aware. It is found through
+# R_USER_CONFIG_DIR. Set R_LSP_AGENT_LINTERS=false to use lintr's defaults.
+
+SCRIPT="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+PLUGIN_ROOT="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
+export R_LSP_PLUGIN_ROOT="$PLUGIN_ROOT"
+if [ "${R_LSP_AGENT_LINTERS:-true}" != "false" ] && [ -z "${R_USER_CONFIG_DIR:-}" ]; then
+  export R_USER_CONFIG_DIR="$PLUGIN_ROOT/lintr/user-config"
+fi
 
 exec R --vanilla --no-echo -e "
+  # Retire helper sessions that are not running a task, so replacements
+  # start with the current .libPaths(). A busy session keeps its old paths
+  # until the task manager's idle timeout replaces it.
+  refresh_workers <- function(self) {
+    for (tm in list(self\$parse_task_manager, self\$diagnostics_task_manager)) {
+      tryCatch({
+        p <- tm\$.__enclos_env__\$private
+        for (s in p\$sessions) {
+          if (!identical(s\$get_state(), 'busy')) p\$retire_session(s)
+        }
+        p\$ensure_min_sessions()
+      }, error = function(e) NULL)
+    }
+  }
+
+  # Private library holding languageserver and its recursive dependencies,
+  # as symlinks into the library they are installed in.
+  server_lib <- function() {
+    lib <- file.path(tempdir(), 'r-lsp-server-lib')
+    if (dir.exists(lib)) return(lib)
+    dir.create(lib)
+    ip <- installed.packages()
+    ip <- ip[!duplicated(rownames(ip)), , drop = FALSE]
+    deps <- unique(c('languageserver', unlist(tools::package_dependencies(
+      'languageserver', db = ip, recursive = TRUE))))
+    for (p in intersect(deps, rownames(ip))) {
+      if (!identical(unname(ip[p, 'Priority']), 'base')) {
+        file.symlink(file.path(ip[p, 'LibPath'], p), file.path(lib, p))
+      }
+    }
+    lib
+  }
+
   original <- languageserver:::on_initialized
   patched <- function(self, params) {
     if (!is.null(self\$rootPath)) {
       af <- file.path(self\$rootPath, 'renv', 'activate.R')
       if (file.exists(af)) {
         gl <- .libPaths()
+        srv <- tryCatch(server_lib(), error = function(e) NULL)
         old_wd <- getwd()
         setwd(self\$rootPath)
         sink(stderr())
@@ -41,7 +99,10 @@ exec R --vanilla --no-echo -e "
           suppressMessages(source(af, echo = FALSE, print.eval = FALSE)),
           finally = { sink(); setwd(old_wd) }
         )
-        .libPaths(c(.libPaths(), gl))
+        # Server packages first, then the project's renv library, then global.
+        .libPaths(unique(c(srv, .libPaths(), gl)))
+        if (!is.null(srv)) Sys.setenv(R_LSP_SERVER_LIB = srv)
+        refresh_workers(self)
       }
     }
     original(self, params)
@@ -70,6 +131,7 @@ exec R --vanilla --no-echo -e "
             lib <- tryCatch(renv::paths\$library(project = root), error = function(e) NULL)
             if (!is.null(lib) && dir.exists(lib) && !(lib %in% .libPaths())) {
               .libPaths(c(.libPaths(), lib))
+              refresh_workers(self)
             }
           }
         }

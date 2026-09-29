@@ -1,0 +1,5 @@
+Package: lintr
+Title: Fake old lintr
+Version: 2.0.1
+Description: Stand-in for a pinned old lintr.
+License: MIT
