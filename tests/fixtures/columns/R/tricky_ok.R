@@ -1,0 +1,27 @@
+# Correct tidyverse code with the patterns most likely to trip a column checker.
+# r-colcheck must report nothing here.
+library(tidyverse)
+sales <- read_csv("data/sales.csv")
+cols <- c("region", "year")
+f <- function(df, col) df %>% filter({{ col }} > 0) %>% mutate(v = .data[[col]])
+g <- function(by) sales %>% group_by(across(all_of(by))) %>% summarise(t = sum(amount))
+h <- sales %>% mutate(label = glue::glue("{region}-{year}"), region2 = str_to_upper(region))
+i <- sales %>% select(all_of(cols), amount) %>% filter(if_any(everything(), is.na))
+j <- sales %>% filter(.data$amount > 0, !is.na(customer)) %>% mutate(idx = row_number(), grp = cur_group_id())
+k <- sales %>% summarise(across(c(amount, year), mean), .by = region) %>% mutate(zz = amount)
+l <- sales %>% mutate(year = as.integer(year), bucket = case_when(amount > 5 ~ "hi", TRUE ~ "lo"), ratio = amount / threshold2)
+threshold2 <- 3
+m <- sales %>% janitor::clean_names() %>% select(region)
+n2 <- sales %>% rename_with(toupper) %>% select(REGION)
+o <- sales %>% left_join(tibble(region = "North", pop = 5), by = "region") %>% mutate(pc = amount / pop)
+p <- sales %>% pivot_longer(c(amount, year), names_to = "key", values_to = "val") %>% filter(key == "amount", val > 1)
+q <- sales |> distinct(region, .keep_all = TRUE) |> arrange(desc(amount))
+r <- sales %>% nest(data = -region) %>% mutate(n = map_int(data, nrow))
+s2 <- sales %>% transmute(region, amt2 = amount * 2) %>% filter(amt2 > 1)
+t2 <- ggplot(sales, aes(year, amount)) + geom_point(aes(colour = region)) + facet_wrap(~ customer) + labs(x = NULL)
+u <- sales %>% mutate(name = paste(region, year)) %>% separate(name, c("a", "b")) %>% select(a)
+v <- with(sales, mean(amount))
+w <- sales$amount * 2
+x <- sales[sales$year > 2019, c("region", "amount")]
+y <- sales %>% filter(amount > quantile(amount, 0.9)) %>% slice_max(amount, n = 3)
+z <- sales %>% group_by(region) %>% mutate(rank = min_rank(desc(amount))) %>% ungroup() %>% filter(rank == 1)

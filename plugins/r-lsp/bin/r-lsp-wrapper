@@ -1,48 +1,20 @@
 #!/bin/bash
 # R LSP wrapper for Claude Code.
 #
-# Launches the R language server with renv-aware library paths.
-# --vanilla prevents renv from hijacking .libPaths() at startup (before
-# the workspace root is known). A patch on the initialized handler
-# activates renv once the LSP learns the project root, giving it
-# visibility into both the project's renv library (pinned versions)
-# and the global library (where languageserver is installed).
-#
-# The server runs parsing and linting in helper R processes (callr
-# sessions). Those start before renv is activated and keep the library
-# paths they started with, so after changing .libPaths() the wrapper
-# retires the idle helpers; their replacements inherit the new paths.
-# Without this, diagnostics and library()-attached symbols never see the
-# renv library.
-#
-# The server's own packages (languageserver and everything it imports) are
-# put first on the library path, ahead of the renv library, through a
-# private library of symlinks. Otherwise a project that pins an old lintr,
-# xml2, etc. in renv breaks every diagnostics run.
-#
-# Multi-repo note: Claude Code runs ONE language server per session,
-# rooted at the session's launch directory, and the R `languageserver`
-# package only *indexes* that single root. So cross-file navigation
-# (go-to-definition / find-references / workspace-symbol) only works for
-# the repo you launched the session in. For full intelligence across
-# several repos, run one session per repo (see README).
-#
-# What the didOpen patch below CAN do for a single session: when a file
-# from a *different* renv project is opened, resolve that project's renv
-# library and append it to .libPaths(), so package-aware diagnostics and
-# hover for that file resolve against the right packages instead of
-# emitting spurious "no such package / object" errors. It does NOT enable
-# cross-repo navigation (that needs the repo to be the indexed root).
-#
-# We resolve the library path with renv::paths$library() rather than
-# sourcing each project's renv/activate.R: activation assumes one project
-# per R session and starts a watchdog, so re-activating per file would
-# corrupt renv state and leak processes. Path resolution is side-effect free.
+# Sets up the environment and starts the R language server with the plugin's
+# patches (bin/r-lsp-server.R): renv-aware library paths, index status
+# events, complete cross-file answers, and workspaces for other repositories.
+# The patches are documented in that file and in the README.
 #
 # Lint profile: when a project has no .lintr (and there is no ~/.lintr),
 # lintr falls back to the plugin's agent profile (lintr/agent_linters.R):
 # likely bugs only, no style, tidyverse-aware. It is found through
 # R_USER_CONFIG_DIR. Set R_LSP_AGENT_LINTERS=false to use lintr's defaults.
+#
+# Multi-repo note: Claude Code runs ONE language server per session, rooted
+# at the session's launch directory. A file opened from another repository
+# gets that repository added as a second workspace (indexed, with its renv
+# library), so navigation works there too.
 
 SCRIPT="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 PLUGIN_ROOT="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
@@ -51,95 +23,7 @@ if [ "${R_LSP_AGENT_LINTERS:-true}" != "false" ] && [ -z "${R_USER_CONFIG_DIR:-}
   export R_USER_CONFIG_DIR="$PLUGIN_ROOT/lintr/user-config"
 fi
 
-exec R --vanilla --no-echo -e "
-  # Retire helper sessions that are not running a task, so replacements
-  # start with the current .libPaths(). A busy session keeps its old paths
-  # until the task manager's idle timeout replaces it.
-  refresh_workers <- function(self) {
-    for (tm in list(self\$parse_task_manager, self\$diagnostics_task_manager)) {
-      tryCatch({
-        p <- tm\$.__enclos_env__\$private
-        for (s in p\$sessions) {
-          if (!identical(s\$get_state(), 'busy')) p\$retire_session(s)
-        }
-        p\$ensure_min_sessions()
-      }, error = function(e) NULL)
-    }
-  }
-
-  # Private library holding languageserver and its recursive dependencies,
-  # as symlinks into the library they are installed in.
-  server_lib <- function() {
-    lib <- file.path(tempdir(), 'r-lsp-server-lib')
-    if (dir.exists(lib)) return(lib)
-    dir.create(lib)
-    ip <- installed.packages()
-    ip <- ip[!duplicated(rownames(ip)), , drop = FALSE]
-    deps <- unique(c('languageserver', unlist(tools::package_dependencies(
-      'languageserver', db = ip, recursive = TRUE))))
-    for (p in intersect(deps, rownames(ip))) {
-      if (!identical(unname(ip[p, 'Priority']), 'base')) {
-        file.symlink(file.path(ip[p, 'LibPath'], p), file.path(lib, p))
-      }
-    }
-    lib
-  }
-
-  original <- languageserver:::on_initialized
-  patched <- function(self, params) {
-    if (!is.null(self\$rootPath)) {
-      af <- file.path(self\$rootPath, 'renv', 'activate.R')
-      if (file.exists(af)) {
-        gl <- .libPaths()
-        srv <- tryCatch(server_lib(), error = function(e) NULL)
-        old_wd <- getwd()
-        setwd(self\$rootPath)
-        sink(stderr())
-        tryCatch(
-          suppressMessages(source(af, echo = FALSE, print.eval = FALSE)),
-          finally = { sink(); setwd(old_wd) }
-        )
-        # Server packages first, then the project's renv library, then global.
-        .libPaths(unique(c(srv, .libPaths(), gl)))
-        if (!is.null(srv)) Sys.setenv(R_LSP_SERVER_LIB = srv)
-        refresh_workers(self)
-      }
-    }
-    original(self, params)
-  }
-  assignInNamespace('on_initialized', patched, ns = 'languageserver')
-
-  # Per-file renv library resolution for files outside the indexed root.
-  # Wrapped so a future languageserver that renames these internals disables
-  # this convenience rather than failing to start the whole server.
-  tryCatch({
-    seen_roots <- new.env(parent = emptyenv())
-    orig_open <- languageserver:::text_document_did_open
-    patched_open <- function(self, params) {
-      tryCatch({
-        uri <- params\$textDocument\$uri
-        if (!is.null(uri) && requireNamespace('renv', quietly = TRUE)) {
-          path <- languageserver:::path_from_uri(uri)
-          dir <- dirname(path)
-          root <- NULL
-          while (nzchar(dir) && dir != dirname(dir)) {
-            if (file.exists(file.path(dir, 'renv', 'activate.R'))) { root <- dir; break }
-            dir <- dirname(dir)
-          }
-          if (!is.null(root) && is.null(seen_roots[[root]])) {
-            seen_roots[[root]] <- TRUE
-            lib <- tryCatch(renv::paths\$library(project = root), error = function(e) NULL)
-            if (!is.null(lib) && dir.exists(lib) && !(lib %in% .libPaths())) {
-              .libPaths(c(.libPaths(), lib))
-              refresh_workers(self)
-            }
-          }
-        }
-      }, error = function(e) NULL)
-      orig_open(self, params)
-    }
-    assignInNamespace('text_document_did_open', patched_open, ns = 'languageserver')
-  }, error = function(e) NULL)
-
-  languageserver::run()
-"
+# --vanilla: renv's .Rprofile must not change .libPaths() before the project
+# root is known. The server program is a file, not an -e string: no shell
+# escaping, no size limit.
+exec R --vanilla --no-echo --file="$PLUGIN_ROOT/bin/r-lsp-server.R"

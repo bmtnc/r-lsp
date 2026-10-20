@@ -1,0 +1,6 @@
+Package: pkgtwo
+Title: Second package
+Version: 0.0.1
+Description: Fixture for multi-repo and index tests.
+License: MIT
+Encoding: UTF-8

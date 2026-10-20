@@ -1,0 +1,7 @@
+[
+  {
+    "name": "r-lsp-index",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/monitor-status.sh\" \"${CLAUDE_PLUGIN_DATA}\"",
+    "description": "R language server index status (indexing started / index ready / workspace added)"
+  }
+]

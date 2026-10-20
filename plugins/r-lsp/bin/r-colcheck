@@ -1,0 +1,6 @@
+#!/bin/bash
+# r-colcheck [--json] [--root DIR] FILE.R ...
+# Check bare column names in tidyverse code against the real columns of the
+# data the code reads. See scripts/colcheck-lib.R for what is resolved.
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+exec Rscript --vanilla "$here/../scripts/r-colcheck.R" "$@"

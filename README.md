@@ -59,7 +59,14 @@ r-lsp/
 │       │   └── plugin.json     # Plugin metadata
 │       ├── .lsp.json           # LSP server config
 │       ├── bin/
-│       │   └── r-lsp-wrapper   # Wrapper script (renv-aware)
+│       │   ├── r-lsp-wrapper   # Starts the server (environment, lint profile)
+│       │   ├── r-lsp-server.R  # The server with the plugin's patches
+│       │   ├── r-colcheck      # Column names vs the data a script reads
+│       │   └── r-lsp-status    # Recent index events for this project
+│       ├── hooks/              # SessionStart context + pre-warm, post-edit and post-LSP notes
+│       ├── monitors/           # Streams index events to Claude
+│       ├── scripts/            # R code behind the hooks and r-colcheck
+│       ├── skills/r-lsp/       # Tells Claude how to use all of this
 │       ├── lintr/
 │       │   ├── agent_linters.R # Diagnostics profile (bugs only, tidyverse-aware)
 │       │   └── user-config/    # Points lintr at the profile
@@ -82,6 +89,35 @@ The wrapper script solves a problem with renv: the LSP process starts before it 
 For projects without renv, the renv part has no effect — the LSP uses the global library as normal.
 
 The wrapper also points lintr at the plugin's diagnostics profile (see [Diagnostics](#diagnostics)).
+
+Beyond the server itself, the plugin uses the other channels Claude Code gives a plugin, because Claude Code's LSP client is narrow: its LSP tool has nine read-only operations (definition, references, hover, document and workspace symbols, implementation, call hierarchy), it pushes diagnostics only after Claude's own edits (10 per file, 30 per edit, each shown once per session), and it never tells the server about files changed by `git` or `Bash`. So:
+
+- **A skill** (`skills/r-lsp/SKILL.md`) tells Claude when to use the LSP tool, what each answer covers, and how to check data-frame column names.
+- **Hooks** add what the server cannot say: a `SessionStart` hook prints the project's shape and warms the index cache; after each LSP result a hook appends the mentions `grep` finds in files the server does not index and says whether the index is still building; after each `.R` edit a hook runs the column-name check.
+- **A monitor** streams the server's "indexing" / "index ready" events to Claude.
+- **Shell tools** on Claude's `PATH`: `r-colcheck` and `r-lsp-status`.
+
+## Index, completeness and other repositories
+
+The server indexes in the background after it starts (on the first `.R` edit). Three things make that visible and safe:
+
+- **Complete answers.** References, definitions, workspace symbols and call hierarchy wait for the index and the parse queue before answering (up to 30 s, `R_LSP_INDEX_WAIT`). Without this, a references call right after opening a file returned 0 results on dplyr, which Claude reads as "nothing calls this".
+- **Status events.** The server writes "indexing N files" / "index ready (N files, T s)" / "added workspace" to `<plugin data dir>/status.log`. The monitor forwards this project's lines to Claude; `r-lsp-status` prints them on demand; the post-LSP hook warns when an answer was given while indexing.
+- **Pre-warm.** At session start, a background `Rscript` builds the server's persistent index cache for the project, so the first index is near-instant. (It speeds up the file index, not the parse of package `R/` files, which still takes a few seconds per hundred files.)
+
+**Other repositories.** Claude Code sends the server one root, the session's directory. When Claude opens a file outside every known workspace (another repository, `/add-dir`), the server adds that file's project root (found by `DESCRIPTION`, `.git`, `*.Rproj`, `renv.lock`, `_targets.R`, `.here`) as a workspace, indexes it, and attaches its renv library. Navigation then works there too.
+
+**Subagents** inherit the LSP tool (background subagents since Claude Code v2.1.280) and share the one server; requests queue. Pushed diagnostics reach only the main conversation, so subagents rely on the hooks and on running `r-colcheck` or `Rscript -e 'parse("file.R")'` themselves; the skill says so.
+
+## Column names in tidyverse code
+
+Column names inside `mutate()`, `filter()`, `summarise()`, `select()` and `aes()` live in the data, not the code, so no language server can check them. `r-colcheck FILE.R` does the next best thing statically: it finds the data each frame comes from (a path given to `read_csv()`, `read.csv()`, `fread()`, `readRDS()`, `read_parquet()`, `read_excel()`, `read_dta()`; a built-in dataset; a `tibble()`/`data.frame()`/`tribble()` literal), reads only the column names (one header line, or file metadata; RDS files are loaded only under 20 MB), then tracks the column set through the verbs: `mutate` adds, `rename` swaps, `select` keeps, `summarise` replaces with the grouping columns plus the new names, `pivot_longer` and joins to known frames are computed. A bare name that cannot exist is reported with its line:
+
+```
+R/analysis.R:20: 'regoin' is not a column at this point (columns: region, year, amount, customer; data from sales.csv)
+```
+
+It stays silent whenever it cannot be sure: an unresolvable source (database, function argument, API), or a step that makes the set unknowable (`across()`, tidyselect helpers, `pivot_wider()`, `clean_names()`, joins to unknown frames, user functions). On a fixture of 9 planted column bugs and 35 correct lines using `{{ }}`, `.data`, `across()`, `glue`, `case_when()`, joins and pivots, it reports the 9 and nothing else; on dplyr's own 191 source files it reports nothing. The post-edit hook runs it after every `.R` edit (about 1 s). For data the code does not read from a file, the skill tells Claude how to get real names from a running session or a targets store.
 
 ## What this gives Claude Code
 
@@ -117,6 +153,8 @@ To turn the profile off and get lintr's defaults, set `R_LSP_AGENT_LINTERS=false
 
 - **References cover `R/`, open files and `source()`d files**: Since `languageserver` 0.3.19, workspace symbol search covers every `.R` file in the project, packages or not. Find-references and go-to-definition still only see a package's `R/` directory, files that are open, and files linked by static `source()` calls. Calls in unopened `tests/` or `scripts/` files are missed.
 - **No argument checks**: A wrong argument name or too many arguments (`f(a = 1, bb = 2)`) is not reported.
+- **Scope of references**: the server's references and call hierarchy cover a package's `R/`, open files and `source()`d files. Calls in `tests/`, `data-raw/`, scripts and Rmd are not in the server's answer; the post-LSP hook adds what `grep` finds there, so read the two together.
+- **Position off-by-one**: at the first character of a symbol that directly follows `(`, `,` or `$`, the server answers for the punctuation and returns nothing. The post-LSP hook points this out; one character to the right works.
 - **Dynamic scope**: Files that use `attach()`, `list2env()`, `sys.source()` or `box::use()`, or that load a package that isn't installed, skip the undefined-function check. The check can't know what those put in scope.
 - **Single workspace**: Each LSP instance serves one project. It can't cross-reference between two of your packages simultaneously.
 - **Hover gaps**: Some namespaced calls may not return hover docs depending on how the package structures its help pages.
@@ -249,7 +287,7 @@ The only external dependency is the `languageserver` R package, from CRAN; it in
 
 ### Testing
 
-`tests/smoke_test.py` starts the wrapper on scratch projects and talks to it over LSP, the way Claude Code does. It checks planted bugs, a tidyverse script, renv-only packages, a project pinning an old `lintr`, and a project pinning an old `purrr`. It needs R with `languageserver`, `lintr` and `renv` installed (plus `tidyverse` for the tidyverse scenario):
+`tests/smoke_test.py` starts the wrapper on scratch projects and talks to it over LSP, the way Claude Code does. It checks planted bugs, a tidyverse script, renv-only packages, a project pinning an old `lintr`, a project pinning an old `purrr`, complete references on an 80-file package asked right after opening (with the status events), navigation into a second repository, the column checker on its fixture and through the post-edit hook, and the session-start and post-LSP hooks. It needs R with `languageserver`, `lintr` and `renv` installed (plus `tidyverse` for the tidyverse scenario):
 
 ```bash
 python3 tests/smoke_test.py            # all scenarios

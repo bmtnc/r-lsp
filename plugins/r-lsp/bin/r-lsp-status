@@ -1,0 +1,20 @@
+#!/bin/bash
+# r-lsp-status: print the R language server's recent index events for the
+# current project (indexing started / index ready / workspace added).
+# The server writes them to <plugin data dir>/status.log; the Bash tool does
+# not carry the plugin variables, so the data directory is searched for.
+project="${CLAUDE_PROJECT_DIR:-$PWD}"
+shopt -s nullglob
+files=("${R_LSP_STATUS_FILE:-}")
+[ -n "${R_LSP_STATUS_FILE:-}" ] || files=("$HOME"/.claude/plugins/data/*/status.log)
+found=0
+for f in "${files[@]}"; do
+  [ -f "$f" ] || continue
+  lines="$(grep -F "[$project]" "$f" | tail -n "${1:-8}")"
+  [ -n "$lines" ] || continue
+  found=1
+  printf '%s\n' "$lines" | sed -e 's/ \[[^]]*\]//'
+done
+if [ "$found" = 0 ]; then
+  echo "No R LSP status events for $project yet (the server starts on the first .R edit)."
+fi

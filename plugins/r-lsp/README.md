@@ -34,15 +34,31 @@ to use lintr's defaults instead. See the repository README for details.
 ## Installation
 
 ```
+/plugin install r-lsp --marketplace bmtnc/r-lsp
+```
+
+Or in two steps on older Claude Code versions:
+
+```
 /plugin marketplace add bmtnc/r-lsp
 /plugin install r-lsp
 ```
 
+## What else the plugin does
+
+- Cross-file answers (references, definitions, call hierarchy, workspace symbols) wait for the index, so they are complete when they arrive; the server's "indexing" / "index ready" events reach Claude through a monitor and `r-lsp-status`.
+- A `SessionStart` hook prints the project's shape and warms the index cache in the background.
+- After each LSP result, a hook adds the mentions `grep` finds in files the server does not index (tests/, scripts, Rmd) and says if the index is still building.
+- After each `.R` edit, `r-colcheck` checks bare column names in tidyverse code against the columns of the data the code reads (headers only), and reports names that cannot exist.
+- Files opened from another repository get that repository indexed too (see below).
+
 ## Working across multiple repositories
 
 Claude Code runs **one** R language server per session, rooted at the directory
-you launched the session in, and the `languageserver` package only *indexes*
-that single root. Consequences:
+you launched the session in. When Claude opens a file from another repository,
+the plugin adds that repository's root as a second workspace (indexed, with its
+renv library), so definition, references and call hierarchy work there as well.
+Earlier versions did not; the notes below describe what still holds:
 
 - **Cross-file navigation** (go-to-definition, find-references, workspace-symbol)
   works only for the repo you launched the session in. Files from other repos

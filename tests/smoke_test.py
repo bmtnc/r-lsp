@@ -16,11 +16,13 @@ skipped, not failed.
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -99,11 +101,22 @@ class Scenario:
         self.scratch = scratch
         self.keep_logs = keep_logs
 
-    def server(self, root, cwd=None):
+    def server(self, root, cwd=None, env=None):
         log = os.path.join(self.scratch, os.path.basename(root) + ".stderr.log")
-        client = LspClient([WRAPPER], root, cwd=cwd, stderr_path=log)
+        full_env = dict(os.environ, **(env or {}))
+        client = LspClient([WRAPPER], root, cwd=cwd, env=full_env, stderr_path=log)
         client.initialize()
         return client
+
+    def make_package(self, name, extra_files=0):
+        """Copy the pkg2 fixture and add `extra_files` generated R files, each
+        calling add_tax(), so that indexing takes long enough to observe."""
+        root = os.path.join(self.scratch, name)
+        shutil.copytree(os.path.join(FIXTURES, "pkg2"), root)
+        for i in range(extra_files):
+            with open(os.path.join(root, "R", f"gen_{i:03d}.R"), "w") as f:
+                f.write(f"gen_fun_{i} <- function(x) {{\n  y <- add_tax(x) + {i}\n  y * 2\n}}\n")
+        return root
 
     def make_project(self, name, files):
         root = os.path.join(self.scratch, name)
@@ -243,8 +256,130 @@ def scenario_renv_old_purrr(s):
               f"list_rbind() on line {n} not reported as missing from purrr 0.3.5", diags)
 
 
+def run_hook(script, payload, env=None, stdin_text=None):
+    """Run a plugin hook/bin script with a JSON payload on stdin; return stdout."""
+    full_env = dict(os.environ, **(env or {}))
+    out = subprocess.run([script], input=stdin_text if stdin_text is not None else json.dumps(payload),
+                         capture_output=True, text=True, env=full_env, timeout=120)
+    return out.stdout
+
+
+def hook_context(stdout):
+    if not stdout.strip():
+        return ""
+    return json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def references(lsp, rel, line, char):
+    res = lsp.request("textDocument/references", {
+        "textDocument": {"uri": lsp.uri(rel)}, "position": {"line": line, "character": char},
+        "context": {"includeDeclaration": True}})
+    return [loc["uri"] for loc in (res.get("result") or [])]
+
+
+def scenario_complete_answers(s):
+    """References asked right after opening a file wait for the index and are complete."""
+    root = s.make_package("complete_answers", extra_files=80)
+    status_file = os.path.join(s.scratch, "complete_answers.status.log")
+    lsp = s.server(root, env={"R_LSP_STATUS_FILE": status_file, "CLAUDE_PROJECT_DIR": root})
+    try:
+        lsp.open("R/tax.R")
+        t0 = time.time()
+        uris = references(lsp, "R/tax.R", 4, 0)
+        elapsed = time.time() - t0
+    finally:
+        lsp.close()
+    files = {u.rsplit("/", 1)[-1] for u in uris}
+    generated = {f for f in files if f.startswith("gen_")}
+    check(len(generated) == 80, f"references found {len(generated)}/80 generated callers after {elapsed:.1f}s: {sorted(files)[:5]}")
+    check("other.R" in files, "references missed R/other.R")
+    with open(status_file) as f:
+        status = f.read()
+    check("indexing" in status and "index ready" in status, f"status events missing:\n{status}")
+
+
+def scenario_other_repository(s):
+    """A file opened from another repository gets that repository indexed."""
+    other = s.make_package("other_repo")
+    root = s.make_project("scripts_root", {"analysis.R": os.path.join(FIXTURES, "bugs", "bugs.R")})
+    status_file = os.path.join(s.scratch, "other_repo.status.log")
+    lsp = s.server(root, env={"R_LSP_STATUS_FILE": status_file, "CLAUDE_PROJECT_DIR": root})
+    try:
+        tax = os.path.join(other, "R", "tax.R")
+        lsp.open(tax)
+        time.sleep(3)
+        uris = references(lsp, tax, 4, 0)
+        sym = lsp.request("workspace/symbol", {"query": "gross"}).get("result") or []
+    finally:
+        lsp.close()
+    files = {u.rsplit("/", 1)[-1] for u in uris}
+    check("other.R" in files, f"references in the other repository missed R/other.R: {sorted(files)}")
+    check(any(x.get("name") == "gross" for x in sym), "workspace symbol did not find gross() in the other repository")
+    with open(status_file) as f:
+        check("added workspace" in f.read(), "status log has no 'added workspace' event")
+
+
+def scenario_colcheck(s):
+    """Column names in tidyverse code are checked against the data the code reads."""
+    require_packages("tidyverse")
+    root = os.path.join(s.scratch, "columns")
+    shutil.copytree(os.path.join(FIXTURES, "columns"), root)
+    rscript('saveRDS(data.frame(id = 1:3, score = c(1, 2, 3)), "data/scores.rds")', cwd=root)
+    tool = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-colcheck")
+    analysis = os.path.join(root, "R", "analysis.R")
+    out = subprocess.run([tool, "--root", root, analysis], capture_output=True, text=True, timeout=120).stdout
+    reported = {int(line.split(":")[1]) for line in out.splitlines() if line.startswith("R/analysis.R:")}
+    with open(analysis) as f:
+        src = f.read().splitlines()
+    bad = {i for i, line in enumerate(src, 1) if line.rstrip().endswith("# bad")}
+    check(bad <= reported, f"r-colcheck missed lines {sorted(bad - reported)}:\n{out}")
+    check(reported <= bad, f"r-colcheck flagged correct lines {sorted(reported - bad)}:\n{out}")
+    tricky = subprocess.run([tool, "--root", root, os.path.join(root, "R", "tricky_ok.R")],
+                            capture_output=True, text=True, timeout=120).stdout
+    check(not tricky.strip(), f"r-colcheck flagged correct tricky code:\n{tricky}")
+    hook = os.path.join(REPO, "plugins", "r-lsp", "hooks", "post-edit.sh")
+    ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": analysis}, "cwd": root},
+                                env={"CLAUDE_PROJECT_DIR": root}))
+    check("'amt'" in ctx and "regoin" in ctx, f"post-edit hook context missing findings:\n{ctx[:400]}")
+    silent = run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": "/tmp/x.py"}})
+    check(not silent.strip(), "post-edit hook spoke for a non-R file")
+
+
+def scenario_hooks(s):
+    """SessionStart context + index pre-warm, and the note after LSP results."""
+    root = s.make_package("hooks_pkg")
+    start = os.path.join(REPO, "plugins", "r-lsp", "hooks", "session-start.sh")
+    out = run_hook(start, {}, env={"CLAUDE_PROJECT_DIR": root}, stdin_text="{}")
+    check("R LSP plugin: R package 'pkgtwo'" in out, f"session-start context unexpected:\n{out}")
+    cache = rscript(f'cat(file.path(tools::R_user_dir("languageserver", "cache"), "workspace-index", '
+                    f'paste0(digest::digest(normalizePath("{root}"), algo = "xxhash64"), ".rds")))').strip()
+    for _ in range(60):
+        if os.path.exists(cache):
+            break
+        time.sleep(0.5)
+    check(os.path.exists(cache), f"pre-warm did not create the index cache {cache}")
+    lsp_hook = os.path.join(REPO, "plugins", "r-lsp", "hooks", "post-lsp.sh")
+    payload = {"tool_name": "LSP", "cwd": root,
+               "tool_input": {"operation": "findReferences", "filePath": os.path.join(root, "R", "tax.R"),
+                              "line": 5, "character": 1},
+               "tool_response": "Found 3 references across 2 files:\nR/tax.R: Line 5:1, Line 9:20\nR/other.R: Line 1:28"}
+    ctx = hook_context(run_hook(lsp_hook, payload, env={"CLAUDE_PROJECT_DIR": root}))
+    check("tests/testthat/test-tax.R" in ctx, f"post-lsp note missed the test file:\n{ctx}")
+    status_file = os.path.join(s.scratch, "hooks.status.log")
+    with open(status_file, "w") as f:
+        f.write(f"12:00:00 [{root}] R LSP: workspace: indexing 3 files\n")
+    payload["tool_response"] = "No references found. This may occur if the symbol has no usages"
+    ctx = hook_context(run_hook(lsp_hook, payload, env={"CLAUDE_PROJECT_DIR": root, "R_LSP_STATUS_FILE": status_file}))
+    check("still indexing" in ctx, f"post-lsp note did not report the running index:\n{ctx}")
+    covered = dict(payload, tool_response="R/tax.R R/other.R tests/testthat/test-tax.R")
+    quiet = run_hook(lsp_hook, covered, env={"CLAUDE_PROJECT_DIR": root})
+    check(not quiet.strip(), f"post-lsp hook spoke although every file was covered:\n{quiet}")
+
+
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,
-             scenario_renv_old_lintr, scenario_renv_old_purrr]
+             scenario_renv_old_lintr, scenario_renv_old_purrr,
+             scenario_complete_answers, scenario_other_repository,
+             scenario_colcheck, scenario_hooks]
 
 
 def main():
