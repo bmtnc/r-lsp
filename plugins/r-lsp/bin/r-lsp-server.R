@@ -251,9 +251,15 @@ drain_index <- function(self) {
   note_idle(self)
 }
 
+# Every request the LSP tool exposes whose answer depends on the parse
+# queue or the index: hover and document symbols read the parse data of the
+# file (and of the file that defines the symbol), which is produced by the
+# same task queue, so a cold hover answered "no information" for a function
+# defined in another file.
 for (h in c("text_document_references", "text_document_definition", "workspace_symbol",
             "text_document_prepare_call_hierarchy", "call_hierarchy_incoming_calls",
-            "call_hierarchy_outgoing_calls")) {
+            "call_hierarchy_outgoing_calls", "text_document_hover", "text_document_document_symbol",
+            "text_document_implementation")) {
   local({
     orig <- get0(h, envir = ns, inherits = FALSE)
     if (is.function(orig)) {

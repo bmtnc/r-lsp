@@ -30,8 +30,8 @@ cache <- tryCatch(file.path(tools::R_user_dir("languageserver", "cache"), "works
 cat(sprintf("R LSP plugin: %s, %d R files (%d under tests/), %d Rmd/qmd%s. Index cache %s.\n",
   kind, length(rfiles), length(tests), length(rmd), if (renv) ", renv project" else "",
   if (nzchar(cache) && file.exists(cache)) "warm" else "cold (building in the background)"))
-cat("The R language server starts on the first LSP call or .R edit. Cross-file answers (findReferences,",
-    "workspaceSymbol, call hierarchy) wait for indexing, up to ~30 s once, then return complete results",
+cat("The R language server starts on the first LSP call or .R edit. Answers that need the index (findReferences,",
+    "goToDefinition, hover, documentSymbol, workspaceSymbol, call hierarchy) wait for it, up to ~30 s once, then are complete",
     "for every .R file in the project (R/, tests, scripts; git-ignored files excepted) and the files they",
     "source(); a note after each LSP result lists any mentions grep finds that the answer did not",
     "(Rmd/qmd, roxygen links, functions passed as values). Files from other repositories are indexed on",

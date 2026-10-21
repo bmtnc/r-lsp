@@ -299,6 +299,27 @@ def scenario_complete_answers(s):
     check("indexing" in status and "index ready" in status, f"status events missing:\n{status}")
 
 
+def scenario_cold_hover(s):
+    """Hover and documentSymbol asked right after opening a file wait for the
+    parse queue and the index like references do: an empty answer during
+    warm-up looked like a real "nothing here"."""
+    root = s.make_package("cold_hover", extra_files=80)
+    lsp = s.server(root, env={"CLAUDE_PROJECT_DIR": root})
+    try:
+        lsp.open("R/gen_040.R")
+        t0 = time.time()
+        hover = lsp.request("textDocument/hover", {
+            "textDocument": {"uri": lsp.uri("R/gen_040.R")}, "position": {"line": 1, "character": 8}})
+        symbols = lsp.request("textDocument/documentSymbol", {"textDocument": {"uri": lsp.uri("R/gen_040.R")}})
+        elapsed = time.time() - t0
+    finally:
+        lsp.close()
+    contents = json.dumps((hover.get("result") or {}).get("contents") or "")
+    check("add_tax" in contents, f"cold hover on add_tax() came back empty after {elapsed:.1f}s: {hover.get('result')!r}")
+    names = {sym.get("name") for sym in (symbols.get("result") or [])}
+    check("gen_fun_40" in names, f"cold documentSymbol came back empty after {elapsed:.1f}s: {sorted(names)}")
+
+
 def scenario_shared_scope(s):
     """Since languageserver 0.3.19 a script or test is scoped away from the
     package's R/; the plugin restores one shared scope and complete outgoing calls."""
@@ -912,7 +933,7 @@ def scenario_hooks(s):
 
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,
              scenario_renv_old_lintr, scenario_renv_old_purrr,
-             scenario_complete_answers, scenario_shared_scope, scenario_other_repository,
+             scenario_complete_answers, scenario_cold_hover, scenario_shared_scope, scenario_other_repository,
              scenario_colcheck, scenario_colcheck_cache, scenario_colcheck_packages, scenario_lint_fallback, scenario_callmap, scenario_hooks]
 
 

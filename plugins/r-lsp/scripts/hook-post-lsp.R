@@ -51,6 +51,7 @@ notes <- character()
 # --- index state ---------------------------------------------------------------
 status_file <- Sys.getenv("R_LSP_STATUS_FILE",
   file.path(Sys.getenv("CLAUDE_PLUGIN_DATA", ""), "status.log"))
+still_indexing <- NULL
 if (file.exists(status_file)) {
   lines <- tryCatch(readLines(status_file, warn = FALSE), error = function(e) character())
   mine <- grep(paste0("[", session_root, "]"), lines, fixed = TRUE, value = TRUE)
@@ -65,9 +66,7 @@ if (file.exists(status_file)) {
   if (length(mine)) {
     last <- tail(mine, 1)
     if (grepl(": indexing ", last, fixed = TRUE) && !grepl("index ready", last, fixed = TRUE)) {
-      notes <- c(notes, paste0("The R language server is still indexing this project (",
-        sub("^.*R LSP: ", "", last), "). This answer may be incomplete; the same call returns complete",
-        " results once `r-lsp-status` shows 'index ready'."))
+      still_indexing <- sub("^.*R LSP: ", "", last)
     }
   }
 }
@@ -98,8 +97,18 @@ sym <- if (op %in% c("findReferences", "incomingCalls", "outgoingCalls", "goToDe
   symbol_at(file, as.integer(ti$line), as.integer(ti$character))
 } else NULL
 
-null_answer <- grepl("^No (references|definition|hover|call hierarchy|incoming|outgoing|implementation)", resp_text) ||
+null_answer <- grepl("^No (references|definition|hover|call hierarchy|incoming|outgoing|implementation|symbols)", resp_text) ||
   !nzchar(resp_text)
+# An answer given while the index was still building: an empty one is not
+# an answer at all, a non-empty one may be short.
+if (!is.null(still_indexing)) {
+  notes <- c(notes, if (null_answer) paste0(
+    "This empty result is not an answer: the R language server was still indexing this project (", still_indexing,
+    ") when it replied. Repeat the same call once `r-lsp-status` shows 'index ready' (the index wait is capped at ",
+    "R_LSP_INDEX_WAIT seconds, 30 by default; a larger project can need more).") else paste0(
+    "The R language server is still indexing this project (", still_indexing,
+    "). This answer may be incomplete; the same call returns complete results once `r-lsp-status` shows 'index ready'."))
+}
 if (!is.null(sym) && !sym$shifted && sym$first_after_punct && null_answer) {
   notes <- c(notes, sprintf("The server has an off-by-one for the first character of a symbol that directly follows punctuation: repeat the call at character %d (inside `%s`) before concluding there is nothing.",
     as.integer(ti$character) + 1L, sym$name))
