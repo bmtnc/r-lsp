@@ -35,7 +35,7 @@ Column names inside `mutate()`, `filter()`, `summarise()`, `select()`, `aes()` l
 - a targets object: `Rscript -e 'names(targets::tar_read(x))'`
 - an object in a running session: `names(df)` or `str(df)`
 
-After editing a pipeline, `r-colcheck path/to/file.R` checks every bare column name against the data files the code reads (headers only, nothing loaded) and tracks names through the verbs. It is also run for you after each edit of an `.R` file; it stays silent when a step makes the column set unknowable (`across()`, `pivot_wider()`, joins to unknown frames, a frame passed through a user function). A cheap runtime check for anything it cannot see: run the pipeline on `head(df, 5)`.
+After editing a pipeline, `r-colcheck path/to/file.R` checks every bare column name against the data files the code reads (headers only, nothing loaded) and tracks names through the verbs. It is also run for you after each edit of an `.R` file; it stays silent when a step makes the column set unknowable (`across()`, `pivot_wider()`, joins to unknown frames, a frame passed through a package function). Frames passed to functions defined in the project (same file, `source()`d files, the package's `R/`) are followed into the body and back out, with `|>` and `%>%` alike. A cheap runtime check for anything it cannot see: run the pipeline on `head(df, 5)`.
 
 ### Data the checker cannot open: the schema cache
 

@@ -28,6 +28,12 @@
 #               or "note"); colcheck_format(findings, root) -> character lines.
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
+# Arguments of a call without empty ones (`x[, 1]`): the empty symbol cannot
+# be bound to a loop variable or passed to a function without an error.
+call_args <- function(e) {
+  args <- as.list(e)[-1L]
+  args[!vapply(seq_along(args), function(i) identical(args[[i]], quote(expr = )), TRUE)]
+}
 quiet <- function(expr, default = NULL) {
   tryCatch(suppressWarnings(suppressMessages(expr)), error = function(e) default)
 }
@@ -78,7 +84,7 @@ schema_columns <- function(key, ctx) {
 string_literals <- function(e) {
   if (is.character(e)) return(e)
   if (!is.call(e)) return(character())
-  unlist(lapply(as.list(e)[-1L], string_literals))
+  unlist(lapply(call_args(e), string_literals))
 }
 
 # Column set for a source call the checker could not open: a cache entry for
@@ -122,20 +128,202 @@ pipeline_head <- function(e) {
 # when the source looks like a data loader (a reader, or a call carrying a
 # string literal such as an S3 key) or the line names a key that is not cached.
 note_unresolved <- function(target, rhs, key, ctx) {
+  # only script-level loaders: inside a function the data usually comes from
+  # a parameter, and the learn command needs a self-contained expression
+  if (isTRUE(ctx$in_function)) return(invisible())
+  # tests build their data in place; nothing there is learnable
+  if (grepl("(^|/)tests?/", relative_path(ctx$file, ctx$root))) return(invisible())
   head <- pipeline_head(rhs)
   if (!is.call(head)) return(invisible())
   fn <- call_name(head)
+  if (is.na(fn) || fn %in% not_loaders) return(invisible())
+  # a loader is called with keys and paths, not with frames already in hand:
+  # update_log(log, "step") or bind_rows(a, b) are not learnable
+  if (any(vapply(call_args(head), is.symbol, TRUE))) return(invisible())
   literals <- unique(string_literals(head))
-  if (is.null(key) && !(fn %in% readers) && !length(literals)) return(invisible())
+  if (fn %in% readers) {
+    # a reader with a literal path that does not exist locally (an S3 URI);
+    # read.csv(text = x) or read_csv(path_variable) are not learnable sources
+    path_arg <- if (length(call_args(head))) call_args(head)[[1L]] else NULL
+    if (!is.character(path_arg) && !(is.call(path_arg) && call_name(path_arg) %in% c("here", "file.path"))) return(invisible())
+  } else if (is.null(key) && !length(literals)) return(invisible())
   ctx$unresolved[[target]] <- list(
     line = ctx$line, keys = unique(c(key, literals)), expr = paste(deparse(head), collapse = " "),
     used = !identical(head, rhs))
   invisible()
 }
 
+# Calls that combine or wrap frames rather than load them.
+not_loaders <- c("bind_rows", "bind_cols", "rbind", "cbind", "merge", "rbindlist", "tryCatch", "try",
+                 "withCallingHandlers", "suppressWarnings", "suppressMessages", "switch", "if", "ifelse",
+                 "c", "list", "paste", "paste0", "sprintf", "format", "as.Date", "as.numeric",
+                 "as.character", "as.integer", "unique", "sort", "rev", "seq", "rep", "Reduce", "do.call",
+                 "lapply", "sapply", "vapply", "map", "map_dfr", "map_df", "purrr::map")
+
 mark_used <- function(nm, ctx) {
   if (!is.null(ctx$unresolved[[nm]])) ctx$unresolved[[nm]]$used <- TRUE
   invisible()
+}
+
+# --- project functions ------------------------------------------------------
+# Logic is often factored out: `cleaned <- clean(sales)`. When a known frame
+# is passed to a function defined in the project, the parameter is bound to
+# that column set, the body is checked (with its own lines), and the columns
+# of the body's last expression become the columns of the call. Functions
+# come from the file itself, files it source()s, and, in an R package, every
+# file under R/.
+
+function_defs <- function(exprs, file) {
+  out <- list()
+  for (e in exprs) {
+    if (is.call(e) && call_name(e) %in% c("<-", "=") && length(e) == 3L && is.symbol(e[[2L]]) &&
+        is.call(e[[3L]]) && identical(call_name(e[[3L]]), "function")) {
+      out[[as.character(e[[2L]])]] <- list(fn = e[[3L]], file = file)
+    }
+  }
+  out
+}
+
+source_calls <- function(e, acc = character()) {
+  if (!is.call(e)) return(acc)
+  if (call_name(e) %in% c("source", "sys.source") && length(e) >= 2L && is.character(e[[2L]])) acc <- c(acc, e[[2L]])
+  for (p in call_args(e)) if (is.call(p)) acc <- source_calls(p, acc)
+  acc
+}
+
+project_functions <- function(file, exprs, ctx) {
+  self <- normalizePath(file, mustWork = FALSE)
+  others <- character()
+  if (file.exists(file.path(ctx$root, "DESCRIPTION"))) {
+    others <- list.files(file.path(ctx$root, "R"), pattern = "[.][rR]$", full.names = TRUE)
+  }
+  for (e in exprs) for (s in source_calls(e)) {
+    p <- resolve_path(s, ctx)
+    if (!is.null(p)) others <- c(others, p)
+  }
+  defs <- list()
+  for (f in setdiff(unique(normalizePath(others, mustWork = FALSE)), self)) {
+    ex <- quiet(parse(f, keep.source = TRUE))
+    if (!is.null(ex)) defs[names(function_defs(ex, f))] <- function_defs(ex, f)
+  }
+  own <- function_defs(exprs, file)
+  defs[names(own)] <- own
+  defs
+}
+
+# Statements of a `{` block, each at its own line.
+walk_block <- function(block, ctx, last = walk_expr) {
+  stmts <- as.list(block)[-1L]
+  srcs <- attr(block, "srcref")
+  saved_line <- ctx$line
+  result <- NULL
+  for (i in seq_along(stmts)) {
+    if (!is.null(srcs) && length(srcs) > i) ctx$line <- as.integer(srcs[[i + 1L]][[1L]])
+    result <- if (i == length(stmts)) last(stmts[[i]], ctx) else walk_expr(stmts[[i]], ctx)
+  }
+  ctx$line <- saved_line
+  result
+}
+
+# Walk a function body in the current scope; the columns of what it returns.
+body_columns <- function(body, ctx) {
+  if (is.call(body) && identical(call_name(body), "{")) return(walk_block(body, ctx, last = return_columns))
+  return_columns(body, ctx)
+}
+
+return_columns <- function(e, ctx) {
+  if (is.call(e) && call_name(e) %in% c("return", "invisible") && length(e) >= 2L) e <- e[[2L]]
+  walk_expr(e, ctx)
+  if (is.call(e) && call_name(e) %in% c("<-", "=") && is.symbol(e[[2L]])) return(ctx$frames[[as.character(e[[2L]])]])
+  if (is.call(e) && identical(call_name(e), "{")) return(walk_block(e, ctx, last = return_columns))
+  frame_columns(e, ctx)
+}
+
+# Column set of a call to a project function, or NULL.
+negative_expectations <- c("expect_error", "expect_warning", "expect_condition", "expect_snapshot_error",
+                           "expect_snapshot_warning", "expect_failure")
+
+call_user_function <- function(e, name, ctx) {
+  def <- ctx$functions[[name]]
+  if (is.null(def) || name %in% ctx$call_stack || length(ctx$call_stack) >= 4L) return(NULL)
+  if (isTRUE(ctx$in_negative_test)) return(NULL)
+  fdef <- def$fn
+  proto <- quiet(eval(call("function", fdef[[2L]], NULL)))
+  if (!is.function(proto)) return(NULL)
+  # forwarded dots (`f(x, ...)`) cannot be matched statically: drop them
+  args <- call_args(e)
+  args <- args[!vapply(args, function(a) is.symbol(a) && identical(as.character(a), "..."), TRUE)]
+  matched <- quiet(match.call(proto, as.call(c(e[[1L]], args)), expand.dots = FALSE))
+  if (is.null(matched)) return(NULL)
+  supplied <- as.list(matched)[-1L]
+  params <- setdiff(names(fdef[[2L]]) %||% character(), "...")
+  arg_cols <- list()
+  for (p in names(supplied)) {
+    a <- supplied[[p]]
+    if (!(is.symbol(a) || is.call(a))) next
+    arg_cols[[p]] <- frame_columns(a, ctx, used = param_used_as_frame(fdef[[3L]], p))
+  }
+  saved <- list(frames = ctx$frames, variables = ctx$variables, unknown = ctx$unknown_frames,
+                line = ctx$line, file = ctx$file)
+  # `if ("x" %in% names(df))`: the body handles frames with and without x,
+  # so x counts as present for the parameter rather than reported
+  guarded <- guarded_columns(fdef[[3L]])
+  for (p in params) {
+    cols <- arg_cols[[p]]
+    if (!is.null(cols) && length(guarded)) cols <- keep_source(structure(unique(c(cols, guarded)), groups = attr(cols, "groups")), cols)
+    ctx$frames[[p]] <- cols
+    if (is.null(cols)) ctx$unknown_frames <- union(ctx$unknown_frames, p)
+    ctx$variables <- union(ctx$variables, p)
+  }
+  ctx$call_sites <- c(ctx$call_sites, sprintf("%s:%s", relative_path(ctx$file, ctx$root), ctx$line))
+  ctx$file <- def$file
+  ctx$call_stack <- c(ctx$call_stack, name)
+  saved_in <- ctx$in_function
+  ctx$in_function <- TRUE
+  result <- tryCatch(body_columns(fdef[[3L]], ctx), error = function(err) NULL)
+  ctx$in_function <- saved_in
+  ctx$call_stack <- ctx$call_stack[-length(ctx$call_stack)]
+  ctx$call_sites <- ctx$call_sites[-length(ctx$call_sites)]
+  ctx$frames <- saved$frames
+  ctx$variables <- saved$variables
+  ctx$unknown_frames <- saved$unknown
+  ctx$line <- saved$line
+  ctx$file <- saved$file
+  result
+}
+
+# Column names a body tests for before using: string literals inside `if`
+# conditions that look at names()/colnames()/has_name()/hasName().
+guarded_columns <- function(e, acc = character()) {
+  if (!is.call(e)) return(acc)
+  if (identical(call_name(e), "if") && length(e) >= 2L) {
+    cond <- e[[2L]]
+    if (any(all.names(cond) %in% c("names", "colnames", "has_name", "hasName", "exists"))) {
+      acc <- c(acc, string_literals(cond))
+    }
+  }
+  for (a in call_args(e)) acc <- guarded_columns(a, acc)
+  unique(acc)
+}
+
+# Does the body pipe parameter `p` into a verb, or pass it as a verb's data?
+param_used_as_frame <- function(e, p) {
+  if (!is.call(e)) return(FALSE)
+  fn <- call_name(e)
+  args <- call_args(e)
+  first <- if (length(args)) args[[1L]] else NULL
+  if (!is.na(fn) && (fn %in% c("%>%", "%<>%", "%T>%") || fn %in% verb_names) &&
+      is.symbol(first) && identical(as.character(first), p)) return(TRUE)
+  for (a in args) if (is.call(a) && param_used_as_frame(a, p)) return(TRUE)
+  FALSE
+}
+
+# `lhs %>% f(...)`: the call f(lhs, ...) (or with lhs in place of `.`).
+pipe_into <- function(rhs, lhs_symbol) {
+  args <- call_args(rhs)
+  dots <- vapply(args, function(a) is.symbol(a) && identical(as.character(a), "."), TRUE)
+  if (any(dots)) args[dots] <- list(lhs_symbol) else args <- c(list(lhs_symbol), args)
+  as.call(c(rhs[[1L]], args))
 }
 
 # --- reading column names without loading rows ------------------------------
@@ -219,7 +407,7 @@ resolve_path <- function(e, ctx) {
     return(if (length(hit)) normalizePath(hit[[1L]]) else NULL)
   }
   if (is.call(e) && call_name(e) %in% c("here", "file.path")) {
-    parts <- lapply(as.list(e)[-1L], string_arg)
+    parts <- lapply(call_args(e), string_arg)
     if (any(vapply(parts, is.null, TRUE))) return(NULL)
     return(resolve_path(do.call(file.path, parts), ctx))
   }
@@ -269,8 +457,13 @@ frame_columns <- function(e, ctx, used = FALSE) {
     rhs <- e[[3L]]
     if (is.symbol(rhs)) rhs <- as.call(list(rhs))
     if (!is.call(rhs)) return(NULL)
-    lhs <- frame_columns(e[[2L]], ctx, used = used || call_name(rhs) %in% verb_names)
+    rhs_fn <- call_name(rhs)
+    lhs <- frame_columns(e[[2L]], ctx, used = used || rhs_fn %in% verb_names || !is.null(ctx$functions[[rhs_fn]]))
     if (is.null(lhs)) return(NULL)
+    if (!is.na(rhs_fn) && !is.null(ctx$functions[[rhs_fn]])) {
+      ctx$frames[[".colcheck_lhs"]] <- lhs
+      return(call_user_function(pipe_into(rhs, as.name(".colcheck_lhs")), rhs_fn, ctx))
+    }
     return(apply_verb(rhs, lhs, ctx, piped = TRUE))
   }
   if (fn %in% readers) {
@@ -293,11 +486,17 @@ frame_columns <- function(e, ctx, used = FALSE) {
     return(cols)
   }
   if (fn == "tribble") {
-    hdr <- Filter(function(a) is.call(a) && identical(a[[1L]], as.name("~")), as.list(e)[-1L])
+    hdr <- Filter(function(a) is.call(a) && identical(a[[1L]], as.name("~")), call_args(e))
     cols <- vapply(hdr, function(a) as.character(a[[2L]]), "")
     if (!length(cols)) return(NULL)
     attr(cols, "source") <- "tribble() literal"
     return(cols)
+  }
+  # a project function: bind its parameters, check its body, take its result;
+  # when the body does not resolve (a loader), the cache below still can
+  if (!is.null(ctx$functions[[fn]])) {
+    via_function <- call_user_function(e, fn, ctx)
+    if (!is.null(via_function)) return(via_function)
   }
   # native pipe is parsed into nested calls: verb(frame_expr, ...)
   if (length(e) >= 2L) {
@@ -317,17 +516,30 @@ quoting_calls <- c("across", "if_any", "if_all", "pick", "c_across", "where", "a
                    "last_col", "vars", "quote", "bquote", "expr", "sym", "syms", "!!", "!!!",
                    "glue", "str_glue")
 
-# Names used as bare symbols inside an expression evaluated with data masking.
-masked_symbols <- function(e, acc = character()) {
+# Names used as bare symbols inside an expression evaluated with data masking,
+# minus the names the expression itself assigns (`{ idx <- which(...); x[idx] }`)
+# or binds (`function(i) ...`, `for (i in ...)`).
+masked_symbols <- function(e) {
+  setdiff(collect_symbols(e), local_names(e))
+}
+
+collect_symbols <- function(e, acc = character()) {
   if (is.symbol(e)) return(c(acc, as.character(e)))
   if (!is.call(e)) return(acc)
   fn <- call_name(e)
   if (!is.na(fn) && fn %in% c("$", "@", "::", ":::")) return(acc)
   if (!is.na(fn) && fn %in% quoting_calls) return(acc)
-  if (is.call(e[[1L]]) && call_name(e[[1L]]) %in% c("::", ":::")) {
-    # pkg::fun(args): walk the args only
-  }
-  for (p in as.list(e)[-1L]) acc <- masked_symbols(p, acc)
+  for (p in call_args(e)) acc <- collect_symbols(p, acc)
+  acc
+}
+
+local_names <- function(e, acc = character()) {
+  if (!is.call(e)) return(acc)
+  fn <- call_name(e)
+  if (!is.na(fn) && fn %in% c("<-", "=", "<<-") && length(e) == 3L && is.symbol(e[[2L]])) acc <- c(acc, as.character(e[[2L]]))
+  if (!is.na(fn) && fn == "for" && is.symbol(e[[2L]])) acc <- c(acc, as.character(e[[2L]]))
+  if (!is.na(fn) && fn == "function") acc <- c(acc, names(e[[2L]]) %||% character())
+  for (p in call_args(e)) acc <- local_names(p, acc)
   acc
 }
 
@@ -351,11 +563,13 @@ selection_names <- function(args) {
 
 report <- function(ctx, name, cols) {
   src <- attr(cols, "source") %||% "the data"
+  via <- if (length(ctx$call_sites)) ctx$call_sites[[length(ctx$call_sites)]] else NULL
   ctx$findings[[length(ctx$findings) + 1L]] <- list(
     kind = "column", file = ctx$file, line = ctx$line, name = name, source = src,
-    columns = as.character(cols),
-    message = sprintf("'%s' is not a column at this point (columns: %s; data from %s)", name,
-                      paste(head(cols, 12), collapse = ", "), src))
+    columns = as.character(cols), via = via,
+    message = sprintf("'%s' is not a column at this point (columns: %s; data from %s%s)", name,
+                      paste(head(cols, 12), collapse = ", "), src,
+                      if (is.null(via)) "" else sprintf(", called from %s", via)))
 }
 
 check_symbols <- function(syms, cols, ctx) {
@@ -369,7 +583,7 @@ check_symbols <- function(syms, cols, ctx) {
 apply_verb <- function(call, cols, ctx, piped) {
   fn <- call_name(call)
   if (is.na(fn)) return(NULL)
-  args <- as.list(call)[-1L]
+  args <- call_args(call)
   if (!piped && length(args)) args <- args[-1L]
   nms <- names(args) %||% rep("", length(args))
   dot_args <- startsWith(nms, ".")
@@ -378,6 +592,15 @@ apply_verb <- function(call, cols, ctx, piped) {
   group_cols <- attr(cols, "groups") %||% character()
   with_groups <- function(x, g = group_cols) { attr(x, "groups") <- g; keep_source(x, cols) }
   check_all <- function() check_symbols(unlist(lapply(c(pos, named), masked_symbols)), cols, ctx)
+  # mutate(a = ..., b = a + 1): each argument sees the columns made before it
+  check_sequential <- function() {
+    cur <- cols
+    for (i in seq_along(args)) {
+      if (dot_args[[i]]) next
+      check_symbols(masked_symbols(args[[i]]), cur, ctx)
+      if (nzchar(nms[[i]])) cur <- unique(c(cur, nms[[i]]))
+    }
+  }
   has_nonsymbol_pos <- function() any(vapply(pos, function(p) !is.symbol(p), TRUE))
 
   if (fn %in% c("filter", "arrange", "slice", "slice_head", "slice_tail", "slice_min", "slice_max",
@@ -393,14 +616,14 @@ apply_verb <- function(call, cols, ctx, piped) {
     return(with_groups(cols, if (is.null(g)) group_cols else unique(c(if (add) group_cols, g))))
   }
   if (fn %in% c("mutate", "transmute")) {
-    check_all()
+    check_sequential()
     if (has_nonsymbol_pos()) return(NULL)
     new <- names(named)
     if (fn == "mutate") return(with_groups(unique(c(cols, new))))
     return(with_groups(unique(c(group_cols, new))))
   }
   if (fn %in% c("summarise", "summarize", "reframe")) {
-    check_all()
+    check_sequential()
     if (has_nonsymbol_pos()) return(NULL)
     by <- if (".by" %in% names(args)) selection_names(list(args[[".by"]])) else group_cols
     if (is.null(by)) return(NULL)
@@ -512,6 +735,13 @@ walk_expr <- function(e, ctx) {
   fn <- call_name(e)
   if (!is.na(fn) && fn %in% c("<-", "=", "<<-") && length(e) == 3L && is.symbol(e[[2L]])) {
     target <- as.character(e[[2L]])
+    if (is.call(e[[3L]]) && identical(call_name(e[[3L]]), "function")) {
+      # a named function: check its body now with unknown parameters (its
+      # own loaders and globals resolve); calls with known frames check it again
+      ctx$variables <- union(ctx$variables, target)
+      walk_expr(e[[3L]], ctx)
+      return(invisible())
+    }
     key <- line_annotation(ctx)
     ctx$annotation <- key
     cols <- frame_columns(e[[3L]], ctx)
@@ -542,9 +772,20 @@ walk_expr <- function(e, ctx) {
     saved_unknown <- ctx$unknown_frames
     ctx$variables <- union(ctx$variables, params)
     ctx$unknown_frames <- union(ctx$unknown_frames, params)
+    saved_in <- ctx$in_function
+    ctx$in_function <- TRUE
     walk_expr(e[[3L]], ctx)
+    ctx$in_function <- saved_in
     ctx$variables <- saved_vars
     ctx$unknown_frames <- saved_unknown
+    return(invisible())
+  }
+  # negative tests pass deliberately wrong frames: do not follow calls inside
+  if (!is.na(fn) && fn %in% negative_expectations) {
+    saved_neg <- ctx$in_negative_test
+    ctx$in_negative_test <- TRUE
+    for (p in call_args(e)) if (is.call(p)) walk_expr(p, ctx)
+    ctx$in_negative_test <- saved_neg
     return(invisible())
   }
   if (!is.na(fn) && fn %in% c("%>%", "%<>%", "%T>%")) {
@@ -555,8 +796,9 @@ walk_expr <- function(e, ctx) {
     check_ggplot(e, ctx)
     return(invisible())
   }
-  if (!is.na(fn) && fn %in% verbs) frame_columns(e, ctx)
-  for (p in as.list(e)[-1L]) if (is.call(p)) walk_expr(p, ctx)
+  if (!is.na(fn) && fn == "{") return(walk_block(e, ctx))
+  if (!is.na(fn) && (fn %in% verbs || !is.null(ctx$functions[[fn]]))) frame_columns(e, ctx)
+  for (p in call_args(e)) if (is.call(p)) walk_expr(p, ctx)
   invisible()
 }
 
@@ -581,6 +823,8 @@ colcheck_file <- function(file, root = NULL) {
   exprs <- quiet(parse(file, keep.source = TRUE))
   if (is.null(exprs)) return(list())
   src <- attr(exprs, "srcref")
+  ctx$functions <- project_functions(file, exprs, ctx)
+  ctx$call_stack <- character()
   # Names assigned anywhere in the file count as variables: data masking falls back to the environment.
   for (e in exprs) {
     if (is.call(e) && call_name(e) %in% c("<-", "=", "<<-") && is.symbol(e[[2L]])) {
@@ -635,11 +879,12 @@ colcheck_files <- function(files, root = NULL) {
   all[!duplicated(keys)]
 }
 
+relative_path <- function(file, root) {
+  shown <- normalizePath(file, mustWork = FALSE)
+  base <- normalizePath(root %||% colcheck_root(file), mustWork = FALSE)
+  if (startsWith(shown, paste0(base, "/"))) substring(shown, nchar(base) + 2L) else shown
+}
+
 colcheck_format <- function(findings, root = NULL) {
-  vapply(findings, function(x) {
-    shown <- normalizePath(x$file, mustWork = FALSE)
-    base <- normalizePath(root %||% colcheck_root(x$file), mustWork = FALSE)
-    if (startsWith(shown, paste0(base, "/"))) shown <- substring(shown, nchar(base) + 2L)
-    sprintf("%s:%s: %s", shown, x$line, x$message)
-  }, "")
+  vapply(findings, function(x) sprintf("%s:%s: %s", relative_path(x$file, root), x$line, x$message), "")
 }

@@ -336,6 +336,24 @@ def scenario_colcheck(s):
     tricky = subprocess.run([tool, "--root", root, os.path.join(root, "R", "tricky_ok.R")],
                             capture_output=True, text=True, timeout=120).stdout
     check(not tricky.strip(), f"r-colcheck flagged correct tricky code:\n{tricky}")
+
+    # Frames passed through project functions (same file, source()d file), both pipes.
+    funcs = os.path.join(root, "R", "funcs.R")
+    out = subprocess.run([tool, "--root", root, funcs], capture_output=True, text=True, timeout=120).stdout
+    reported = {int(line.split(":")[1]) for line in out.splitlines() if line.startswith("R/funcs.R:")}
+    with open(funcs) as f:
+        bad = {i for i, line in enumerate(f.read().splitlines(), 1) if line.rstrip().endswith("# bad")}
+    check(bad <= reported, f"function tracking missed lines {sorted(bad - reported)}:\n{out}")
+    check(reported <= bad, f"function tracking flagged correct lines {sorted(reported - bad)}:\n{out}")
+    check("helpers_src.R" not in out, f"findings attributed to the sourced helper file:\n{out}")
+
+    # In a package, functions from every file under R/ are known without source().
+    pkg = os.path.join(s.scratch, "pkgcols")
+    shutil.copytree(os.path.join(FIXTURES, "pkgcols"), pkg)
+    out = subprocess.run([tool, "--root", pkg, os.path.join(pkg, "R", "pipeline.R")],
+                         capture_output=True, text=True, timeout=120).stdout
+    check("R/pipeline.R:5: 'amout'" in out and out.count("is not a column") == 1,
+          f"package-wide function lookup unexpected:\n{out}")
     hook = os.path.join(REPO, "plugins", "r-lsp", "hooks", "post-edit.sh")
     ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": analysis}, "cwd": root},
                                 env={"CLAUDE_PROJECT_DIR": root}))

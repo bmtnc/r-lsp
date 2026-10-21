@@ -1,0 +1,5 @@
+Package: pkgcols
+Version: 0.0.1
+Title: Fixture
+Description: Fixture for r-colcheck across package files.
+License: MIT
