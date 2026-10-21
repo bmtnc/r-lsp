@@ -24,3 +24,8 @@ load_clean <- function(date) {
 
 # Output columns that cannot be read statically.
 opaque <- function(df) do.call(rbind, list(df))
+
+# Helpers whose output is the same every call but whose calls carry no
+# literal: covered by a cache entry keyed on the function name.
+taxonomy <- function(products, categories) stop("no database in a test package")
+fixed_table <- function() stop("no database in a test package")

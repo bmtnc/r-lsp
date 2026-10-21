@@ -137,7 +137,26 @@ cached_columns <- function(e, ctx) {
     ctx$annotation <- NULL
     return(schema_columns(key, ctx))
   }
+  # an entry keyed on the function itself (`r-colcheck learn "pkg::fn" '<expr>'`):
+  # a helper whose output is the same every call, with no literal to match
+  # and no comment on any call line
+  if (length(ctx$schemas)) {
+    for (k in function_keys(e, ctx)) {
+      cols <- schema_columns(k, ctx)
+      if (!is.null(cols)) return(cols)
+    }
+  }
   NULL
+}
+
+# The cache keys a call matches by its function: `pkg::fn` and `fn` for a
+# namespaced call; for a bare call, `fn` and any `<pkg>::fn` entry.
+function_keys <- function(e, ctx) {
+  fn <- call_name(e)
+  if (is.na(fn)) return(character())
+  head <- e[[1L]]
+  if (is.call(head)) return(c(paste0(as.character(head[[2L]]), "::", fn), fn))
+  c(fn, grep(paste0("^[A-Za-z][A-Za-z0-9.]*::", gsub(".", "[.]", fn, fixed = TRUE), "$"), names(ctx$schemas), value = TRUE))
 }
 
 line_annotation <- function(ctx) {
@@ -180,7 +199,8 @@ note_unresolved <- function(target, rhs, key, ctx) {
   package_note <- function() {
     if (!is.null(head_def) && !is.null(head_def$pkg)) {
       ctx$unresolved[[target]] <- list(line = ctx$line, keys = character(), package_fn = head_def$file,
-                                       expr = paste(deparse(head), collapse = " "), used = !identical(head, rhs))
+                                       expr = paste(deparse(head), collapse = " "), used = !identical(head, rhs),
+                                       self_contained = !length(all.vars(head)) && !("function" %in% all.names(head)))
     }
     invisible()
   }
@@ -1217,9 +1237,10 @@ source_notes <- function(ctx) {
     u <- ctx$unresolved[[nm]]
     if (!isTRUE(u$used)) next
     if (!is.null(u$package_fn)) {
+      learn_expr <- if (isTRUE(u$self_contained)) gsub("'", "'\\\\''", u$expr) else "<an expression that returns its table>"
       note(u$line, nm, sprintf(
-        "'%s' comes from %s(), whose output columns could not be read from its code (%s), so column names downstream are not checked. If it returns a fixed table, cache it: add `# cols: KEY` on this line and run r-colcheck learn \"KEY\" '%s'",
-        nm, u$package_fn, u$expr, gsub("'", "'\\\\''", u$expr)))
+        "'%s' comes from %s(), whose output columns could not be read from its code (%s), so column names downstream are not checked. If it returns the same columns every call, cache it once by name: r-colcheck learn \"%s\" '%s' (every call then resolves); if its columns depend on an argument, add `# cols: KEY` on this line and learn KEY instead.",
+        nm, u$package_fn, u$expr, u$package_fn, learn_expr))
       next
     }
     keys <- u$keys[!(u$keys %in% names(ctx$schemas))]

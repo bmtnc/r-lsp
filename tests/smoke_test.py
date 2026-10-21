@@ -587,7 +587,10 @@ def scenario_colcheck_packages(s):
         return {"expr": f"teamdata::fetch_table(Sys.Date(), \"{table}\")", "observed_at": "2026-10-01T00:00:00Z",
                 "method": "data_frame", "columns": [{"name": c, "type": "character"} for c in columns]}
     schemas = json.dumps({"orders": entry("orders", ["id", "customer_id", "amount", "status", "extra"]),
-                          "customers": entry("customers", ["customer_id", "region"])})
+                          "customers": entry("customers", ["customer_id", "region"]),
+                          # keyed on the function: no literal in the call, no comment on the line
+                          "teamdata::taxonomy": entry("taxonomy", ["product", "category"]),
+                          "fixed_table": entry("fixed", ["code", "label"])})
     script = (
         "library(teamdata)\n"
         "raw <- teamdata::fetch_table(Sys.Date(), \"orders\")\n"
@@ -610,7 +613,11 @@ def scenario_colcheck_packages(s):
         "bad5 <- inner %>% dplyr::select(id, amount, status)\n"
         # reassignment: every step reads the old frame
         "orders <- orders %>% dplyr::filter(total > 0) %>% dplyr::select(id)\n"
-        "ok2 <- orders %>% dplyr::select(id)\n")
+        "ok2 <- orders %>% dplyr::select(id)\n"
+        "tx <- teamdata::taxonomy(raw, customers)\n"
+        "bad6 <- tx %>% dplyr::select(product, categry)\n"
+        "ft <- fixed_table()\n"
+        "bad7 <- ft %>% dplyr::select(code, labell)\n")
     root = s.make_renv_project("colcheck_pkgs", {}, extra_packages=("teamdata",))
     for rel, text in (("script/run.R", script), (".colcheck/schemas.json", schemas)):
         os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
@@ -621,29 +628,32 @@ def scenario_colcheck_packages(s):
     check(out.returncode == 1, f"r-colcheck exited {out.returncode} (expected 1, findings):\n{out.stderr}")
     findings = json.loads(out.stdout)
     cols = {(f["line"], f["name"]) for f in findings if f["kind"] == "column"}
-    check(cols == {(6, "amount"), (7, "idd"), (9, "extra"), (15, "regionn"), (17, "status")},
+    check(cols == {(6, "amount"), (7, "idd"), (9, "extra"), (15, "regionn"), (17, "status"), (21, "categry"), (23, "labell")},
           f"column findings unexpected: {sorted(cols)}\n{out.stdout}")
     src = {f["line"]: f["source"] for f in findings if f["kind"] == "column"}
     check(src[6] == src[9] == "teamdata::clean_orders() (read from its code)", f"finding source unexpected: {src}")
     check(src[15].startswith("cached schema \"customers\""), f"annotated loader source unexpected: {src[15]}")
     check(src[17] == "teamdata::load_clean() (read from its code)", f"inner-loader source unexpected: {src[17]}")
+    check(src[21].startswith("cached schema \"teamdata::taxonomy\"") and src[23].startswith("cached schema \"fixed_table\""),
+          f"function-keyed cache sources unexpected: {src[21]} / {src[23]}")
     check(not [f for f in findings if f["kind"] == "error"], f"checker errors:\n{out.stdout}")
     notes = {f["line"]: f["message"] for f in findings if f["kind"] == "note"}
     check(sorted(notes) == [10, 12], f"notes unexpected:\n{notes}")
-    check("teamdata::opaque()" in notes[10] and "could not be read from its code" in notes[10],
+    check("teamdata::opaque()" in notes[10] and "could not be read from its code" in notes[10]
+          and "r-colcheck learn \"teamdata::opaque\" '<an expression that returns its table>'" in notes[10],
           f"opaque-function note unexpected:\n{notes[10]}")
     # A self-contained package loader with a literal key keeps the learn suggestion.
     check("r-colcheck learn \"returns\" 'teamdata::fetch_table(Sys.Date(), \"returns\")'" in notes[12],
           f"uncached loader note lost its learn command:\n{notes[12]}")
-    check("9 pipeline step(s) checked" in out.stderr and "2 step(s) skipped" in out.stderr
+    check("11 pipeline step(s) checked" in out.stderr and "2 step(s) skipped" in out.stderr
           and "checker error" not in out.stderr, f"summary unexpected:\n{out.stderr}")
     # Switched off, the package function is opaque and nothing after it is checked.
     off = subprocess.run([tool, "--json", "script/run.R"], cwd=root, capture_output=True, text=True, timeout=300,
                          env=dict(os.environ, R_LSP_COLCHECK_PACKAGES="false"))
-    check(off.returncode == 1 and "1 pipeline step(s) checked" in off.stderr,
+    check(off.returncode == 1 and "3 pipeline step(s) checked" in off.stderr,
           f"R_LSP_COLCHECK_PACKAGES=false still followed the package function:\n{off.stderr}")
     off_cols = {(f["line"], f["name"]) for f in json.loads(off.stdout) if f["kind"] == "column"}
-    check(off_cols == {(15, "regionn")}, f"with packages off, only the cache should answer: {sorted(off_cols)}")
+    check(off_cols == {(15, "regionn"), (21, "categry"), (23, "labell")}, f"with packages off, only the cache should answer: {sorted(off_cols)}")
 
 def scenario_lint_fallback(s):
     """A project .lintr replaces the plugin's profile in the server (lintr
