@@ -695,9 +695,45 @@ collect_symbols <- function(e, acc = character()) {
   if (!is.call(e)) return(acc)
   fn <- call_name(e)
   if (!is.na(fn) && fn %in% c("$", "@", "::", ":::")) return(acc)
-  if (!is.na(fn) && fn %in% quoting_calls) return(acc)
+  if (!is.na(fn) && fn %in% quoting_calls) return(c(acc, island_selection(e) %||% character()))
   for (p in call_args(e)) acc <- collect_symbols(p, acc)
   acc
+}
+
+# A tidy-select island inside data-masked code: `across(<selection>, .fns)`,
+# `pick(<selection>)`, `if_any(<selection>, ...)`, `c_across(<selection>)`,
+# `all_of("a")`. The selection slot is resolved like a select() argument and
+# its names are checked; the function slot (`.fns`, a lambda) is never
+# walked, since it holds function names, not columns. A selection the
+# resolver cannot read (`starts_with()`, `where()`, `all_of(variable)`,
+# `any_of()`) leaves the whole island unchecked, as before.
+island_selection <- function(e) {
+  fn <- call_name(e)
+  if (is.na(fn)) return(NULL)
+  args <- call_args(e)
+  nms <- names(args) %||% rep("", length(args))
+  if (fn == "all_of") return(selection_names(list(e)))
+  if (fn == "pick") return(selection_names(args))
+  if (fn %in% c("across", "if_any", "if_all", "c_across")) {
+    slot <- if (fn == "c_across") "cols" else ".cols"
+    sel <- if (slot %in% nms) args[[slot]] else if (any(!nzchar(nms))) args[!nzchar(nms)][[1L]] else NULL
+    if (is.null(sel)) return(NULL)
+    return(selection_names(list(sel)))
+  }
+  NULL
+}
+
+# The grouping columns a group_by() names: a selection, an island, or a
+# computed group (`group_by(yr = year(date))`, which also adds the column).
+# NULL when any of them cannot be resolved.
+grouping_names <- function(pos) {
+  out <- character()
+  for (a in pos) {
+    g <- if (is.call(a) && call_name(a) %in% c("across", "pick")) island_selection(a) else selection_names(list(a))
+    if (is.null(g)) return(NULL)
+    out <- c(out, g)
+  }
+  out
 }
 
 local_names <- function(e, acc = character()) {
@@ -804,6 +840,7 @@ apply_verb <- function(call, cols, ctx, piped) {
   pos <- args[!nzchar(nms)]
   named <- args[nzchar(nms) & !dot_args]
   group_cols <- attr(cols, "groups") %||% character()
+  groups_unknown <- anyNA(group_cols)
   with_groups <- function(x, g = group_cols) { attr(x, "groups") <- g; keep_source(x, cols) }
   check_all <- function() check_symbols(unlist(lapply(c(pos, named), masked_symbols)), cols, ctx)
   # mutate(a = ..., b = a + 1): each argument sees the columns made before it
@@ -832,22 +869,29 @@ apply_verb <- function(call, cols, ctx, piped) {
   }
   if (fn == "group_by") {
     check_all()
-    g <- selection_names(pos)
+    g <- grouping_names(pos)
+    computed <- names(named)
     add <- isTRUE(args[[".add"]] %||% FALSE)
-    return(with_groups(cols, if (is.null(g)) group_cols else unique(c(if (add) group_cols, g))))
+    # a grouping that cannot be resolved is unknown (NA), never empty: the
+    # columns stay known for mutate()/filter(), and the verbs whose output is
+    # built from the groups (summarise, transmute, count) give up instead of
+    # reporting every grouping column downstream as missing
+    groups <- if (is.null(g) || (add && groups_unknown)) NA_character_ else unique(c(if (add) group_cols, g, computed))
+    return(with_groups(unique(c(cols, computed)), groups))
   }
   if (fn %in% c("mutate", "transmute")) {
     check_sequential()
     if (has_nonsymbol_pos()) return(NULL)
     new <- names(named)
     if (fn == "mutate") return(with_groups(unique(c(cols, new))))
+    if (groups_unknown) return(NULL)
     return(with_groups(unique(c(group_cols, new))))
   }
   if (fn %in% c("summarise", "summarize", "reframe")) {
     check_sequential()
     if (has_nonsymbol_pos()) return(NULL)
     by <- if (".by" %in% nms) by_sel else group_cols
-    if (is.null(by)) return(NULL)
+    if (is.null(by) || anyNA(by)) return(NULL)
     return(with_groups(unique(c(by, names(named))), character()))
   }
   if (fn == "select") {
@@ -873,6 +917,7 @@ apply_verb <- function(call, cols, ctx, piped) {
     g <- selection_names(pos)
     if (is.null(g)) return(NULL)
     nm <- if (!is.null(args[["name"]])) string_arg(args[["name"]]) %||% "n" else "n"
+    if (fn != "add_count" && groups_unknown) return(NULL)
     return(with_groups(if (fn == "add_count") unique(c(cols, nm)) else unique(c(group_cols, g, nm)), character()))
   }
   if (fn == "distinct") {
@@ -880,6 +925,7 @@ apply_verb <- function(call, cols, ctx, piped) {
     g <- selection_names(pos)
     if (is.null(g)) return(NULL)
     if (!length(g) || isTRUE(args[[".keep_all"]] %||% FALSE)) return(with_groups(cols))
+    if (groups_unknown) return(NULL)
     return(with_groups(unique(c(group_cols, g))))
   }
   if (fn == "pivot_longer") {

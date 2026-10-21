@@ -33,3 +33,12 @@ bad11 <- sales %>% mutate(m = mean(amount), .by = c(region, yaer))              
 bad12 <- sales %>% filter(amount > mean(amount), .by = regin)                        # bad
 bad13 <- sales %>% summarise(m = mean(amount), .by = dplyr::all_of("regoin"))            # bad
 bad14 <- sales %>% select(all_of(c("region", "amuont")))                                 # bad
+bad15 <- sales %>% group_by(across(all_of("regoin"))) %>% summarise(m = mean(amount))       # bad
+bad16 <- sales %>% slice_max(amount, by = all_of("regoin"))                                  # bad
+bad17 <- sales %>% mutate(across(c(regoin, amount), mean))                                   # bad
+bad18 <- sales %>% filter(if_any(c(amuont), ~ .x > 1))                                       # bad
+bad19 <- sales %>% group_by(pick(regoin))                                                    # bad
+bad20 <- sales %>% summarise(across(all_of(c("amount", "yaer")), mean), .by = region)        # bad
+bad21 <- sales %>% rowwise() %>% mutate(s = sum(c_across(amuont:year)))                      # bad
+bad22 <- sales %>% group_by(across(c(region, year))) %>% summarise(m = mean(amount)) %>% mutate(z = regoin)  # bad
+bad23 <- sales %>% group_by(yr = year * 2) %>% summarise(m = mean(amount)) %>% mutate(z = yrr)   # bad
