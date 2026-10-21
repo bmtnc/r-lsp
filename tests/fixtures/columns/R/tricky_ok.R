@@ -25,3 +25,7 @@ w <- sales$amount * 2
 x <- sales[sales$year > 2019, c("region", "amount")]
 y <- sales %>% filter(amount > quantile(amount, 0.9)) %>% slice_max(amount, n = 3)
 z <- sales %>% group_by(region) %>% mutate(rank = min_rank(desc(amount))) %>% ungroup() %>% filter(rank == 1)
+k2 <- sales %>% mutate(m = mean(amount), .by = c(region, year)) %>% select(region, m)
+keys <- c("region")
+k3 <- sales %>% summarise(m = mean(amount), .by = dplyr::all_of(keys)) %>% mutate(z = m)
+k4 <- sales %>% slice_max(amount, n = 1, by = region)

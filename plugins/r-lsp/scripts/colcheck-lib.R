@@ -780,6 +780,7 @@ check_symbols <- function(syms, cols, ctx) {
   bad <- syms[!(syms %in% cols) & !(syms %in% ctx$variables) & !(syms %in% ctx$known_names) &
               !vapply(syms, function(s) exists(s, envir = baseenv()), TRUE)]
   for (b in bad) report(ctx, b, cols)
+  invisible(bad)
 }
 
 # Apply one verb call to a known column set; returns the new set or NULL (unknown).
@@ -806,6 +807,13 @@ apply_verb <- function(call, cols, ctx, piped) {
     }
   }
   has_nonsymbol_pos <- function() any(vapply(pos, function(p) !is.symbol(p), TRUE))
+  # `.by =` is the one dot-argument that names columns of the incoming frame
+  # (bare, `c(a, b)`, a helper); check it like group_by()'s arguments. When a
+  # name is wrong the result is unknown: the pipeline fails there at run time,
+  # and carrying the misspelling into the output would only flag the correct
+  # name downstream.
+  by_sel <- if (".by" %in% nms) selection_names(list(args[[".by"]])) else NULL
+  if (!is.null(by_sel) && length(check_symbols(by_sel, cols, ctx))) return(NULL)
 
   if (fn %in% c("filter", "arrange", "slice", "slice_head", "slice_tail", "slice_min", "slice_max",
                 "slice_sample", "drop_na", "fill", "relocate", "ungroup", "rowwise", "glimpse", "print",
@@ -829,7 +837,7 @@ apply_verb <- function(call, cols, ctx, piped) {
   if (fn %in% c("summarise", "summarize", "reframe")) {
     check_sequential()
     if (has_nonsymbol_pos()) return(NULL)
-    by <- if (".by" %in% names(args)) selection_names(list(args[[".by"]])) else group_cols
+    by <- if (".by" %in% nms) by_sel else group_cols
     if (is.null(by)) return(NULL)
     return(with_groups(unique(c(by, names(named))), character()))
   }

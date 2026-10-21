@@ -28,3 +28,6 @@ bad6 <- mtcars %>% filter(mpgg > 20)                                            
 bad7 <- ok6 %>% mutate(c = aa + 1)                                                  # bad
 bad8 <- ggplot(sales, aes(x = yr, y = amount)) + geom_line(aes(colour = regionn))   # bad
 bad9 <- sales |> summarise(m = mean(amount), .by = region) |> mutate(k = year)      # bad
+bad10 <- sales |> summarise(m = mean(amount), .by = regoin)                          # bad
+bad11 <- sales %>% mutate(m = mean(amount), .by = c(region, yaer))                   # bad
+bad12 <- sales %>% filter(amount > mean(amount), .by = regin)                        # bad
