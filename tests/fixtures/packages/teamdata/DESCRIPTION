@@ -1,0 +1,6 @@
+Package: teamdata
+Title: Fake In-House Data Package
+Version: 0.1.0
+Description: Test package: a loader the checker cannot open and cleaning functions it can read.
+License: MIT
+Encoding: UTF-8

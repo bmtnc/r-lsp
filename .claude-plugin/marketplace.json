@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "r-lsp",
-      "version": "1.6.2",
+      "version": "1.7.0",
       "source": "./plugins/r-lsp",
       "description": "R language server for Claude Code with renv support. Tidyverse-aware bug diagnostics, hover, go-to-definition, find-references, workspace symbols and call hierarchy for R, R Markdown and Quarto files; a column-name check for tidyverse code; a static call map of the project; index status and other-repository support.",
       "category": "development",

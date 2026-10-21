@@ -561,7 +561,7 @@ local({
       }
       if (head == "signal_stage") {
         stage <- arg_value(s, "stage", 1L)
-        if (!is.null(stage) && stage %in% c("superseded", "deprecated")) {
+        if (!is.null(stage) && stage %in% c("superseded", "deprecated", "experimental")) {
           return(list(stage = stage, with = arg_value(s, "with", 3L)))
         }
       }
@@ -583,7 +583,7 @@ local({
     # "[Superseded]: coord_polar() has been in favour of coord_radial()".
     # There, only functions named before the replacement count.
     shared <- sum(aliases == aliases[[fun]]) > 1L
-    for (stage in c("defunct", "deprecated", "superseded")) {
+    for (stage in c("defunct", "deprecated", "superseded", "experimental")) {
       at <- gregexpr(paste0("lifecycle-", stage), text, fixed = TRUE)[[1L]]
       if (at[[1L]] < 0L) next
       if (!shared) return(list(stage = stage))
@@ -626,7 +626,9 @@ local({
         if (!is.null(st$when)) sprintf(" as of %s %s", st$pkg, st$when) else "",
         st$pkg, st$version, with),
       defunct = sprintf("%s() is defunct in %s %s and errors when called%s.",
-        fun, st$pkg, st$version, with)
+        fun, st$pkg, st$version, with),
+      experimental = sprintf("%s() is experimental in %s %s: its interface or behaviour may change in a later release; prefer a stable function where one exists.",
+        fun, st$pkg, st$version)
     )
   }
 
@@ -660,7 +662,7 @@ local({
       st <- stages[[paste(pkgs[[i]], funs[[i]], sep = "::")]]
       if (is.null(st)) return(NULL)
       list(node = nodes[[i]], message = stage_message(funs[[i]], st),
-        type = switch(st$stage, superseded = "style", deprecated = "warning", defunct = "error"))
+        type = switch(st$stage, superseded = "style", deprecated = "warning", defunct = "error", experimental = "warning"))
     })
     found <- Filter(Negate(is.null), found)
     if (!length(found)) return(list())

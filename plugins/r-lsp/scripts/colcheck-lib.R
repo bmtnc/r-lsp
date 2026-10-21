@@ -137,13 +137,26 @@ note_unresolved <- function(target, rhs, key, ctx) {
   if (!is.call(head)) return(invisible())
   fn <- call_name(head)
   if (is.na(fn) || fn %in% not_loaders) return(invisible())
+  # A call `learn` cannot evaluate on its own (variables, function literals,
+  # nested project calls, no key) used to leave no note. When it is a package
+  # function the checker followed and could not read, name it instead, so a
+  # skipped pipeline has a cause. A self-contained loader call with a literal
+  # key keeps the learn suggestion below, package or not.
+  head_def <- lookup_function(head, fn, ctx)
+  package_note <- function() {
+    if (!is.null(head_def) && !is.null(head_def$pkg)) {
+      ctx$unresolved[[target]] <- list(line = ctx$line, keys = character(), package_fn = head_def$file,
+                                       expr = paste(deparse(head), collapse = " "), used = !identical(head, rhs))
+    }
+    invisible()
+  }
   # `learn` evaluates the expression on its own, so only a self-contained
   # loader call qualifies: no variables, no function literals, no project
   # function calls nested in the arguments. update_log(log, "step"),
   # list_rbind(imap(chunks, function(...) ...)) and friends are computations.
-  if (length(all.vars(head)) || "function" %in% all.names(head)) return(invisible())
+  if (length(all.vars(head)) || "function" %in% all.names(head)) return(package_note())
   nested <- setdiff(all.names(head), c(fn, "::", ":::"))
-  if (any(nested %in% names(ctx$functions))) return(invisible())
+  if (any(nested %in% names(ctx$functions))) return(package_note())
   # the key is a direct argument of the loader, or of a path built in place
   direct <- call_args(head)
   literals <- unique(unlist(lapply(direct, function(a) {
@@ -156,7 +169,7 @@ note_unresolved <- function(target, rhs, key, ctx) {
     # read.csv(text = x) or read_csv(path_variable) are not learnable sources
     path_arg <- if (length(call_args(head))) call_args(head)[[1L]] else NULL
     if (!is.character(path_arg) && !(is.call(path_arg) && call_name(path_arg) %in% c("here", "file.path"))) return(invisible())
-  } else if (is.null(key) && !length(literals)) return(invisible())
+  } else if (is.null(key) && !length(literals)) return(package_note())
   ctx$unresolved[[target]] <- list(
     line = ctx$line, keys = unique(c(key, literals)), expr = paste(deparse(head), collapse = " "),
     used = !identical(head, rhs))
@@ -254,13 +267,80 @@ return_columns <- function(e, ctx) {
   frame_columns(e, ctx)
 }
 
+# --- installed package functions ---------------------------------------------
+# Raw data usually passes through a team's own package before any dplyr code:
+# `orders <- teamdata::clean_orders(raw, customers)`. The function
+# is installed, so its body is available without running it, and the walker
+# reads it like a project function: parameters bound to the caller's column
+# sets, the columns of the last expression returned. Only the result crosses
+# back out: nothing inside a package body is reported or counted, since the
+# user cannot edit it. Resolution: `pkg::fn` always; a bare name through the
+# packages the file attached with library(); inside a package body, that
+# package's own functions. Reading a function loads the package namespace
+# (its .onLoad runs, as for hover and go-to-definition); set
+# R_LSP_COLCHECK_PACKAGES=false to turn this off.
+package_skip <- c("base", "stats", "utils", "methods", "graphics", "grDevices", "tools", "parallel",
+                  "compiler", "datasets", "dplyr", "tidyr", "purrr", "tibble", "ggplot2", "stringr", "forcats",
+                  "readr", "lubridate", "rlang", "vctrs", "magrittr", "tidyselect", "data.table", "arrow",
+                  "glue", "cli", "withr", "testthat", "janitor", "dbplyr", "DBI", "jsonlite", "httr", "httr2")
+
+# The project's renv library first, so in-house packages are found and
+# judged at the versions the project pins. Once per process.
+use_project_library <- function(root) {
+  if (isTRUE(getOption("r_lsp.colcheck_library_set"))) return(invisible())
+  options(r_lsp.colcheck_library_set = TRUE)
+  if (!file.exists(file.path(root, "renv", "activate.R")) || !requireNamespace("renv", quietly = TRUE)) return(invisible())
+  lib <- quiet(renv::paths$library(project = root))
+  if (is.character(lib) && length(lib) == 1L && dir.exists(lib)) .libPaths(c(lib, .libPaths()))
+  invisible()
+}
+
+packages_enabled <- function() !identical(Sys.getenv("R_LSP_COLCHECK_PACKAGES", "true"), "false")
+
+# A definition for pkg::fn read from the installed package, in the shape
+# project_functions() produces, or NULL (not installed, not a closure).
+package_function <- function(pkg, fn, ctx, exported_only = TRUE) {
+  if (!packages_enabled() || pkg %in% package_skip || is.na(fn) || !nzchar(fn)) return(NULL)
+  if (is.null(ctx$package_defs)) ctx$package_defs <- new.env()
+  key <- paste0(pkg, "::", fn, if (exported_only) "" else ":::")
+  hit <- ctx$package_defs[[key]]
+  if (!is.null(hit)) return(if (identical(hit, FALSE)) NULL else hit)
+  def <- NULL
+  if (quiet(requireNamespace(pkg, quietly = TRUE), FALSE)) {
+    ok <- !exported_only || fn %in% quiet(getNamespaceExports(pkg), character())
+    f <- if (ok) quiet(get0(fn, envir = asNamespace(pkg), inherits = FALSE)) else NULL
+    if (is.function(f) && !is.primitive(f)) {
+      def <- list(fn = as.call(list(as.name("function"), formals(f), body(f))),
+                  file = paste0(pkg, "::", fn), pkg = pkg)
+    }
+  }
+  ctx$package_defs[[key]] <- def %||% FALSE
+  def
+}
+
+# The definition a call reaches: a project function, or an installed package
+# function (see above). `e` is the call, `fn` its bare name.
+lookup_function <- function(e, fn, ctx) {
+  if (is.na(fn)) return(NULL)
+  head <- if (is.call(e)) e[[1L]] else NULL
+  if (is.call(head) && as.character(head[[1L]]) %in% c("::", ":::") && length(head) == 3L) {
+    return(package_function(as.character(head[[2L]]), fn, ctx, exported_only = identical(as.character(head[[1L]]), "::")))
+  }
+  if (!is.null(ctx$pkg_scope)) return(package_function(ctx$pkg_scope, fn, ctx, exported_only = FALSE))
+  if (!is.null(ctx$functions[[fn]])) return(ctx$functions[[fn]])
+  for (pkg in ctx$packages) {
+    def <- package_function(pkg, fn, ctx)
+    if (!is.null(def)) return(def)
+  }
+  NULL
+}
+
 # Column set of a call to a project function, or NULL.
 negative_expectations <- c("expect_error", "expect_warning", "expect_condition", "expect_snapshot_error",
                            "expect_snapshot_warning", "expect_failure")
 
-call_user_function <- function(e, name, ctx) {
-  def <- ctx$functions[[name]]
-  if (is.null(def) || name %in% ctx$call_stack || length(ctx$call_stack) >= 4L) return(NULL)
+call_user_function <- function(e, name, ctx, def = lookup_function(e, name, ctx)) {
+  if (is.null(def) || def$file %in% ctx$call_stack || length(ctx$call_stack) >= 4L) return(NULL)
   if (isTRUE(ctx$in_negative_test)) return(NULL)
   fdef <- def$fn
   proto <- quiet(eval(call("function", fdef[[2L]], NULL)))
@@ -292,11 +372,19 @@ call_user_function <- function(e, name, ctx) {
   }
   ctx$call_sites <- c(ctx$call_sites, sprintf("%s:%s", relative_path(ctx$file, ctx$root), ctx$line))
   ctx$file <- def$file
-  ctx$call_stack <- c(ctx$call_stack, name)
+  ctx$call_stack <- c(ctx$call_stack, def$file)
   saved_in <- ctx$in_function
+  saved_scope <- ctx$pkg_scope
   ctx$in_function <- TRUE
+  ctx$pkg_scope <- def$pkg
   result <- tryCatch(body_columns(fdef[[3L]], ctx), error = function(err) NULL)
+  ctx$pkg_scope <- saved_scope
   ctx$in_function <- saved_in
+  # Columns that came out of a package function: say so, since the function
+  # may have dropped or renamed what the cached source had.
+  if (!is.null(result) && !is.null(def$pkg) && is.null(saved_scope)) {
+    attr(result, "source") <- sprintf("%s() (read from its code)", def$file)
+  }
   ctx$call_stack <- ctx$call_stack[-length(ctx$call_stack)]
   ctx$call_sites <- ctx$call_sites[-length(ctx$call_sites)]
   ctx$frames <- saved$frames
@@ -474,14 +562,15 @@ frame_columns <- function(e, ctx, used = FALSE) {
     if (is.symbol(rhs)) rhs <- as.call(list(rhs))
     if (!is.call(rhs)) return(NULL)
     rhs_fn <- call_name(rhs)
-    lhs <- frame_columns(e[[2L]], ctx, used = used || rhs_fn %in% verb_names || !is.null(ctx$functions[[rhs_fn]]))
+    rhs_def <- lookup_function(rhs, rhs_fn, ctx)
+    lhs <- frame_columns(e[[2L]], ctx, used = used || rhs_fn %in% verb_names || !is.null(rhs_def))
     if (is.null(lhs)) {
       if (!is.na(rhs_fn)) count_step(ctx, "skipped", rhs_fn)
       return(NULL)
     }
-    if (!is.na(rhs_fn) && !is.null(ctx$functions[[rhs_fn]])) {
+    if (!is.null(rhs_def)) {
       ctx$frames[[".colcheck_lhs"]] <- lhs
-      return(call_user_function(pipe_into(rhs, as.name(".colcheck_lhs")), rhs_fn, ctx))
+      return(call_user_function(pipe_into(rhs, as.name(".colcheck_lhs")), rhs_fn, ctx, def = rhs_def))
     }
     return(apply_verb(rhs, lhs, ctx, piped = TRUE))
   }
@@ -513,8 +602,9 @@ frame_columns <- function(e, ctx, used = FALSE) {
   }
   # a project function: bind its parameters, check its body, take its result;
   # when the body does not resolve (a loader), the cache below still can
-  if (!is.null(ctx$functions[[fn]])) {
-    via_function <- call_user_function(e, fn, ctx)
+  fn_def <- lookup_function(e, fn, ctx)
+  if (!is.null(fn_def)) {
+    via_function <- call_user_function(e, fn, ctx, def = fn_def)
     if (!is.null(via_function)) return(via_function)
   }
   # native pipe is parsed into nested calls: verb(frame_expr, ...)
@@ -611,12 +701,13 @@ pin_line <- function(ctx, name) {
 # because the frame's columns are unknowable. Keyed so that the walker
 # visiting a pipeline twice counts it once.
 count_step <- function(ctx, kind, fn) {
-  if (!(fn %in% verbs)) return(invisible())
+  if (!(fn %in% verbs) || !is.null(ctx$pkg_scope)) return(invisible())
   ctx$stats[[kind]] <- union(ctx$stats[[kind]], paste(ctx$file, ctx$line, fn))
   invisible()
 }
 
 report <- function(ctx, name, cols) {
+  if (!is.null(ctx$pkg_scope)) return(invisible())
   src <- attr(cols, "source") %||% "the data"
   via <- if (length(ctx$call_sites)) ctx$call_sites[[length(ctx$call_sites)]] else NULL
   ctx$findings[[length(ctx$findings) + 1L]] <- list(
@@ -933,6 +1024,7 @@ colcheck_file <- function(file, root = NULL) {
   ctx <- new.env()
   ctx$file <- file
   ctx$root <- root %||% colcheck_root(file)
+  use_project_library(ctx$root)
   ctx$filedir <- dirname(normalizePath(file, mustWork = FALSE))
   ctx$frames <- list()
   ctx$unknown_frames <- character()
@@ -983,6 +1075,12 @@ source_notes <- function(ctx) {
   for (nm in names(ctx$unresolved)) {
     u <- ctx$unresolved[[nm]]
     if (!isTRUE(u$used)) next
+    if (!is.null(u$package_fn)) {
+      note(u$line, nm, sprintf(
+        "'%s' comes from %s(), whose output columns could not be read from its code (%s), so column names downstream are not checked. If it returns a fixed table, cache it: add `# cols: KEY` on this line and run r-colcheck learn \"KEY\" '%s'",
+        nm, u$package_fn, u$expr, gsub("'", "'\\\\''", u$expr)))
+      next
+    }
     keys <- u$keys[!(u$keys %in% names(ctx$schemas))]
     key <- if (length(keys)) keys[[1L]] else if (length(u$keys)) u$keys[[1L]] else nm
     note(u$line, nm, sprintf(
