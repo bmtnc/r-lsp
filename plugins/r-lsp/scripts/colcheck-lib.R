@@ -137,10 +137,20 @@ note_unresolved <- function(target, rhs, key, ctx) {
   if (!is.call(head)) return(invisible())
   fn <- call_name(head)
   if (is.na(fn) || fn %in% not_loaders) return(invisible())
-  # a loader is called with keys and paths, not with frames already in hand:
-  # update_log(log, "step") or bind_rows(a, b) are not learnable
-  if (any(vapply(call_args(head), is.symbol, TRUE))) return(invisible())
-  literals <- unique(string_literals(head))
+  # `learn` evaluates the expression on its own, so only a self-contained
+  # loader call qualifies: no variables, no function literals, no project
+  # function calls nested in the arguments. update_log(log, "step"),
+  # list_rbind(imap(chunks, function(...) ...)) and friends are computations.
+  if (length(all.vars(head)) || "function" %in% all.names(head)) return(invisible())
+  nested <- setdiff(all.names(head), c(fn, "::", ":::"))
+  if (any(nested %in% names(ctx$functions))) return(invisible())
+  # the key is a direct argument of the loader, or of a path built in place
+  direct <- call_args(head)
+  literals <- unique(unlist(lapply(direct, function(a) {
+    if (is.character(a)) a
+    else if (is.call(a) && call_name(a) %in% c("file.path", "here", "paste0", "paste", "sprintf", "glue")) string_literals(a)
+    else NULL
+  })))
   if (fn %in% readers) {
     # a reader with a literal path that does not exist locally (an S3 URI);
     # read.csv(text = x) or read_csv(path_variable) are not learnable sources

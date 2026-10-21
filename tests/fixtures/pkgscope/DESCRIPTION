@@ -1,0 +1,5 @@
+Package: pkgscope
+Version: 0.0.1
+Title: Fixture
+Description: Scripts and tests share the package scope; outgoing calls are complete.
+License: MIT

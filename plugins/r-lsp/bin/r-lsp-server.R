@@ -18,6 +18,10 @@
 #   4. Other repositories: a file opened from outside every known workspace
 #      gets its project root added as a workspace (indexed like the main one)
 #      and its renv library attached.
+#   5. Shared scope: scripts and tests see the package's R/ and vice versa
+#      (0.3.19 scoped each document to its package root or source() closure).
+#   6. Complete outgoing calls: skip the shallow-index shortcut that drops
+#      calls inside `!`, subscripts and `if` conditions (0.3.19+).
 #
 # Every patch is wrapped so that a languageserver release that renames an
 # internal disables that patch instead of stopping the server.
@@ -268,5 +272,39 @@ tryCatch({
   }
   assignInNamespace("text_document_did_open", patched_open, ns = "languageserver")
 }, error = function(e) message("r-lsp: multi-repo patch disabled: ", conditionMessage(e)))
+
+# --- 5. scripts and tests see the package ------------------------------------
+# Since 0.3.19 a document is scoped to its package root (files under R/) or to
+# the files it source()s. A script in scripts/ or a test file is in neither,
+# so hover, definition, references and call hierarchy from it into R/ return
+# nothing, and callers in scripts and tests are invisible from R/. In this
+# plugin's projects scripts and tests always use the package (load_all(),
+# library(pkg)), so every open document shares one scope, as before 0.3.19.
+
+tryCatch({
+  ws <- ns$Workspace
+  if (!is.function(ws$public_methods$document_uris_for_context)) stop("no document scoping in this version (nothing to patch)")
+  # the originals also reset the per-scope caches when the document set
+  # changes; keep that, or a namespace built early stays stale
+  ws$set("public", "document_uris_for_context", function(uri = NULL) {
+    all_uris <- self$documents$keys()
+    if (is.function(private$refresh_scope_cache)) private$refresh_scope_cache(all_uris)
+    all_uris
+  }, overwrite = TRUE)
+  ws$set("public", "document_uris_for_references", function(definition_uri, context_uri = definition_uri) {
+    self$document_uris_for_context(context_uri)
+  }, overwrite = TRUE)
+}, error = function(e) message("r-lsp: shared-scope patch disabled: ", conditionMessage(e)))
+
+# --- 6. complete outgoing calls ---------------------------------------------
+# Since 0.3.19 outgoingCalls is answered from a shallow reference index when
+# one exists; it misses calls after `!` or a unary minus, inside subscripts
+# and inside `if` conditions (4 of 26 on a real function). Declining the
+# shortcut makes the reply walk the full parse, as before.
+
+tryCatch({
+  if (!is.function(ns$indexed_outgoing_calls)) stop("no indexed shortcut in this version (nothing to patch)")
+  assignInNamespace("indexed_outgoing_calls", function(workspace, item) NULL, ns = "languageserver")
+}, error = function(e) message("r-lsp: full outgoing-calls patch disabled: ", conditionMessage(e)))
 
 languageserver::run()

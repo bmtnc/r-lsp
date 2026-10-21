@@ -5,12 +5,12 @@ description: Working in an R repository (.R, .Rmd, .qmd files, R packages, tidyv
 
 # R code intelligence in this repository
 
-The R language server runs for `.R`, `.Rmd` and `.qmd` files. It starts on the first edit of an R file. Load the LSP tool once with `ToolSearch "select:LSP"`, then prefer it over text search for these questions:
+The R language server runs for `.R`, `.Rmd` and `.qmd` files. It starts on the first LSP call or edit that touches an R file. Load the LSP tool once with `ToolSearch "select:LSP"`, then prefer it over text search for these questions:
 
 | Question | Operation | Covers |
 |---|---|---|
-| Where is `f` defined? | `goToDefinition` | package `R/`, open files, `source()`d files, installed packages (jumps to a temp copy of the package source) |
-| Who calls `f`? | `findReferences`, `incomingCalls` | same scope; **not** `tests/`, scripts or Rmd |
+| Where is `f` defined? | `goToDefinition` | package `R/`, open files, `source()`d files, installed packages (jumps to a temp copy of the package source); works from scripts and tests into `R/` |
+| Who calls `f`? | `findReferences`, `incomingCalls` | same scope; a test or script counts only once something has opened it, so read the plugin note that follows: it lists every call the server did not return |
 | What does `f` call? | `outgoingCalls` | direct calls only; functions passed as values (`map(x, f)`, `do.call`) are not edges |
 | What does `f` take? | `hover` | signature + roxygen for project functions; the full help page for package functions |
 | What is in this file? | `documentSymbol` | top-level functions and variables |

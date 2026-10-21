@@ -298,6 +298,45 @@ def scenario_complete_answers(s):
     check("indexing" in status and "index ready" in status, f"status events missing:\n{status}")
 
 
+def scenario_shared_scope(s):
+    """Since languageserver 0.3.19 a script or test is scoped away from the
+    package's R/; the plugin restores one shared scope and complete outgoing calls."""
+    root = os.path.join(s.scratch, "pkgscope")
+    shutil.copytree(os.path.join(FIXTURES, "pkgscope"), root)
+    lsp = s.server(root, env={"CLAUDE_PROJECT_DIR": root})
+    try:
+        lsp.open("scripts/run.R")
+        hover = ""
+        for _ in range(15):
+            hover = lsp.hover("scripts/run.R", 2, 12)   # 0-based: line 3 `result <- flag_missing(`
+            if hover:
+                break
+            time.sleep(1)
+        defn = lsp.request("textDocument/definition", {
+            "textDocument": {"uri": lsp.uri("scripts/run.R")},
+            "position": {"line": 2, "character": 12}}).get("result")
+        lsp.open("R/flags.R")
+        items = []
+        for _ in range(10):
+            items = lsp.request("textDocument/prepareCallHierarchy", {
+                "textDocument": {"uri": lsp.uri("R/flags.R")},
+                "position": {"line": 3, "character": 1}}).get("result") or []
+            if items:
+                break
+            time.sleep(1)
+        outgoing = lsp.request("callHierarchy/outgoingCalls", {"item": items[0]}).get("result") or [] if items else []
+        incoming = lsp.request("callHierarchy/incomingCalls", {"item": items[0]}).get("result") or [] if items else []
+    finally:
+        lsp.close()
+    check("flag_missing" in hover, f"hover from a script into R/ is empty (document scope not shared): {hover[:80]!r}")
+    check(bool(defn) and "flags.R" in json.dumps(defn), f"definition from a script did not reach R/flags.R: {defn}")
+    called = {o["to"]["name"] for o in outgoing}
+    check({"is.na", "sum", "as.character"} <= called,
+          f"outgoingCalls dropped calls inside `!`, unary minus or a subscript: {sorted(called)}")
+    callers = {i["from"]["uri"].rsplit("/", 1)[-1] for i in incoming}
+    check("run.R" in callers, f"incomingCalls missed the script caller: {sorted(callers)}")
+
+
 def scenario_other_repository(s):
     """A file opened from another repository gets that repository indexed."""
     other = s.make_package("other_repo")
@@ -462,7 +501,7 @@ def scenario_hooks(s):
 
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,
              scenario_renv_old_lintr, scenario_renv_old_purrr,
-             scenario_complete_answers, scenario_other_repository,
+             scenario_complete_answers, scenario_shared_scope, scenario_other_repository,
              scenario_colcheck, scenario_colcheck_cache, scenario_hooks]
 
 
