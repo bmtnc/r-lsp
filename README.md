@@ -125,7 +125,7 @@ The wrapper also points lintr at the plugin's diagnostics profile (see [Diagnost
 Beyond the server itself, the plugin uses the other channels Claude Code gives a plugin, because Claude Code's LSP client is narrow: its LSP tool has nine read-only operations (definition, references, hover, document and workspace symbols, implementation, call hierarchy), it pushes diagnostics only after Claude's own edits (10 per file, 30 per edit, each shown once per session), and it never tells the server about files changed by `git` or `Bash`. So:
 
 - **A skill** (`skills/r-lsp/SKILL.md`) tells Claude when to use the LSP tool, what each answer covers, and how to check data-frame column names.
-- **Hooks** add what the server cannot say: a `SessionStart` hook prints the project's shape and warms the index cache; after each LSP result a hook appends the mentions `grep` finds in files the server does not index and says whether the index is still building; after each `.R` edit a hook runs the column-name check.
+- **Hooks** add what the server cannot say: a `SessionStart` hook prints the project's shape and warms the index cache; after each LSP result a hook appends the mentions `grep` finds that the answer did not (Rmd/qmd, roxygen links, functions passed as values) and says whether the index is still building; after each `.R` edit a hook runs the column-name and argument checks, and the bug linters when a project `.lintr` wins.
 - **A monitor** tells Claude when the index is ready and when a second repository joins the workspace; the other status events stay in the log for `r-lsp-status`.
 - **Shell tools** on Claude's `PATH`: `r-colcheck`, `r-callmap` and `r-lsp-status`.
 

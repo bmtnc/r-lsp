@@ -30,11 +30,12 @@ cache <- tryCatch(file.path(tools::R_user_dir("languageserver", "cache"), "works
 cat(sprintf("R LSP plugin: %s, %d R files (%d under tests/), %d Rmd/qmd%s. Index cache %s.\n",
   kind, length(rfiles), length(tests), length(rmd), if (renv) ", renv project" else "",
   if (nzchar(cache) && file.exists(cache)) "warm" else "cold (building in the background)"))
-cat("The R language server starts on the first .R edit. Cross-file answers (findReferences,",
-    "workspaceSymbol, call hierarchy) wait for indexing, up to ~30 s once, then return complete",
-    "results for R/ files; a note after each LSP result lists any mentions grep finds in files the",
-    "server does not index (tests/, scripts, Rmd). Files from other repositories are indexed on",
-    "first open. Column-name mistakes in tidyverse code are checked after each edit (r-colcheck).\n")
+cat("The R language server starts on the first LSP call or .R edit. Cross-file answers (findReferences,",
+    "workspaceSymbol, call hierarchy) wait for indexing, up to ~30 s once, then return complete results",
+    "for every .R file in the project (R/, tests, scripts; git-ignored files excepted) and the files they",
+    "source(); a note after each LSP result lists any mentions grep finds that the answer did not",
+    "(Rmd/qmd, roxygen links, functions passed as values). Files from other repositories are indexed on",
+    "first open. Column-name and argument mistakes are checked after each edit (r-colcheck).\n")
 # Diagnostics: which lintr config the server will use. A project or home
 # .lintr replaces the plugin's profile; say so, or a missing diagnostic reads
 # as a clean file.
@@ -47,8 +48,8 @@ if (lint_profile_off()) {
   cat("Lint profile off (R_LSP_AGENT_LINTERS=false): after-edit diagnostics are lintr's defaults.\n")
 } else if (!is.null(cfg)) {
   cat(sprintf(paste("Lint profile inactive: %s takes precedence in the language server, so LSP diagnostics are that",
-                    "file's rules. The plugin's bug linters (undefined functions, non-exported pkg::fun, deprecated or",
-                    "superseded calls, missing packages) run from the post-edit hook instead and appear in its note.\n"),
+                    "file's rules. The plugin's bug linters (undefined functions, non-exported pkg::fun, deprecated,",
+                    "superseded or experimental calls, missing packages) run from the post-edit hook instead and appear in its note.\n"),
               cfg))
 }
 note <- lintr_version_note()
