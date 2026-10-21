@@ -24,6 +24,24 @@ op <- ti$operation %||% ""
 file <- ti$filePath %||% ""
 root <- Sys.getenv("CLAUDE_PROJECT_DIR", input$cwd %||% getwd())
 if (nzchar(file) && !file.exists(file) && file.exists(file.path(root, file))) file <- file.path(root, file)
+# A file from another repository (opened from this session): grep that
+# repository, not this one. Its root is found the way the server finds it.
+project_root_of <- function(path) {
+  dir <- dirname(normalizePath(path, mustWork = FALSE))
+  home <- normalizePath("~", mustWork = FALSE)
+  markers <- c("DESCRIPTION", "renv.lock", "_targets.R", ".here", ".git")
+  while (nzchar(dir) && dir != dirname(dir) && dir != home) {
+    if (any(file.exists(file.path(dir, markers))) || length(list.files(dir, pattern = "[.]Rproj$"))) return(dir)
+    dir <- dirname(dir)
+  }
+  NULL
+}
+session_root <- root
+if (nzchar(file) && file.exists(file) &&
+    !startsWith(normalizePath(file, mustWork = FALSE), paste0(normalizePath(root, mustWork = FALSE), "/"))) {
+  other <- project_root_of(file)
+  if (!is.null(other)) root <- other
+}
 resp <- input$tool_response
 resp_text <- if (is.character(resp)) paste(resp, collapse = "\n") else
   if (is.list(resp) && is.character(resp$formatted)) resp$formatted else
@@ -35,7 +53,7 @@ status_file <- Sys.getenv("R_LSP_STATUS_FILE",
   file.path(Sys.getenv("CLAUDE_PLUGIN_DATA", ""), "status.log"))
 if (file.exists(status_file)) {
   lines <- tryCatch(readLines(status_file, warn = FALSE), error = function(e) character())
-  mine <- grep(paste0("[", root, "]"), lines, fixed = TRUE, value = TRUE)
+  mine <- grep(paste0("[", session_root, "]"), lines, fixed = TRUE, value = TRUE)
   # only the most recently started server's events; a server that has
   # exited (plugin reload) left "indexing" lines that mean nothing now
   marker <- grep("R LSP: server started", mine, fixed = TRUE)

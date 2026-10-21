@@ -363,13 +363,24 @@ def scenario_other_repository(s):
         time.sleep(3)
         uris = references(lsp, tax, 4, 0)
         sym = lsp.request("workspace/symbol", {"query": "gross"}).get("result") or []
+        # the other repository's R/ is parsed and its tests loaded, as for the session's own
     finally:
         lsp.close()
     files = {u.rsplit("/", 1)[-1] for u in uris}
     check("other.R" in files, f"references in the other repository missed R/other.R: {sorted(files)}")
+    check("test-tax.R" in files, f"references in the other repository missed tests/testthat/test-tax.R: {sorted(files)}")
     check(any(x.get("name") == "gross" for x in sym), "workspace symbol did not find gross() in the other repository")
     with open(status_file) as f:
-        check("added workspace" in f.read(), "status log has no 'added workspace' event")
+        log = f.read()
+    check("added workspace" in log, "status log has no 'added workspace' event")
+    check("loaded 1 test/script files as documents" in log, f"the other repository's tests were not loaded:\n{log}")
+    hook = os.path.join(REPO, "plugins", "r-lsp", "hooks", "post-lsp.sh")
+    payload = {"tool_name": "LSP", "cwd": root,
+               "tool_input": {"operation": "findReferences", "filePath": tax, "line": 5, "character": 1},
+               "tool_response": "Found 1 references across 1 files:\n\nR/tax.R:\n  Line 5:1"}
+    ctx = hook_context(run_hook(hook, payload, env={"CLAUDE_PROJECT_DIR": root}))
+    check("R/other.R:1:" in ctx and "tests/testthat/test-tax.R:2:" in ctx,
+          f"post-lsp note did not grep the other repository:\n{ctx}")
 
 
 def scenario_colcheck(s):
