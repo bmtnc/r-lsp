@@ -514,6 +514,59 @@ def scenario_colcheck_cache(s):
     check(probe_cols == ["renv_on"], f"learn ran without renv active: columns {probe_cols}")
 
 
+def scenario_lint_fallback(s):
+    """A project .lintr replaces the plugin's profile in the server (lintr
+    takes the first config it finds), so the post-edit hook runs the bug
+    linters itself and the session-start context says so."""
+    root = s.make_package("lintfb")
+    lintr_cfg = ("linters: linters_with_defaults(\n    line_length_linter(120L),\n"
+                 "    pipe_consistency_linter(pipe = \"%>%\"),\n    object_usage_linter = NULL,\n"
+                 "    object_length_linter = NULL,\n    commented_code_linter = NULL\n  )\n")
+    probe = os.path.join(root, "R", "probe.R")
+    with open(probe, "w") as f:
+        f.write("x <- stats::not_real_function(1)\ny <- misspelled_fn(2)\nz <- 3\n")
+    hook = os.path.join(REPO, "plugins", "r-lsp", "hooks", "post-edit.sh")
+    start = os.path.join(REPO, "plugins", "r-lsp", "hooks", "session-start.sh")
+    payload = {"tool_name": "Edit", "tool_input": {"file_path": probe}, "cwd": root}
+    env = {"CLAUDE_PROJECT_DIR": root}
+
+    # No project config: the server's profile applies, the hook adds nothing.
+    out = run_hook(hook, payload, env=env)
+    check(out.strip() == "", f"hook ran the bug linters although no .lintr exists:\n{out}")
+    check("Lint profile inactive" not in run_hook(start, {}, env=env, stdin_text="{}"),
+          "session-start reported an inactive profile without a .lintr")
+
+    with open(os.path.join(root, ".lintr"), "w") as f:
+        f.write(lintr_cfg)
+    ctx = hook_context(run_hook(hook, payload, env=env))
+    check("bug linters on probe.R" in ctx and ".lintr takes precedence" in ctx, f"hook note missing the fallback section:\n{ctx}")
+    check("R/probe.R:1:13: 'not_real_function' is not exported from {stats}. [namespace_linter]" in ctx,
+          f"namespace lint missing from the hook note:\n{ctx}")
+    check('R/probe.R:2:6: could not find function "misspelled_fn" [undefined_function_linter]' in ctx,
+          f"undefined-function lint missing from the hook note:\n{ctx}")
+    check("could not run" not in ctx, f"the profile failed to load in the hook:\n{ctx}")
+    if rscript('cat(requireNamespace("dplyr", quietly = TRUE))').strip() == "TRUE":
+        with open(probe, "a") as f:
+            f.write("w <- dplyr::summarise_each(data.frame(a = 1), dplyr::funs(mean))\n")
+        ctx = hook_context(run_hook(hook, payload, env=env))
+        check("summarise_each" in ctx and ("deprecated" in ctx or "superseded" in ctx or "defunct" in ctx),
+              f"lifecycle lint missing from the hook note:\n{ctx}")
+    started = run_hook(start, {}, env=env, stdin_text="{}")
+    check("Lint profile inactive" in started and ".lintr takes precedence" in started and "post-edit hook" in started,
+          f"session-start did not report the inactive profile:\n{started}")
+
+    # A .lintr.R and a config under .github/linters/ win the same way.
+    os.remove(os.path.join(root, ".lintr"))
+    os.makedirs(os.path.join(root, ".github", "linters"), exist_ok=True)
+    with open(os.path.join(root, ".github", "linters", ".lintr"), "w") as f:
+        f.write(lintr_cfg)
+    ctx = hook_context(run_hook(hook, payload, env=env))
+    check(".github/linters/.lintr takes precedence" in ctx and "[namespace_linter]" in ctx,
+          f"a .github/linters/.lintr was not treated as the winning config:\n{ctx}")
+    shutil.rmtree(os.path.join(root, ".github"))
+    check(run_hook(hook, payload, env=env).strip() == "", "hook kept running the bug linters after the config was removed")
+
+
 def scenario_callmap(s):
     """r-callmap: the static call map of a package, its neighbourhood view and
     JSON, with no server. The chain avoids one-letter names: a project function
@@ -750,7 +803,7 @@ def scenario_hooks(s):
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,
              scenario_renv_old_lintr, scenario_renv_old_purrr,
              scenario_complete_answers, scenario_shared_scope, scenario_other_repository,
-             scenario_colcheck, scenario_colcheck_cache, scenario_callmap, scenario_hooks]
+             scenario_colcheck, scenario_colcheck_cache, scenario_lint_fallback, scenario_callmap, scenario_hooks]
 
 
 def main():

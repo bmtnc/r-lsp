@@ -63,6 +63,28 @@ if (ls_version < "0.3.19") {
   status(old_note)
 }
 
+# Which lintr config wins (scripts/lint-config.R, shared with the hook and
+# the session-start context). Without it, assume the profile applies.
+lint_config_file <- function(path) NULL
+lint_profile_off <- function() FALSE
+lintr_version_note <- function() NULL
+tryCatch(source(file.path(Sys.getenv("R_LSP_PLUGIN_ROOT"), "scripts", "lint-config.R"), local = TRUE),
+         error = function(e) NULL)
+lintr_note <- lintr_version_note()
+if (!is.null(lintr_note)) status(lintr_note)
+# Said at startup, where r-lsp-status shows it: a project or home .lintr
+# replaces the profile, and the post-edit hook runs the bug linters instead.
+note_lint_config <- function(root) {
+  tryCatch({
+    if (lint_profile_off()) {
+      status("lint profile off (R_LSP_AGENT_LINTERS=false): diagnostics use lintr's defaults")
+    } else {
+      cfg <- lint_config_file(root)
+      if (!is.null(cfg)) status(sprintf("lint profile inactive: %s takes precedence; the post-edit hook runs the plugin's bug linters instead", cfg))
+    }
+  }, error = function(e) NULL)
+}
+
 # Runs on every event-loop turn, so it must survive any languageserver
 # version: an internal that is missing (has_work() and the workspace index
 # arrived in 0.3.19) reads as "not busy", never as an error.
@@ -179,6 +201,7 @@ patched_initialized <- function(self, params) {
       error = function(e) message("r-lsp: renv activation failed: ", conditionMessage(e)))
   }
   orig_initialized(self, params)
+  if (!is.null(self$rootPath)) note_lint_config(self$rootPath)
   tryCatch(if (index_busy(self)) note_busy(self, "workspace"), error = function(e) NULL)
 }
 assignInNamespace("on_initialized", patched_initialized, ns = "languageserver")

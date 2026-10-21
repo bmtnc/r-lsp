@@ -35,6 +35,24 @@ cat("The R language server starts on the first .R edit. Cross-file answers (find
     "results for R/ files; a note after each LSP result lists any mentions grep finds in files the",
     "server does not index (tests/, scripts, Rmd). Files from other repositories are indexed on",
     "first open. Column-name mistakes in tidyverse code are checked after each edit (r-colcheck).\n")
+# Diagnostics: which lintr config the server will use. A project or home
+# .lintr replaces the plugin's profile; say so, or a missing diagnostic reads
+# as a clean file.
+lint_config_file <- function(path) NULL
+lint_profile_off <- function() FALSE
+lintr_version_note <- function() NULL
+tryCatch(source(file.path(script_dir, "lint-config.R"), local = TRUE), error = function(e) NULL)
+cfg <- tryCatch(lint_config_file(root), error = function(e) NULL)
+if (lint_profile_off()) {
+  cat("Lint profile off (R_LSP_AGENT_LINTERS=false): after-edit diagnostics are lintr's defaults.\n")
+} else if (!is.null(cfg)) {
+  cat(sprintf(paste("Lint profile inactive: %s takes precedence in the language server, so LSP diagnostics are that",
+                    "file's rules. The plugin's bug linters (undefined functions, non-exported pkg::fun, deprecated or",
+                    "superseded calls, missing packages) run from the post-edit hook instead and appear in its note.\n"),
+              cfg))
+}
+note <- lintr_version_note()
+if (!is.null(note)) cat(note, "\n")
 # Counting definitions parses every file: ~0.3 s for 240 files. Above 500
 # files the sentence goes without the count to keep the hook fast.
 n_defs <- if (have_callmap && length(rfiles) <= 500L) tryCatch({

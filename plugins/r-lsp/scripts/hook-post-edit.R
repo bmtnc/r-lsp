@@ -10,7 +10,39 @@ if (is.null(file) || !is.character(file) || !grepl("[.][Rr]$", file) || !file.ex
 root <- Sys.getenv("CLAUDE_PROJECT_DIR", input$cwd %||% getwd())
 source(file.path(script_dir, "colcheck-lib.R"), local = TRUE)
 findings <- tryCatch(colcheck_files(file, root), error = function(e) list())
-if (!length(findings)) quit(save = "no", status = 0)
+
+# --- the plugin's bug linters, when the server cannot run them ---------------
+# A project or home .lintr replaces the profile in the language server (lintr
+# takes the first config it finds and merges nothing), so in those projects
+# the deprecated, namespace and undefined-function checks run here instead,
+# on the edited file, and reach subagents too. A failure is reported, not
+# swallowed: silence must mean "checked and clean".
+source(file.path(script_dir, "lint-config.R"), local = TRUE)
+lint_winner <- tryCatch(lint_config_file(file), error = function(e) NULL)
+lint_lines <- character()
+lint_failure <- NULL
+if (!is.null(lint_winner) && !lint_profile_off()) {
+  res <- tryCatch({
+    # lintr itself from the global library, as the server runs it; only the
+    # packages the code calls are looked up in the project's renv library
+    # (prepended next), so lifecycle stages and exports are judged against
+    # the versions the project pins.
+    loadNamespace("lintr")
+    if (file.exists(file.path(root, "renv", "activate.R")) && requireNamespace("renv", quietly = TRUE)) {
+      lib <- tryCatch(renv::paths$library(project = root), error = function(e) NULL)
+      if (is.character(lib) && length(lib) == 1L && dir.exists(lib)) .libPaths(c(lib, .libPaths()))
+    }
+    linters <- source(file.path(script_dir, "..", "lintr", "agent_linters.R"), local = new.env())$value
+    lints <- lintr::lint(file, linters = linters)
+    # Parse errors reach Claude from the server whichever config wins.
+    lints <- Filter(function(l) !identical(l$type, "error"), lints)
+    vapply(lints, function(l) sprintf("%s:%d:%d: %s [%s]", relative_path(file, root), l$line_number,
+                                      l$column_number, l$message, l$linter), "")
+  }, error = function(e) e)
+  if (inherits(res, "error")) lint_failure <- conditionMessage(res) else lint_lines <- res
+}
+
+if (!length(findings) && !length(lint_lines) && is.null(lint_failure)) quit(save = "no", status = 0)
 kinds <- vapply(findings, function(x) x$kind %||% "column", "")
 columns <- findings[kinds == "column"]
 arguments <- findings[kinds == "argument"]
@@ -22,7 +54,7 @@ clip <- function(lines, n = 15) {
   paste0(paste(shown, collapse = "\n"),
          if (length(lines) > length(shown)) sprintf("\n... and %d more", length(lines) - length(shown)) else "")
 }
-parts <- sprintf("r-colcheck (this plugin) on %s:", basename(file))
+parts <- if (length(findings)) sprintf("r-colcheck (this plugin) on %s:", basename(file)) else character()
 if (length(columns)) {
   parts <- c(parts,
     "Column names that cannot exist at that point in the pipeline, checked against the columns of the data the code reads:",
@@ -42,6 +74,12 @@ if (length(notes)) {
     "Data sources the checker cannot open (nothing downstream of these is checked):",
     clip(colcheck_format(notes, root), 5),
     "The r-lsp skill explains `r-colcheck learn`: run it once per dataset, with --source for the file that defines the loader.")
+}
+if (length(lint_lines) || !is.null(lint_failure)) {
+  parts <- c(parts,
+    sprintf("Diagnostics from the plugin's bug linters on %s (%s takes precedence in the language server, so these never arrive as LSP diagnostics; the file's own lintr rules still do):",
+            basename(file), relative_path(lint_winner, root)),
+    if (length(lint_lines)) clip(lint_lines) else sprintf("the linters could not run: %s", lint_failure))
 }
 text <- paste(parts, collapse = "\n")
 cat(jsonlite::toJSON(list(hookSpecificOutput = list(hookEventName = "PostToolUse", additionalContext = text)),

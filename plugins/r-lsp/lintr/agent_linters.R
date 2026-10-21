@@ -369,10 +369,14 @@ local({
 
   # A linter that errors aborts the whole lintr run, so each one here is
   # wrapped: on an internal error it reports `fallback()` instead.
+  # `linter_level=` arrived in lintr 3.2.0; before that, Linter() takes the
+  # function alone and lint() runs it at every level, which these linters
+  # tolerate (they read the whole file from source_expression).
+  linter_args <- if ("linter_level" %in% names(formals(lintr::Linter))) list(linter_level = "file") else list()
   safe_linter <- function(fun, fallback = function(source_expression) list()) {
-    lintr::Linter(linter_level = "file", function(source_expression) {
+    do.call(lintr::Linter, c(list(function(source_expression) {
       tryCatch(fun(source_expression), error = function(e) fallback(source_expression))
-    })
+    }), linter_args))
   }
 
   # Run a lintr linter, then keep only the lints `keep(lint, source_expression)`
