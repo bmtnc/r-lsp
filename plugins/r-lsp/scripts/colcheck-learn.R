@@ -61,9 +61,20 @@ write_cache <- function(s) {
 # Column names and types of whatever a loader returned, reading no rows when
 # the object exposes a schema.
 describe <- function(obj) {
-  cols <- function(names, types, method) {
+  cols <- function(names, types, method, inner = NULL) {
     types <- as.character(types)
-    list(method = method, columns = Map(function(n, t) list(name = n, type = if (is.na(t)) NULL else t), names, types))
+    if (is.null(inner)) inner <- vector("list", length(names))
+    list(method = method, columns = Map(function(n, t, i) c(list(name = n, type = if (is.na(t)) NULL else t),
+                                                             if (!is.null(i)) list(inner = i)), names, types, inner))
+  }
+  # a list-column of data frames: the columns of its first non-empty element
+  # are recorded under it, so unnest() can be followed; nested data is one
+  # shape per row in nearly all real tables, so one sample is enough
+  inner_columns <- function(x) {
+    if (!is.list(x) || is.data.frame(x)) return(NULL)
+    el <- Filter(function(v) !is.null(v) && is.data.frame(v) && length(v), x)
+    if (!length(el)) return(NULL)
+    unname(Map(function(n, t) list(name = n, type = t), names(el[[1L]]), vapply(el[[1L]], function(v) class(v)[[1L]], "")))
   }
   if (inherits(obj, "ArrowObject") || inherits(obj, "arrow_dplyr_query")) {
     sch <- quiet(obj$schema)
@@ -74,7 +85,7 @@ describe <- function(obj) {
     return(cols(names(obj), rep(NA_character_, length(names(obj))), "arrow_names"))
   }
   if (is.data.frame(obj)) {
-    return(cols(names(obj), vapply(obj, function(x) class(x)[[1L]], ""), "data_frame"))
+    return(cols(names(obj), vapply(obj, function(x) class(x)[[1L]], ""), "data_frame", lapply(obj, inner_columns)))
   }
   if (inherits(obj, "tbl_lazy")) {
     nm <- colnames(obj)
@@ -112,7 +123,10 @@ if (cmd == "learn") {
   s[[key]] <- list(expr = expr, observed_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
                    method = d$method, columns = unname(d$columns))
   created <- write_cache(s)
+  nested <- vapply(d$columns, function(cl) if (!is.null(cl$inner)) cl$name else NA_character_, "")
+  nested <- nested[!is.na(nested)]
   cat(sprintf("learned \"%s\": %d columns via %s -> %s", key, length(d$columns), d$method, rel_path),
+      if (length(nested)) sprintf(" (inner columns recorded for list-column %s)", paste(nested, collapse = ", ")) else "",
       if (created) "\n.colcheck/ is gitignored (its own .gitignore); delete .colcheck/.gitignore to commit the cache." else "",
       "\n", sep = "")
   quit(save = "no", status = 0)

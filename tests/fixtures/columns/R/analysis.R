@@ -44,3 +44,5 @@ bad22 <- sales %>% group_by(across(c(region, year))) %>% summarise(m = mean(amou
 bad23 <- sales %>% group_by(yr = year * 2) %>% summarise(m = mean(amount)) %>% mutate(z = yrr)   # bad
 bad24 <- sales %>% filter(amount > 0) %>% pull(amuont)                                       # bad
 bad25 <- sales |> pull(var = regoin)                                                         # bad
+bad26 <- tibble(id = 1, data = list(tibble(d = 1, r = 2))) %>% unnest(data) %>% filter(zzz == 1)   # bad
+bad27 <- tibble(id = 1, data = list(tibble(d = 1, r = 2))) %>% hoist(data, first = "dd")            # bad

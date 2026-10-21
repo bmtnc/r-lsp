@@ -103,6 +103,15 @@ schema_columns <- function(key, ctx) {
   cols <- cols[nzchar(cols)]
   if (!length(cols)) return(NULL)
   observed <- substr(as.character(entry$observed_at %||% ""), 1L, 10L)
+  inner <- list()
+  for (cl in entry$columns) {
+    if (is.list(cl) && is.list(cl$inner) && length(cl$inner)) {
+      inn <- vapply(cl$inner, function(x) if (is.list(x)) as.character(x$name %||% "") else as.character(x), "")
+      inn <- inn[nzchar(inn)]
+      if (length(inn)) inner[[as.character(cl$name)]] <- inn
+    }
+  }
+  if (length(inner)) attr(cols, "inner") <- inner
   attr(cols, "source") <- sprintf("cached schema \"%s\"%s", key,
                                   if (nzchar(observed)) paste0(", observed ", observed) else "")
   age <- quiet(as.integer(Sys.Date() - as.Date(observed)))
@@ -183,8 +192,9 @@ pipeline_head <- function(e) {
 nesting_verbs <- c("unnest", "unnest_wider", "unnest_longer", "hoist")
 note_stop <- function(ctx, call, fn, def) {
   if (!is.null(ctx$stopped) || !is.null(ctx$pkg_scope)) return(invisible())
+  if (fn %in% c("ggplot", "+")) return(invisible())   # a plot is not a frame; nothing was lost
   reason <- if (!is.null(def) && !is.null(def$pkg)) "its code could not be read"
-    else if (fn %in% nesting_verbs) "the columns inside the list-column it expands are not known"
+    else if (fn %in% nesting_verbs) "the columns inside the list-column it expands are not recorded; re-run r-colcheck learn for its source, since entries learned before 1.7.13 carry no inner columns"
     else "its output column names cannot be worked out statically"
   ctx$stopped <- list(fn = fn, expr = paste(deparse(call), collapse = " "), line = ctx$line, reason = reason)
   invisible()
@@ -641,6 +651,7 @@ builtin_dataset <- function(nm, ctx) {
 
 keep_source <- function(cols, template) {
   attr(cols, "source") <- attr(template, "source")
+  attr(cols, "inner") <- attr(template, "inner")
   cols
 }
 
@@ -712,6 +723,19 @@ frame_columns <- function(e, ctx, used = FALSE) {
     if (is.null(nms) || any(!nzchar(nms))) return(NULL)
     cols <- nms
     attr(cols, "source") <- paste0(fn, "() literal")
+    # data = list(tibble(d = 1, r = 2)): the inner columns of a list-column
+    inner <- list()
+    for (i in seq_along(nms)) {
+      a <- e[[i + 1L]]
+      if (is.call(a) && identical(call_name(a), "list") && length(a) >= 2L) {
+        first <- a[[2L]]
+        if (is.call(first) && call_name(first) %in% c("tibble", "data.frame", "data_frame")) {
+          inn <- names(first)[-1L]
+          if (!is.null(inn) && all(nzchar(inn))) inner[[nms[[i]]]] <- inn
+        }
+      }
+    }
+    if (length(inner)) attr(cols, "inner") <- inner
     return(cols)
   }
   if (fn == "tribble") {
@@ -935,6 +959,34 @@ apply_verb <- function(call, cols, ctx, piped) {
     }
   }
   has_nonsymbol_pos <- function() any(vapply(pos, function(p) !is.symbol(p), TRUE))
+  if (fn %in% nesting_verbs) {
+    inner <- attr(cols, "inner") %||% list()
+    col_arg <- if (fn == "hoist") (if (".col" %in% nms) args[[".col"]] else if (length(pos)) pos[[1L]] else NULL)
+      else if ("cols" %in% nms) args[["cols"]] else if ("col" %in% nms) args[["col"]] else if (length(pos)) pos[[1L]] else NULL
+    sel <- if (is.null(col_arg)) NULL else selection_names(list(col_arg))
+    if (is.null(sel)) return(NULL)
+    bad <- check_symbols(sel, cols, ctx)
+    if (length(bad)) return(NULL)
+    if (fn == "unnest_longer") return(with_groups(cols))
+    if (fn == "hoist") {
+      # hoist(series, first = "d", second = list("x", 1)): each field names a
+      # column inside the list-column; a string field is checked against the
+      # recorded inner columns when they are known
+      fields <- named[!(names(named) %in% c(".remove", ".simplify", ".ptype", ".transform"))]
+      inn <- inner[[sel[[1L]]]]
+      if (!is.null(inn)) {
+        strings <- unlist(lapply(fields, function(f) if (is.character(f) && length(f) == 1L) f else
+          if (is.call(f) && identical(call_name(f), "list") && length(f) >= 2L && is.character(f[[2L]])) f[[2L]] else NULL))
+        if (length(strings)) check_symbols(strings, structure(inn, source = attr(cols, "source")), ctx)
+      }
+      return(with_groups(unique(c(cols, names(fields)))))
+    }
+    # unnest(), unnest_wider(): the list-columns are replaced by their inner columns
+    if (!all(sel %in% names(inner))) return(NULL)
+    res <- with_groups(unique(c(setdiff(cols, sel), unlist(inner[sel], use.names = FALSE))))
+    attr(res, "inner") <- inner[setdiff(names(inner), sel)]
+    return(res)
+  }
   if (fn %in% terminal_calls) {
     if (fn == "pull") {
       var <- if ("var" %in% nms) args[["var"]] else if (length(pos)) pos[[1L]] else NULL
@@ -1079,7 +1131,8 @@ check_ggplot <- function(e, ctx) {
 # Verb calls the walker checks when they appear on their own.
 verbs <- c("mutate", "filter", "summarise", "summarize", "select", "arrange", "group_by", "rename",
            "transmute", "distinct", "count", "pivot_longer", "pivot_wider", "ggplot", "slice", "reframe",
-           "left_join", "inner_join", "right_join", "full_join", "semi_join", "anti_join", "pull")
+           "left_join", "inner_join", "right_join", "full_join", "semi_join", "anti_join", "pull",
+           "unnest", "unnest_wider", "unnest_longer", "hoist")
 
 # Everything apply_verb() understands: a call to one of these is a pipeline
 # step, never a data source.

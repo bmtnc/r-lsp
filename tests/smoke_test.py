@@ -556,6 +556,15 @@ def scenario_colcheck_cache(s):
     out, columns, notes = run_check()
     check(columns == bad | later, f"after learn expected {sorted(bad | later)}, got {sorted(columns)}:\n{out}")
     check(not notes, f"unresolved note persists after learn:\n{out}")
+    nested = subprocess.run([tool, "learn", "nested/sample",
+                             '{ x <- data.frame(id = 1); x$data <- list(data.frame(d = 1, r = 2)); x }'],
+                            cwd=root, capture_output=True, text=True, timeout=120)
+    check(nested.returncode == 0 and "inner columns recorded for list-column data" in nested.stdout,
+          f"learn did not record inner columns:\n{nested.stdout}\n{nested.stderr}")
+    with open(os.path.join(root, ".colcheck", "schemas.json")) as f:
+        entry_cols = {c["name"]: c for c in json.load(f)["nested/sample"]["columns"]}
+    check([c["name"] for c in entry_cols["data"].get("inner", [])] == ["d", "r"],
+          f"cache entry lacks inner columns: {entry_cols}")
     listing = subprocess.run([tool, "schemas", "--root", root], capture_output=True, text=True, timeout=120).stdout
     check("holdings/latest  3 columns" in listing, f"schemas listing unexpected:\n{listing}")
 
@@ -596,7 +605,10 @@ def scenario_colcheck_packages(s):
                           "customers": entry("customers", ["customer_id", "region"]),
                           # keyed on the function: no literal in the call, no comment on the line
                           "teamdata::taxonomy": entry("taxonomy", ["product", "category"]),
-                          "fixed_table": entry("fixed", ["code", "label"])})
+                          "fixed_table": dict(entry("fixed", ["code", "label"]),
+                                              columns=[{"name": "code", "type": "character"}, {"name": "label", "type": "character"},
+                                                       {"name": "series", "type": "list",
+                                                        "inner": [{"name": "d", "type": "Date"}, {"name": "r", "type": "double"}]}])})
     script = (
         "library(teamdata)\n"
         "raw <- teamdata::fetch_table(Sys.Date(), \"orders\")\n"
@@ -633,7 +645,12 @@ def scenario_colcheck_packages(s):
         "bad8 <- raw %>% dplyr::pull(idd)\n"
         # a cached source, then a step that loses the columns: the note names the step
         "nested <- teamdata::taxonomy(raw, customers) %>% dplyr::filter(category != \"x\") %>% tidyr::unnest(product)\n"
-        "nested %>% dplyr::select(zz)\n")
+        "nested %>% dplyr::select(zz)\n"
+        # a list-column with recorded inner columns: unnest() and hoist() are followed
+        "ser <- fixed_table() %>% dplyr::filter(code != \"x\") %>% tidyr::unnest(series)\n"
+        "bad9 <- ser %>% dplyr::select(code, d, rr)\n"
+        "h <- fixed_table() %>% tidyr::hoist(series, first = \"d\", second = \"qq\")\n"
+        "h %>% dplyr::select(first, second, code, serie)\n")
     root = s.make_renv_project("colcheck_pkgs", {}, extra_packages=("teamdata", "cranlike"))
     for rel, text in (("script/run.R", script), (".colcheck/schemas.json", schemas)):
         os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
@@ -644,7 +661,7 @@ def scenario_colcheck_packages(s):
     check(out.returncode == 1, f"r-colcheck exited {out.returncode} (expected 1, findings):\n{out.stderr}")
     findings = json.loads(out.stdout)
     cols = {(f["line"], f["name"]) for f in findings if f["kind"] == "column"}
-    check(cols == {(6, "amount"), (7, "idd"), (9, "extra"), (15, "regionn"), (17, "status"), (21, "categry"), (23, "labell"), (28, "idd")},
+    check(cols == {(6, "amount"), (7, "idd"), (9, "extra"), (15, "regionn"), (17, "status"), (21, "categry"), (23, "labell"), (28, "idd"), (32, "rr"), (33, "qq"), (34, "serie")},
           f"column findings unexpected: {sorted(cols)}\n{out.stdout}")
     src = {f["line"]: f["source"] for f in findings if f["kind"] == "column"}
     check(src[6] == src[9] == "teamdata::clean_orders() (read from its code)", f"finding source unexpected: {src}")
@@ -652,6 +669,7 @@ def scenario_colcheck_packages(s):
     check(src[17] == "teamdata::load_clean() (read from its code)", f"inner-loader source unexpected: {src[17]}")
     check(src[21].startswith("cached schema \"teamdata::taxonomy\"") and src[23].startswith("cached schema \"fixed_table\""),
           f"function-keyed cache sources unexpected: {src[21]} / {src[23]}")
+    check(src[32].startswith("cached schema \"fixed_table\""), f"unnested frame lost its source: {src[32]}")
     check(not [f for f in findings if f["kind"] == "error"], f"checker errors:\n{out.stdout}")
     notes = {f["line"]: f["message"] for f in findings if f["kind"] == "note"}
     check(sorted(notes) == [10, 12, 29], f"notes unexpected (a CRAN-style package and a pull() pipeline must get none):\n{notes}")
@@ -664,15 +682,16 @@ def scenario_colcheck_packages(s):
     # A self-contained package loader with a literal key keeps the learn suggestion.
     check("r-colcheck learn \"returns\" 'teamdata::fetch_table(Sys.Date(), \"returns\")'" in notes[12],
           f"uncached loader note lost its learn command:\n{notes[12]}")
-    check("15 pipeline step(s) checked" in out.stderr and "4 step(s) skipped" in out.stderr
+    check("21 pipeline step(s) checked" in out.stderr and "4 step(s) skipped" in out.stderr
           and "checker error" not in out.stderr, f"summary unexpected:\n{out.stderr}")
     # Switched off, the package function is opaque and nothing after it is checked.
     off = subprocess.run([tool, "--json", "script/run.R"], cwd=root, capture_output=True, text=True, timeout=300,
                          env=dict(os.environ, R_LSP_COLCHECK_PACKAGES="false"))
-    check(off.returncode == 1 and "7 pipeline step(s) checked" in off.stderr,
+    check(off.returncode == 1 and "13 pipeline step(s) checked" in off.stderr,
           f"R_LSP_COLCHECK_PACKAGES=false still followed the package function:\n{off.stderr}")
     off_cols = {(f["line"], f["name"]) for f in json.loads(off.stdout) if f["kind"] == "column"}
-    check(off_cols == {(15, "regionn"), (21, "categry"), (23, "labell"), (28, "idd")}, f"with packages off, only the cache should answer: {sorted(off_cols)}")
+    check(off_cols == {(15, "regionn"), (21, "categry"), (23, "labell"), (28, "idd"), (32, "rr"), (33, "qq"), (34, "serie")},
+          f"with packages off, only the cache should answer: {sorted(off_cols)}")
 
 def scenario_lint_fallback(s):
     """A project .lintr replaces the plugin's profile in the server (lintr
