@@ -28,7 +28,17 @@ Rscript --vanilla -e 'install.packages("languageserver", repos = "https://cloud.
 
 `--vanilla` is important — without it, running this inside an renv project would install into the project library instead of the global library.
 
-This also installs `lintr`, which produces the diagnostics.
+This also installs `lintr`, which produces the diagnostics. The plugin needs `languageserver` 0.3.19 or newer for index status, complete cross-file answers and other-repository support (those arrived with the project-wide index in 0.3.19; 0.3.20 is current). On an older release the server still starts with renv support and the hooks, prints a message to `r-lsp-status` and `claude --debug`, and the rest stays off. The install command above also upgrades an existing copy; to see which version is installed:
+
+```bash
+Rscript --vanilla -e 'cat(as.character(packageVersion("languageserver")))'
+```
+
+CRAN's prebuilt macOS binaries can lag the source release by several versions (with R 4.4 the binary was still 0.3.17 while the source was 0.3.20). If the version printed is below 0.3.19, install from source, which needs the Xcode command line tools:
+
+```bash
+Rscript --vanilla -e 'install.packages("languageserver", repos = "https://cloud.r-project.org", type = "source")'
+```
 
 ### Step 2: Install the plugin
 

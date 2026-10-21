@@ -40,13 +40,32 @@ status <- function(text) tryCatch({
 status_state <- new.env()
 status_state$busy <- FALSE
 
+# Patches 2 to 4 use internals that arrived in languageserver 0.3.18 (several
+# workspaces) and 0.3.19 (pending-work check, workspace index). On an older
+# release they switch themselves off; say so once where r-lsp-status and
+# `claude --debug` can show it.
+ls_version <- utils::packageVersion("languageserver")
+if (ls_version < "0.3.19") {
+  old_note <- paste0("languageserver ", ls_version, " is older than 0.3.19: renv support works, but index status, ",
+                     "complete cross-file answers and other-repository support are off. Upgrade with ",
+                     "Rscript --vanilla -e 'install.packages(\"languageserver\")'")
+  message("r-lsp: ", old_note)
+  status(old_note)
+}
+
+# Runs on every event-loop turn, so it must survive any languageserver
+# version: an internal that is missing (has_work() and the workspace index
+# arrived in 0.3.19) reads as "not busy", never as an error.
 index_busy <- function(self) {
-  if (self$parse_task_manager$has_work()) return(TRUE)
-  for (ws in self$workspaces$values()) {
-    idx <- ws$index
-    if (!is.null(idx) && isTRUE(idx$enabled) && length(idx$pending)) return(TRUE)
-  }
-  FALSE
+  tryCatch({
+    pm <- self$parse_task_manager
+    if (is.function(pm$has_work) && isTRUE(pm$has_work())) return(TRUE)
+    for (ws in self$workspaces$values()) {
+      idx <- ws$index
+      if (!is.null(idx) && isTRUE(idx$enabled) && length(idx$pending)) return(TRUE)
+    }
+    FALSE
+  }, error = function(e) FALSE)
 }
 index_files <- function(self) {
   n <- 0L
@@ -145,7 +164,8 @@ tryCatch({
     f <- orig_pe
     environment(f) <- environment()
     f()
-    if (index_busy(self)) note_busy(self, "workspace") else note_idle(self)
+    tryCatch(if (index_busy(self)) note_busy(self, "workspace") else note_idle(self),
+             error = function(e) NULL)
   }, overwrite = TRUE)
 }, error = function(e) message("r-lsp: status patch disabled: ", conditionMessage(e)))
 
@@ -162,6 +182,7 @@ drain_index <- function(self) {
   repeat {
     busy <- FALSE
     pm <- self$parse_task_manager
+    if (!is.function(pm$has_work)) break   # before 0.3.19 there is nothing to wait for
     pm$check_tasks()
     pm$run_tasks()
     if (pm$has_work()) busy <- TRUE
@@ -220,6 +241,7 @@ attach_renv_library <- function(root) {
 }
 
 tryCatch({
+  if (!is.function(ns$LanguageServer$public_methods$add_workspace)) stop("several workspaces need languageserver 0.3.18 or newer")
   orig_open <- ns$text_document_did_open
   patched_open <- function(self, params) {
     tryCatch({
