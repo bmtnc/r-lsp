@@ -2,7 +2,7 @@
 
 R language server for Claude Code, with renv support, tidyverse-aware diagnostics and a column-name check.
 
-Gives Claude diagnostics after each edit, hover documentation, go-to-definition, find-references, workspace symbol search and call hierarchy for `.R`, `.Rmd` and `.qmd` files, plus `r-colcheck`, which checks the column names in tidyverse code against the data the code reads.
+Gives Claude diagnostics after each edit, hover documentation, go-to-definition, find-references, workspace symbol search and call hierarchy for `.R`, `.Rmd` and `.qmd` files, across a package's `R/`, its tests and its scripts (all loaded at startup), plus `r-colcheck`, which checks the column names in tidyverse code against the data the code reads.
 
 ## Prerequisites
 

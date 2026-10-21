@@ -303,8 +303,28 @@ def scenario_shared_scope(s):
     package's R/; the plugin restores one shared scope and complete outgoing calls."""
     root = os.path.join(s.scratch, "pkgscope")
     shutil.copytree(os.path.join(FIXTURES, "pkgscope"), root)
-    lsp = s.server(root, env={"CLAUDE_PROJECT_DIR": root})
+    status_file = os.path.join(s.scratch, "pkgscope.status.log")
+    lsp = s.server(root, env={"CLAUDE_PROJECT_DIR": root, "R_LSP_STATUS_FILE": status_file})
     try:
+        # Callers in a script and a test, asked before anything opens those files.
+        lsp.open("R/flags.R")
+        items = []
+        for _ in range(10):
+            items = lsp.request("textDocument/prepareCallHierarchy", {
+                "textDocument": {"uri": lsp.uri("R/flags.R")},
+                "position": {"line": 3, "character": 1}}).get("result") or []
+            if items:
+                break
+            time.sleep(1)
+        incoming = []
+        for _ in range(15):
+            incoming = lsp.request("callHierarchy/incomingCalls", {"item": items[0]}).get("result") or [] if items else []
+            if len({i["from"]["uri"].rsplit("/", 1)[-1] for i in incoming}) >= 2:
+                break
+            time.sleep(1)
+        outgoing = lsp.request("callHierarchy/outgoingCalls", {"item": items[0]}).get("result") or [] if items else []
+        refs = references(lsp, "R/flags.R", 3, 1)
+        # Hover and definition from the script into R/.
         lsp.open("scripts/run.R")
         hover = ""
         for _ in range(15):
@@ -315,26 +335,20 @@ def scenario_shared_scope(s):
         defn = lsp.request("textDocument/definition", {
             "textDocument": {"uri": lsp.uri("scripts/run.R")},
             "position": {"line": 2, "character": 12}}).get("result")
-        lsp.open("R/flags.R")
-        items = []
-        for _ in range(10):
-            items = lsp.request("textDocument/prepareCallHierarchy", {
-                "textDocument": {"uri": lsp.uri("R/flags.R")},
-                "position": {"line": 3, "character": 1}}).get("result") or []
-            if items:
-                break
-            time.sleep(1)
-        outgoing = lsp.request("callHierarchy/outgoingCalls", {"item": items[0]}).get("result") or [] if items else []
-        incoming = lsp.request("callHierarchy/incomingCalls", {"item": items[0]}).get("result") or [] if items else []
     finally:
         lsp.close()
-    check("flag_missing" in hover, f"hover from a script into R/ is empty (document scope not shared): {hover[:80]!r}")
-    check(bool(defn) and "flags.R" in json.dumps(defn), f"definition from a script did not reach R/flags.R: {defn}")
+    callers = {i["from"]["uri"].rsplit("/", 1)[-1] for i in incoming}
+    check({"run.R", "test-flags.R"} <= callers,
+          f"incomingCalls missed callers in scripts/ or tests/ that nothing had opened: {sorted(callers)}")
+    ref_files = {u.rsplit("/", 1)[-1] for u in refs}
+    check({"run.R", "test-flags.R"} <= ref_files, f"references missed scripts/ or tests/: {sorted(ref_files)}")
     called = {o["to"]["name"] for o in outgoing}
     check({"is.na", "sum", "as.character"} <= called,
           f"outgoingCalls dropped calls inside `!`, unary minus or a subscript: {sorted(called)}")
-    callers = {i["from"]["uri"].rsplit("/", 1)[-1] for i in incoming}
-    check("run.R" in callers, f"incomingCalls missed the script caller: {sorted(callers)}")
+    check("flag_missing" in hover, f"hover from a script into R/ is empty (document scope not shared): {hover[:80]!r}")
+    check(bool(defn) and "flags.R" in json.dumps(defn), f"definition from a script did not reach R/flags.R: {defn}")
+    with open(status_file) as f:
+        check("test/script files as documents" in f.read(), "status log has no 'loaded ... test/script files' event")
 
 
 def scenario_other_repository(s):

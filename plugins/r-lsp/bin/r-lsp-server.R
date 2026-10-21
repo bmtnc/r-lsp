@@ -22,6 +22,8 @@
 #      (0.3.19 scoped each document to its package root or source() closure).
 #   6. Complete outgoing calls: skip the shallow-index shortcut that drops
 #      calls inside `!`, subscripts and `if` conditions (0.3.19+).
+#   7. Tests and scripts are loaded as documents at startup, like R/, so
+#      callers there are found without anything opening the file first.
 #
 # Every patch is wrapped so that a languageserver release that renames an
 # internal disables that patch instead of stopping the server.
@@ -306,5 +308,85 @@ tryCatch({
   if (!is.function(ns$indexed_outgoing_calls)) stop("no indexed shortcut in this version (nothing to patch)")
   assignInNamespace("indexed_outgoing_calls", function(workspace, item) NULL, ns = "languageserver")
 }, error = function(e) message("r-lsp: full outgoing-calls patch disabled: ", conditionMessage(e)))
+
+# --- 7. tests and scripts are loaded, not only R/ ----------------------------
+# The server fully parses a package's R/ files at startup and everything else
+# only when opened, so a caller in tests/ or scripts/ is invisible to
+# references and call hierarchy until something opens that file. Load every
+# other R file the index discovered (git-ignored ones excepted) as a document
+# too, up to R_LSP_LOAD_MAX files.
+
+load_extra_max <- suppressWarnings(as.integer(Sys.getenv("R_LSP_LOAD_MAX", "600")))
+if (is.na(load_extra_max)) load_extra_max <- 600L
+extra_loaded <- new.env()   # workspace root -> uris the plugin loaded
+git_ignored <- function(root, paths) {
+  if (!length(paths)) return(logical())
+  out <- tryCatch(suppressWarnings(system2("git", c("-C", shQuote(root), "check-ignore", "--stdin"),
+                                           input = paths, stdout = TRUE, stderr = FALSE)),
+                  error = function(e) character())
+  paths %in% as.character(out)
+}
+
+tryCatch({
+  orig_lw <- ns$LanguageServer$public_methods$load_workspace
+  if (!is.function(orig_lw) || !is.function(ns$LanguageServer$public_methods$load_index_document)) {
+    stop("no index-backed loader in this version")
+  }
+  ns$LanguageServer$set("public", "load_workspace", function(workspace) {
+    f <- orig_lw
+    environment(f) <- environment()
+    f(workspace)
+    tryCatch({
+      idx <- workspace$index
+      if (is.null(idx) || !isTRUE(idx$enabled)) return(invisible(NULL))
+      uris <- setdiff(idx$files$keys(), idx$package_source_uris())
+      if (!length(uris)) return(invisible(NULL))
+      paths <- vapply(uris, ns$path_from_uri, "")
+      uris <- uris[!git_ignored(workspace$root, paths)]
+      total <- length(uris)
+      if (total > load_extra_max) uris <- head(uris, load_extra_max)
+      for (uri in uris) {
+        if (!idx$summaries$has(uri)) idx$update_path(ns$path_from_uri(uri))
+        self$load_index_document(workspace, uri)
+      }
+      assign(workspace$root %||% "", vapply(uris, ns$index_canonical_uri, ""), envir = extra_loaded)
+      status(sprintf("loaded %d test/script files as documents%s", length(uris),
+                     if (total > length(uris)) sprintf(" (of %d; raise R_LSP_LOAD_MAX for the rest)", total) else ""))
+    }, error = function(e) message("r-lsp: loading tests/scripts failed: ", conditionMessage(e)))
+  }, overwrite = TRUE)
+
+  # On every open the server prunes loaded documents that are not package
+  # files, open, or in an open file's source() closure. Keep ours.
+  orig_prune <- ns$LanguageServer$public_methods$prune_index_documents
+  if (is.function(orig_prune)) {
+    ns$LanguageServer$set("public", "prune_index_documents", function(workspace) {
+      ours <- get0(workspace$root %||% "", envir = extra_loaded, inherits = FALSE)
+      if (!length(ours)) {
+        f <- orig_prune
+        environment(f) <- environment()
+        return(f(workspace))
+      }
+      index <- workspace$index
+      if (is.null(index) || !isTRUE(index$enabled)) return(invisible(NULL))
+      document_uris <- workspace$documents$keys()
+      open_uris <- Filter(function(uri) isTRUE(workspace$documents$get(uri)$is_open), document_uris)
+      keep <- union(union(index$package_source_uris(), open_uris), ours)
+      for (uri in open_uris) keep <- union(keep, index$source_closure(uri))
+      keep <- unique(vapply(keep, ns$index_canonical_uri, character(1L)))
+      remove <- document_uris[!vapply(document_uris, function(uri) ns$index_canonical_uri(uri) %in% keep, logical(1L))]
+      remove <- Filter(function(uri) index$contains_path(ns$path_from_uri(uri)), remove)
+      for (uri in remove) {
+        ns$diagnostics_callback(self, uri, NULL, list())
+        workspace$documents$remove(uri)
+      }
+      if (length(remove)) {
+        workspace$diagnostics_globals_cache <- NULL
+        workspace$type_hierarchy_cache$clear()
+        workspace$update_loaded_packages()
+      }
+      invisible(NULL)
+    }, overwrite = TRUE)
+  }
+}, error = function(e) message("r-lsp: tests/scripts loading patch disabled: ", conditionMessage(e)))
 
 languageserver::run()

@@ -10,7 +10,7 @@ The R language server runs for `.R`, `.Rmd` and `.qmd` files. It starts on the f
 | Question | Operation | Covers |
 |---|---|---|
 | Where is `f` defined? | `goToDefinition` | package `R/`, open files, `source()`d files, installed packages (jumps to a temp copy of the package source); works from scripts and tests into `R/` |
-| Who calls `f`? | `findReferences`, `incomingCalls` | same scope; a test or script counts only once something has opened it, so read the plugin note that follows: it lists every call the server did not return |
+| Who calls `f`? | `findReferences`, `incomingCalls` | same scope plus every `.R` file in the project (tests, scripts), loaded at startup; not Rmd/Quarto, roxygen `[f()]` links or calls through `map()`/`do.call()`, so read the plugin note that follows: it lists every mention the server did not return |
 | What does `f` call? | `outgoingCalls` | direct calls only; functions passed as values (`map(x, f)`, `do.call`) are not edges |
 | What does `f` take? | `hover` | signature + roxygen for project functions; the full help page for package functions |
 | What is in this file? | `documentSymbol` | top-level functions and variables |
