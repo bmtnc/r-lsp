@@ -5,34 +5,38 @@ description: Working in an R repository (.R, .Rmd, .qmd files, R packages, tidyv
 
 # R code intelligence in this repository
 
-The R language server runs for `.R`, `.Rmd` and `.qmd` files. It starts on the first LSP call or edit that touches an R file. Load the LSP tool once with `ToolSearch "select:LSP"`, then prefer it over text search for these questions:
+Three tools, three kinds of question. Pick by the shape of the question, not by habit:
 
-| Question | Operation | Covers |
+| Question | Use | Why |
 |---|---|---|
-| Where is `f` defined? | `goToDefinition` | package `R/`, open files, `source()`d files, installed packages (jumps to a temp copy of the package source); works from scripts and tests into `R/` |
-| Who calls `f`? | `findReferences`, `incomingCalls` | same scope plus every `.R` file in the project (tests, scripts), loaded at startup; not Rmd/Quarto, roxygen `[f()]` links or calls through `map()`/`do.call()`, so read the plugin note that follows: it lists every mention `grep` finds that the server did not return, line by line, in returned files too |
-| What does `f` call? | `outgoingCalls` | direct calls only; functions passed as values (`map(x, f)`, `do.call`) are not edges |
-| What does `f` take? | `hover` | signature + roxygen for project functions; the full help page for package functions |
-| What is in this file? | `documentSymbol` | top-level functions and variables |
-| Find by name | `workspaceSymbol` | every R file in the project, including tests and scripts |
-| How is the code structured / what depends on what? | `r-callmap` (shell), `r-callmap NAME` | every function at once: file:line, arguments, the project functions it calls and its callers (functions, tests, scripts), including `map(x, f)` `(as value)` and `do.call("f")` `(by string)` edges; static parse, see below |
+| How is this code put together? Where does execution start? What is dead? | `r-callmap` (shell) | one listing of every function with its callers and callees, entry points, unreferenced functions, cycles; about 100 tokens per function, read it instead of reading `R/` |
+| What breaks if I change `f`? What must change to add an argument to `f`? Who ends up calling `f`, through which functions? | `r-callmap f` | callers up and callees down two levels (`--depth N`) with every call site as file:line, including `map(x, f)` `(as value)` and `do.call("f")` `(by string)`, which the server and `grep "f("` both miss |
+| How does a value get from the loader to the output? | `r-callmap entry_point` | the callee chain in call order |
+| Where does new code belong? Which helper already does the adjacent thing? | `r-callmap` | see who uses the candidates before extending one |
+| Which callers of the functions in this diff need checking? | `r-callmap f g h` | several names in one call |
+| Where is `f` used, when `f` is a common word (`fit`, `filter`, `summary`)? | LSP `findReferences` | the server returns the uses in scope where `grep` returns every line with the word |
+| What does `pkg::f` take, what does it do? | LSP `hover` | signature and help page of an installed package's function in one call, without opening the package source |
+| Where is `pkg::f` defined? | LSP `goToDefinition` | jumps into installed package source, which is not in the repository, so `grep` cannot find it |
+| Where is `f` used, plain name? What is in this file? Which file mentions this string or comment? | `grep` / `Read` | one step, returns the code |
 
-Positions are 1-based; point at the symbol itself, not the bracket or comma before it.
+The LSP tool is deferred: load it once with `ToolSearch "select:LSP"`. Positions are 1-based; point at the symbol itself, not the bracket or comma before it. Its other operations: `incomingCalls`/`outgoingCalls` (direct calls only; functions passed as values are not edges, so prefer the map), `documentSymbol`, `workspaceSymbol` (every R file in the project, including tests and scripts).
+
+Before any edit, read the file. The map is for the plan, not the edit: it does not show whether a call passes arguments by position or by name, and inserting an argument into a positional call silently shifts the others.
 
 ## Before a refactor
 
-Run `r-callmap` (the whole project) or `r-callmap NAME` (that function's callers and callees, two levels each way, with every call site's file:line; `--depth N` for more) before reading source files. Plan the change from the map, then open only the files it names; do not read through `R/` to work out what calls what. It also lists entry points, functions nobody calls and recursion. After the edits, the post-edit diagnostics report a call to a function that no longer exists and the argument check reports calls whose argument names no longer match. `--json` gives the same data as JSON.
+Run `r-callmap NAME` for the functions you will change, or `r-callmap` for the whole project when the change is wide or the codebase is new to you, before reading source files. Plan from the map, open only the files it names, then read each file you edit. After the edits, the post-edit diagnostics report a call to a function that no longer exists and the argument check reports calls whose argument names no longer match the definition. `--json` gives the same data for filtering (functions with no caller under `tests/`, for example).
 
-It reads the code without running it: calls built from strings at runtime, S4 dispatch, R6 calls through an object (`obj$m()`) and code in Rmd/qmd are not in it, and only functions defined in the project appear.
+The map reads the code without running it: calls built from strings at runtime (`eval(parse())`, pasted names), S4 dispatch, R6 calls through an object (`obj$m()`) and code in Rmd/qmd are not in it; only functions defined in the project appear, so calls into packages are absent by design. Git-ignored R files are included. A file that does not parse is named in the header as skipped.
 
 ## What to trust
 
-- Cross-file answers wait for indexing (up to ~30 s on first use), then they are complete for the scope above. After each LSP result a plugin note lists the mentions `grep` finds in files the server does not index. Treat the server's list plus that note as the full set of call sites before a rename or signature change.
+- Cross-file answers wait for indexing (up to ~30 s on first use), then they are complete for every `.R` file in the project (a package's `R/`, tests, scripts) and for files `source()`d from them. After each LSP result a plugin note lists the mentions `grep` finds in files the server does not index. Treat the server's list plus that note as the full set of call sites before a rename or signature change.
 - "No references found" is reliable only after the note confirms nothing else was found; `r-lsp-status` shows whether indexing is still running (it shows the current server's events only, and says when the server it last heard from has exited).
 - A script-level variable assigned inside `if`/`else` or a loop is scoped by the server to that block: references from one branch's assignment miss the other branch, and `goToDefinition` names one branch. The note recognizes the case and lists the other mentions in the file; take the union before a rename. A name that only appears as `name = ...` inside `mutate()`, `summarise()` or `tibble()` is a data-frame column, which the server does not track at all; the note says where it is created, and "No references found" means nothing for it.
 - The server only sees files changed through Edit/Write. After `git checkout`, `styler`, `roxygen2::roxygenise()` or `sed`, results for those files are stale until you Read or edit them.
 - Diagnostics after an edit report syntax errors, undefined functions (anywhere) and undefined variables (inside function bodies only), non-exported `pkg::fun`, missing packages, deprecated or superseded tidyverse functions, and functions missing from the version renv pins. Wrong argument names in calls to the project's own functions come from `r-colcheck` after the edit (see below); wrong argument names in calls to package functions are not reported by anything. Diagnostics reach only the main conversation, not subagents: in a subagent, run `Rscript -e 'parse("file.R")'` and `r-colcheck file.R` yourself after editing.
-- Subagents share the one server (one per session) and can use the LSP tool. Files in another repository are indexed on first open, so navigation works there too.
+- Subagents share the one server (one per session) and can use the LSP tool after loading it with ToolSearch. `r-callmap` needs no loading: a subagent runs it through Bash, which it already has, so for callers and impact it is the first tool, not `grep`. Files in another repository are indexed on first open, so navigation works there too.
 
 ## Data-frame column names
 
