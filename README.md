@@ -4,19 +4,19 @@
 
 Without an LSP, Claude Code navigates R codebases using grep and file reads — text search that has no understanding of R itself. It can't distinguish a function definition from a comment that mentions the same name, doesn't know what arguments a function accepts, and can't trace how functions call each other across files.
 
-An LSP (Language Server Protocol) gives Claude Code a direct line to R's own parser and package system. Instead of searching for text patterns, Claude can ask "what does this function do?" and get the actual documentation, or "where is this defined?" and jump straight to the source. After every edit, the LSP re-analyzes the file and reports errors immediately — Claude sees them in the same turn and can fix them without a separate test cycle.
+An LSP (Language Server Protocol) gives Claude Code a direct line to R's own parser and package system. Instead of searching for text patterns, Claude can ask "what does this function do?" and get the actual documentation, or "where is this defined?" and jump straight to the source. After every edit, the LSP re-analyzes the file and reports errors, so Claude can fix them without a separate test cycle.
 
 The practical difference: Claude makes fewer mistakes, finds things faster, and catches errors earlier. It understands your code structurally — which packages you use, what functions they export, how your functions relate to each other — rather than just pattern-matching against text.
 
-Gives Claude Code live diagnostics, hover documentation, go-to-definition, find-references, and completions for R code. Works with renv projects — the LSP sees your pinned package versions, not just globally installed packages. Diagnostics report likely bugs only, and understand tidyverse code (see [Diagnostics](#diagnostics)).
+Gives Claude Code diagnostics after each edit, hover documentation, go-to-definition, find-references, workspace symbol search and call hierarchy for R code, plus a column-name check for tidyverse code. Works with renv projects — the LSP sees your pinned package versions, not just globally installed packages. Diagnostics report likely bugs only, and understand tidyverse code (see [Diagnostics](#diagnostics)).
 
 ## Setup
 
 ### Prerequisites
 
 - macOS or Linux
-- R installed and on your `PATH`
-- Claude Code (CLI, desktop app, or IDE extension)
+- R installed, with `R` and `Rscript` on the `PATH` of the shell you start Claude Code from (the server uses `R`, the hooks and shell tools use `Rscript`)
+- Claude Code (CLI, desktop app, or IDE extension) in a terminal session; plugin language servers do not run in cloud sessions
 
 ### Step 1: Install the `languageserver` R package globally
 
@@ -35,6 +35,12 @@ This also installs `lintr`, which produces the diagnostics.
 In Claude Code, run:
 
 ```
+/plugin install r-lsp --marketplace bmtnc/r-lsp
+```
+
+or, on Claude Code versions before 2.1.275, in two steps:
+
+```
 /plugin marketplace add bmtnc/r-lsp
 /plugin install r-lsp
 ```
@@ -43,7 +49,21 @@ Then restart Claude Code or run `/reload-plugins`.
 
 ### Step 3: Verify
 
-Open any R project and ask Claude Code to hover over a function. If you get documentation back, it's working. For renv projects, test with a function from a package that's only in the renv library (not installed globally) to confirm renv integration.
+1. Start a session in an R project. The first lines of context should read `R LSP plugin: R package '...'` (or `R scripts project`), with file counts and the index cache state. That is the `SessionStart` hook; it confirms `Rscript` was found.
+2. Ask Claude to introduce a small error in an `.R` file and fix it. The server starts on that first edit; after the edit, the conversation shows `Found N new diagnostic issues`.
+3. Ask Claude to run `r-lsp-status`. It prints the server's "indexing" / "index ready" events for the project.
+4. Ask Claude to hover over a function. For renv projects, pick a function from a package that is only in the renv library to confirm renv integration.
+
+If a step fails, see [Troubleshooting](#troubleshooting).
+
+### Using it
+
+Nothing to do: the skill tells Claude when to use the LSP tool and what each answer covers, the hooks add context on their own, and the two shell tools are on Claude's `PATH`. The pieces you can ask for by name:
+
+- `r-colcheck path/to/file.R` — column names in tidyverse code vs the data the file reads (also runs after every `.R` edit).
+- `r-lsp-status` — recent index events for this project.
+
+Environment variables, set in the shell that starts Claude Code: `R_LSP_AGENT_LINTERS=false` to use lintr's default rules instead of the plugin's profile; `R_LSP_INDEX_WAIT=<seconds>` to change how long cross-file answers wait for indexing (default 30); `R_LSP_STATUS_FILE=<path>` to move the status log.
 
 ---
 
@@ -121,12 +141,14 @@ It stays silent whenever it cannot be sure: an unresolvable source (database, fu
 
 ## What this gives Claude Code
 
-- **Diagnostics**: After every `.R` file edit, reports syntax errors and likely bugs (see [Diagnostics](#diagnostics)).
-- **Hover**: Documentation for any function, including from renv-pinned packages.
-- **Go-to-definition**: Jump to where a function is defined within the package's `R/` directory.
-- **Find references**: Find all usages of a function within `R/`.
-- **Completions**: Function and symbol name completions based on what's in scope.
-- **Outgoing calls**: Trace which functions a given function calls, including namespaced calls like `dplyr::mutate()`.
+- **Diagnostics**: after every `.R` file edit, syntax errors and likely bugs (see [Diagnostics](#diagnostics)). They reach only the main conversation, and Claude Code may deliver them a turn late; the hooks below are synchronous.
+- **Hover**: signature and roxygen text for project functions; the help page for package functions, including renv-pinned ones.
+- **Go-to-definition, find references, call hierarchy**: complete for a package's `R/` files, open files and `source()`d files, and for other repositories Claude opens files in. For `tests/`, scripts and Rmd, the note after each result lists what `grep` finds.
+- **Workspace symbol search**: every R file in the project.
+- **After each edit**: the column-name check (`r-colcheck`) for tidyverse code.
+- **At session start**: the project's shape and index state, as context.
+
+Claude Code's LSP tool has no completion, rename or code-action operations, so the server's support for those is unused.
 
 ## Diagnostics
 
@@ -151,20 +173,25 @@ To turn the profile off and get lintr's defaults, set `R_LSP_AGENT_LINTERS=false
 
 ## Known limitations
 
-- **References cover `R/`, open files and `source()`d files**: Since `languageserver` 0.3.19, workspace symbol search covers every `.R` file in the project, packages or not. Find-references and go-to-definition still only see a package's `R/` directory, files that are open, and files linked by static `source()` calls. Calls in unopened `tests/` or `scripts/` files are missed.
+- **Scope of references**: the server's references and call hierarchy cover a package's `R/`, open files and `source()`d files, even after `tests/` or script files are opened. Calls there, in `data-raw/`, vignettes and Rmd are not in the server's answer; the post-LSP hook adds what `grep` finds, so read the two together. Workspace symbol search does cover every file.
+- **Call graph gaps**: functions passed as values (`map(x, f)`, `lapply`, `do.call`), S3 dispatch (`print(x)` to `print.myclass`) and R6 methods are not edges in the call hierarchy.
 - **No argument checks**: A wrong argument name or too many arguments (`f(a = 1, bb = 2)`) is not reported.
-- **Scope of references**: the server's references and call hierarchy cover a package's `R/`, open files and `source()`d files. Calls in `tests/`, `data-raw/`, scripts and Rmd are not in the server's answer; the post-LSP hook adds what `grep` finds there, so read the two together.
+- **Silent parse errors in some files**: an R file whose roxygen contains inline code such as `` `r lifecycle::badge("deprecated")` `` gets no diagnostics at all when it fails to parse (lintr treats the file as a literate document). Rmd chunks with a syntax error are dropped silently.
 - **Position off-by-one**: at the first character of a symbol that directly follows `(`, `,` or `$`, the server answers for the punctuation and returns nothing. The post-LSP hook points this out; one character to the right works.
 - **Dynamic scope**: Files that use `attach()`, `list2env()`, `sys.source()` or `box::use()`, or that load a package that isn't installed, skip the undefined-function check. The check can't know what those put in scope.
-- **Single workspace**: Each LSP instance serves one project. It can't cross-reference between two of your packages simultaneously.
+- **Files changed outside Edit/Write**: Claude Code never tells the server about files changed by `git`, `styler` or `Bash`; their results are stale until Claude reads or edits them.
+- **Cost**: a package with ~100 R files takes ~20 s and ~1 GB before the first diagnostic; 400 files, over two minutes. The server idles at ~10% of a core.
 - **Hover gaps**: Some namespaced calls may not return hover docs depending on how the package structures its help pages.
 
 ## Troubleshooting
 
-- **LSP not starting**: Check that `r-lsp-wrapper` is executable and on `PATH`. Check that `R` is on `PATH`.
+- **No `R LSP plugin:` lines at session start**: `Rscript` is not on the `PATH` of the shell that started Claude Code, or the project has no R files within three directory levels.
+- **No diagnostics after an edit**: run `/plugin` and open the **Errors** tab. `Executable not found` means `R` is not on `PATH`. To test the server by hand: `echo | ~/.claude/plugins/.../r-lsp/bin/r-lsp-wrapper` should print nothing and wait (Ctrl-C to stop); an R error there is the cause.
 - **`languageserver` not found**: Run `Rscript --vanilla -e 'find.package("languageserver")'` — should return a path under the global R library, not an renv path.
-- **renv packages not showing hover**: The LSP may not have finished initializing. Wait a few seconds after opening a project and try again.
-- **JSON-RPC errors**: Check that `renv/activate.R` in your project doesn't print to stdout. The wrapper suppresses messages, but custom `.Rprofile` hooks could interfere.
+- **References seem incomplete**: `r-lsp-status` shows whether indexing finished; the post-LSP note lists what `grep` finds outside the server's scope. On a large package the first cross-file answer can take up to 30 s.
+- **renv packages not showing hover**: the server may not have finished initializing. Wait a few seconds after opening a project and try again.
+- **JSON-RPC errors / server restarts**: check that `renv/activate.R` in your project doesn't print to stdout. The server redirects output during activation, but custom `.Rprofile` hooks could interfere. `claude --debug` logs the server's stderr.
+- **No index events from the monitor**: plugin monitors are marked experimental by Anthropic and run only in interactive sessions; `r-lsp-status` reads the same log.
 
 ---
 
@@ -180,21 +207,23 @@ There are five layers between Claude Code and R code intelligence:
 
 2. **Plugin config (`.lsp.json`)** — A static JSON declaration that tells Claude Code: "for files ending in `.R`, `.Rmd`, or `.qmd`, spawn the command `r-lsp-wrapper` and talk to it using the Language Server Protocol over stdio." No code — equivalent to a VS Code `settings.json` LSP entry.
 
-3. **Wrapper script (`r-lsp-wrapper`)** — A bash script that launches R with `--vanilla` and applies a monkey-patch before starting the language server. The `--vanilla` flag prevents `.Rprofile` from running, which is necessary because renv's `.Rprofile` hook would hijack `.libPaths()` before the LSP knows the project root.
+3. **Wrapper script (`r-lsp-wrapper`) and server program (`r-lsp-server.R`)** — The bash wrapper sets the environment (lint profile, plugin root) and launches `R --vanilla --no-echo --file=r-lsp-server.R`. The R file applies the plugin's patches to the `languageserver` package, then calls `languageserver::run()`. The `--vanilla` flag prevents `.Rprofile` from running, which is necessary because renv's `.Rprofile` hook would hijack `.libPaths()` before the LSP knows the project root.
 
 4. **R session** — A long-running R process using the global library. One process per Claude Code session. Persists for the session lifetime — not re-launched per file or per request.
 
-5. **`languageserver` R package** — The open-source `REditorSupport/languageserver` package from CRAN. Implements the Language Server Protocol: diagnostics, go-to-definition, hover, find-references, completions, outgoing calls. Communicates with Claude Code over stdin/stdout using JSON-RPC.
+5. **`languageserver` R package** — The open-source `REditorSupport/languageserver` package from CRAN. Implements the Language Server Protocol: diagnostics, go-to-definition, hover, find-references, workspace symbols, call hierarchy (and completion, rename, formatting and more that Claude Code never requests). Communicates with Claude Code over stdin/stdout using JSON-RPC.
+
+Around the server, the plugin's hooks (`hooks/`), monitor (`monitors/`), shell tools (`bin/`) and skill (`skills/`) run as separate short processes; the R code behind them is in `scripts/`.
 
 ### The renv problem and how the wrapper solves it
 
 **The problem:** When R starts in a directory with an renv project, `.Rprofile` calls `renv::activate()`, which replaces `.libPaths()` with the project-scoped library. `languageserver` is installed globally (not in any project's renv lockfile), so the LSP process can't find it and fails silently.
 
-**Why `--vanilla` alone isn't enough:** Using `--vanilla` skips `.Rprofile`, so renv never activates and `languageserver` loads fine. But then the LSP can only see packages in the global library. Any package installed only in the renv project library (e.g., dplyr, tidyr, arrow) is invisible — hover returns nothing, completions are missing, and diagnostics can't resolve imports.
+**Why `--vanilla` alone isn't enough:** Using `--vanilla` skips `.Rprofile`, so renv never activates and `languageserver` loads fine. But then the LSP can only see packages in the global library. Any package installed only in the renv project library (e.g., dplyr, tidyr, arrow) is invisible — hover returns nothing and diagnostics can't resolve imports.
 
 **Why activating renv at startup doesn't work:** The wrapper script runs before the LSP receives the `initialize` request from Claude Code. At startup, the R process doesn't know which project it's serving. The working directory is the user's home directory (confirmed: `lsof -p <pid>` shows `cwd` as `~`), not the project root. Calling `source('renv/activate.R')` with a relative path either fails (no `renv/activate.R` in `~`) or activates the wrong project.
 
-**The solution — monkey-patch `on_initialized`:** The wrapper overrides `languageserver:::on_initialized` before calling `languageserver::run()`. This function is called after the LSP receives the `initialized` notification from Claude Code, at which point `self$rootPath` contains the project root. The patch:
+**The solution — monkey-patch `on_initialized`:** `r-lsp-server.R` overrides `languageserver:::on_initialized` before calling `languageserver::run()`. This function is called after the LSP receives the `initialized` notification from Claude Code, at which point `self$rootPath` contains the project root. The patch:
 
 1. `setwd(self$rootPath)` — changes to the project directory (renv determines its project from the working directory)
 2. `source(renv/activate.R)` — activates renv, which sets `.libPaths()` to the project library
@@ -208,19 +237,27 @@ There are five layers between Claude Code and R code intelligence:
 
 **Versions the server loads itself:** A helper process loads `languageserver` and its imports, such as purrr, stringr, rlang and cli, from the global library, and R can't load two versions of a package in one process. So the diagnostics profile reads package facts (exports, lifecycle stage, version) from the project's installed copy on disk, not from what is loaded.
 
-**Critical detail — stdout protection:** renv's `activate.R` can produce output. The LSP communicates over stdout using JSON-RPC, so any stray output corrupts the protocol (symptoms: `Header must provide a Content-Length property` errors, concatenated responses). The wrapper uses `sink(stderr())` to redirect all output during activation.
+**Critical detail — stdout protection:** renv's `activate.R` can produce output. The LSP communicates over stdout using JSON-RPC, so any stray output corrupts the protocol (symptoms: `Header must provide a Content-Length property` errors, concatenated responses). The server program uses `sink(stderr())` to redirect all output during activation.
+
+### The other patches in `r-lsp-server.R`
+
+- **Complete answers.** The server is single-threaded and indexes in small slices between messages; a cross-file request that arrives early is answered from a partial index. The patch wraps the handlers for references, definition, workspace symbols and call hierarchy: before answering, they run the parse queue and the index to completion (bounded by `R_LSP_INDEX_WAIT`). Claude Code's own request timeout is 60 s.
+- **Status events.** `process_events`, the loop body, is replaced on the `LanguageServer` class to detect busy/idle transitions and append events to the status log; `on_initialized` and the workspace-add path mark the start.
+- **Other repositories.** `text_document_did_open` is wrapped: a file outside every known workspace gets its project root added through the server's own `add_workspace()` and `load_workspace()`, the same path its unused `workspace/didChangeWorkspaceFolders` handler uses, and the root's renv library is appended to `.libPaths()` without activating it.
+- **Why a file, not `-e`:** an inline `-e` program goes through the shell and R's front-end script, which mangles backslashes and has a size limit; `--file=` has neither problem.
 
 ### What the LSP indexes
 
 Since `languageserver` 0.3.19 (setting `index_mode`, default `"auto"`), indexing has two levels:
 
-- **Full parse**: a package's `R/` files, open files, and files linked by static `source()` calls. These feed find-references, go-to-definition, incoming calls and completion.
+- **Full parse**: a package's `R/` files, open files, and files linked by static `source()` calls. These feed find-references, go-to-definition and incoming calls.
 - **Shallow summary**: every other `.R` file in the workspace, packages or not. The summary stores definitions and `source()` edges but not call sites. So those files appear in workspace symbol search, but calls inside them are not found by find-references.
 
 This means:
 - `workspaceSymbol` covers the whole project
-- `findReferences` and `incomingCalls` miss calls in unopened `tests/` and `scripts/` files. For example, find-references on dplyr's `compute_by()` returns the 10 uses in `R/` and none of the ~20 in `tests/`
+- `findReferences` and `incomingCalls` miss calls in `tests/`, `data-raw/` and script files, open or not: a file counts as package code only under `R/`. For example, find-references on dplyr's `compute_by()` returns the 10 uses in `R/` and none of the 15 in `tests/`
 - The only index settings are `index_mode` (`"auto"` or `"off"`) and include/exclude globs; there is no "fully parse everything" mode
+- The persistent index cache (`~/.cache/R/languageserver/workspace-index/`, or the platform equivalent) stores the shallow summaries keyed by file size and mtime; the `SessionStart` hook pre-builds it
 
 ### How namespace resolution works
 
@@ -238,19 +275,18 @@ For hover on `pkg::fun()`:
 ### LSP capabilities — what works and what doesn't
 
 **Works well:**
-- `documentSymbol` — listing functions in any `.R` file
+- `documentSymbol` — top-level functions and variables in any `.R` file
+- `workspaceSymbol` — every R file in the project
 - `hover` — documentation for local functions and `pkg::fun()` namespaced calls (with renv fix)
-- `goToDefinition` — for functions defined in the project's `R/` directory
-- `findReferences` — within `R/`, open files and `source()`d files
-- `outgoingCalls` — traces calls including through `pkg::fun()` namespaced calls (with renv fix)
-- `diagnostics` — syntax errors and lintr warnings after every edit
-- `completions` — function names, parameters, symbols in scope
+- `goToDefinition` — for functions defined in the project's `R/` directory, open files and `source()`d files
+- `findReferences`, `incomingCalls`, `outgoingCalls` — same scope, complete once the index is ready; calls through `|>` and `%>%` are followed
+- `diagnostics` — syntax errors and the profile's lints after every edit
 
 **Does not work:**
-- `findReferences` into unopened `scripts/` or `tests/` files — those get only a shallow summary
-- `goToDefinition` into external package source — jumps to the installed copy, not a local clone
-- Multi-root workspace — `workspace/didChangeWorkspaceFolders` is a no-op in `languageserver`
-- `hover` on column names inside tidy evaluation (e.g., `mutate(data, new_col = old_col + 1)`) — `old_col` is data-masked, not a real R symbol, so static analysis can't resolve it
+- `findReferences` and call hierarchy into `tests/`, `data-raw/`, scripts or Rmd — the post-LSP hook covers these with `grep`
+- `goToImplementation` — the server answers "unknown request"; S3 methods of a generic are not listed
+- `goToDefinition` into external package source — jumps to a temporary copy of the installed function, not a local clone
+- `hover` on column names inside tidy evaluation (e.g., `mutate(data, new_col = old_col + 1)`) — `old_col` is data-masked, not a real R symbol, so static analysis can't resolve it; `r-colcheck` covers column names instead
 
 ### Verifying renv integration is working
 
@@ -280,10 +316,11 @@ To confirm the LSP can see renv packages, not just global ones:
 - `maxRestarts: 3` in `.lsp.json` means if the process crashes, Claude Code will restart it up to 3 times
 - `startupTimeout: 60000` (60 seconds) gives the server time to load, especially on first run when R packages may need compilation
 - When Claude Code exits, the LSP process is terminated
+- Subagents share the one server; the LSP tool opens a file before each request, so a subagent's or another repository's first request is enough to get the file (and its repository) indexed
 
 ### Dependencies
 
-The only external dependency is the `languageserver` R package, from CRAN; it installs `lintr` and its other dependencies. No fork, no custom builds. The wrapper script is plain bash, the diagnostics profile is plain R, and the plugin config is plain JSON.
+The only external dependency is the `languageserver` R package, from CRAN; it installs `lintr`, `jsonlite`, `digest` and the rest of what the hooks use. No fork, no custom builds. The wrapper and hooks are plain bash, the server patches, the diagnostics profile and the column checker are plain R, and the plugin config is plain JSON. `r-colcheck` uses `readr`, `arrow`, `readxl`, `haven` or `fst` when they are installed and falls back to base R (or stays silent for formats it cannot read) when they are not.
 
 ### Testing
 
