@@ -476,6 +476,17 @@ def scenario_colcheck(s):
     ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(pkg, "R", "calls.R")},
                                        "cwd": pkg}, env={"CLAUDE_PROJECT_DIR": pkg}))
     check("argument names do not match" in ctx and "no argument 'rows'" in ctx, f"post-edit hook missed argument findings:\n{ctx[:600]}")
+    # A file that does not parse is said so, by the CLI and by the hook.
+    broken = os.path.join(root, "R", "broken.R")
+    with open(broken, "w") as f:
+        f.write("library(magrittr)\nx <- tibble::tibble(a = 1)\nx %>% dplyr::select(a))\ny <- x %>% dplyr::select(zz)\n")
+    out = subprocess.run([tool, "--root", root, broken], capture_output=True, text=True, timeout=120)
+    check(out.returncode == 1 and "R/broken.R:3: this file does not parse (3:23: unexpected ')')" in out.stdout
+          and "1 file(s) did not parse" in out.stderr, f"syntax error not reported:\n{out.stdout}{out.stderr}")
+    ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": broken}, "cwd": root},
+                                env={"CLAUDE_PROJECT_DIR": root}))
+    check("does not parse" in ctx and "unexpected ')'" in ctx and "fix this first" in ctx,
+          f"post-edit hook silent on a syntax error:\n{ctx[:400]}")
     silent = run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": "/tmp/x.py"}})
     check(not silent.strip(), "post-edit hook spoke for a non-R file")
 

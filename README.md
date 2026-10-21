@@ -171,7 +171,7 @@ R/report.R:17: 'holdings' comes from a source the checker cannot open (s3_read("
 
 `learn` creates `.colcheck/` with its own `.gitignore` (`*`), so the cache stays local by default; delete that file to commit the cache and share it with the team.
 
-A failure of the checker itself is reported, never swallowed: the statement it gave up on gets a line saying so (`r-colcheck hit an error ... and gave up on this statement`), the summary counts them, and `R_LSP_COLCHECK_DEBUG=1` prints the call stack to stderr. Silence means checked and clean.
+A file that does not parse is reported on the line the parser names, with the offending line and a caret, and nothing in it is checked; the server's diagnostic says the same once the server is running, but the hook's note reaches subagents and the first edits of a session too. A failure of the checker itself is reported, never swallowed: the statement it gave up on gets a line saying so (`r-colcheck hit an error ... and gave up on this statement`), the summary counts them, and `R_LSP_COLCHECK_DEBUG=1` prints the call stack to stderr. Silence means checked and clean.
 
 ## The call map
 

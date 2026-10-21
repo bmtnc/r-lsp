@@ -52,6 +52,7 @@ columns <- findings[kinds == "column"]
 arguments <- findings[kinds == "argument"]
 notes <- findings[kinds == "note"]
 errors <- findings[kinds == "error"]
+syntax <- findings[kinds == "syntax"]
 from_cache <- any(vapply(columns, function(x) startsWith(x$source %||% "", "cached schema"), TRUE))
 
 clip <- function(lines, n = 15) {
@@ -60,6 +61,10 @@ clip <- function(lines, n = 15) {
          if (length(lines) > length(shown)) sprintf("\n... and %d more", length(lines) - length(shown)) else "")
 }
 parts <- if (length(findings)) sprintf("r-colcheck (this plugin) on %s:", basename(file)) else character()
+if (length(syntax)) {
+  parts <- c(parts, "The file does not parse (R will refuse to run or source it); fix this first:",
+             clip(colcheck_format(syntax, root), 3))
+}
 if (length(columns)) {
   parts <- c(parts,
     "Column names that cannot exist at that point in the pipeline, checked against the columns of the data the code reads:",

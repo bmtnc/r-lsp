@@ -1105,8 +1105,8 @@ colcheck_file <- function(file, root = NULL) {
   ctx$known_names <- c("TRUE", "FALSE", "NA", "NULL", "T", "F", "Inf", "NaN", ".", ".x", ".y", ".data", ".env",
                        "desc", "n", "everything", "where", "across", "pi", "letters", "LETTERS",
                        "month.name", "month.abb", "self", "private")
-  exprs <- quiet(parse(file, keep.source = TRUE))
-  if (is.null(exprs)) return(list())
+  exprs <- tryCatch(suppressWarnings(parse(file, keep.source = TRUE)), error = function(err) err)
+  if (inherits(exprs, "error")) return(syntax_finding(file, exprs))
   src <- attr(exprs, "srcref")
   ctx$functions <- project_functions(file, exprs, ctx)
   ctx$call_stack <- character()
@@ -1123,6 +1123,23 @@ colcheck_file <- function(file, root = NULL) {
   }
   structure(c(ctx$findings, source_notes(ctx), error_findings(ctx)),
             stats = list(checked = length(ctx$stats$checked), skipped = length(ctx$stats$skipped)))
+}
+
+# A file that does not parse: said in its own finding, on the line the parser
+# names, so that an agent that has just broken the file does not read the
+# checker's silence as "clean". The parser's message already carries
+# file:line:col, the offending line and a caret.
+syntax_finding <- function(file, err) {
+  msg <- conditionMessage(err)
+  m <- regmatches(msg, regexec("^(?:.*?):(\\d+):(\\d+): *([^\n]*)", msg, perl = TRUE))[[1L]]
+  line <- if (length(m) >= 2L) as.integer(m[[2L]]) else 1L
+  what <- if (length(m) >= 4L) sprintf("%s:%s: %s", m[[2L]], m[[3L]], m[[4L]]) else strsplit(msg, "\n")[[1L]][[1L]]
+  rest <- strsplit(msg, "\n")[[1L]][-1L]
+  structure(list(list(
+    kind = "syntax", file = file, line = line, name = NA_character_, source = NA_character_, columns = character(),
+    message = sprintf("this file does not parse (%s), so nothing in it was checked%s", what,
+                      if (length(rest)) paste0(":\n", paste(rest, collapse = "\n")) else ""))),
+    stats = list(checked = 0L, skipped = 0L, unparsed = 1L))
 }
 
 # Notes about data sources: frames the checker could not resolve that are
@@ -1165,7 +1182,7 @@ source_notes <- function(ctx) {
 # against known columns, steps skipped (columns unknowable), files read.
 colcheck_files <- function(files, root = NULL) {
   all <- list()
-  stats <- list(checked = 0L, skipped = 0L, files = 0L, errors = 0L)
+  stats <- list(checked = 0L, skipped = 0L, files = 0L, errors = 0L, unparsed = 0L)
   for (f in files) {
     if (!file.exists(f) || grepl("[.](Rmd|rmd|qmd)$", f)) next
     res <- tryCatch(colcheck_file(f, root), error = function(err) list(list(
@@ -1178,6 +1195,7 @@ colcheck_files <- function(files, root = NULL) {
     stats$checked <- stats$checked + (st$checked %||% 0L)
     stats$skipped <- stats$skipped + (st$skipped %||% 0L)
     stats$errors <- stats$errors + sum(vapply(res, function(x) identical(x$kind, "error"), TRUE))
+    stats$unparsed <- stats$unparsed + (st$unparsed %||% 0L)
   }
   # The walker can visit a pipeline twice (assignment and its right-hand side).
   keys <- vapply(all, function(x) paste(x$file, x$line, x$name, x$source), "")

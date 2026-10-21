@@ -69,6 +69,6 @@ r-colcheck learn "holdings/latest" 's3_read("holdings/latest")' --source R/loade
 
 Refresh an entry only on evidence: the check reports a column you are sure exists (the cache is stale, re-run `learn` for that key; when the entry is more than 90 days old the note says so next to the findings), or the user says the data changed. Never run `learn` from a hook or in a loop; it reaches the network.
 
-A line saying `r-colcheck hit an error ... and gave up on this statement` is a bug in the checker, not in the code: nothing downstream of that statement was checked, so fall back to reading the data source for that frame, and tell the user, with the statement, so it can be reported.
+A post-edit line saying `this file does not parse (LINE:COL: unexpected ...)` means the edit broke the file: fix the syntax first, nothing else in the file was checked. A line saying `r-colcheck hit an error ... and gave up on this statement` is a bug in the checker, not in the code: nothing downstream of that statement was checked, so fall back to reading the data source for that frame, and tell the user, with the statement, so it can be reported.
 
 The cache is local by default: `.colcheck/` is created with its own `.gitignore`. Deleting `.colcheck/.gitignore` commits it so teammates share the entries.
