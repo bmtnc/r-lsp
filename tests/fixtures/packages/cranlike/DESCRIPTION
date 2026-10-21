@@ -1,0 +1,7 @@
+Package: cranlike
+Version: 0.1.0
+Title: Fixture Standing in for a CRAN Package
+Description: Carries the Repository field CRAN writes at publication.
+License: MIT
+Encoding: UTF-8
+Repository: CRAN

@@ -617,8 +617,11 @@ def scenario_colcheck_packages(s):
         "tx <- teamdata::taxonomy(raw, customers)\n"
         "bad6 <- tx %>% dplyr::select(product, categry)\n"
         "ft <- fixed_table()\n"
-        "bad7 <- ft %>% dplyr::select(code, labell)\n")
-    root = s.make_renv_project("colcheck_pkgs", {}, extra_packages=("teamdata",))
+        "bad7 <- ft %>% dplyr::select(code, labell)\n"
+        # a function from a public (CRAN-style) package: unreadable, but no note
+        "rates <- cranlike::pull_rates()\n"
+        "r3 <- rates %>% dplyr::mutate(z = y)\n")
+    root = s.make_renv_project("colcheck_pkgs", {}, extra_packages=("teamdata", "cranlike"))
     for rel, text in (("script/run.R", script), (".colcheck/schemas.json", schemas)):
         os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
         with open(os.path.join(root, rel), "w") as f:
@@ -638,14 +641,14 @@ def scenario_colcheck_packages(s):
           f"function-keyed cache sources unexpected: {src[21]} / {src[23]}")
     check(not [f for f in findings if f["kind"] == "error"], f"checker errors:\n{out.stdout}")
     notes = {f["line"]: f["message"] for f in findings if f["kind"] == "note"}
-    check(sorted(notes) == [10, 12], f"notes unexpected:\n{notes}")
+    check(sorted(notes) == [10, 12], f"notes unexpected (a CRAN-style package must get none):\n{notes}")
     check("teamdata::opaque()" in notes[10] and "could not be read from its code" in notes[10]
           and "r-colcheck learn \"teamdata::opaque\" '<an expression that returns its table>'" in notes[10],
           f"opaque-function note unexpected:\n{notes[10]}")
     # A self-contained package loader with a literal key keeps the learn suggestion.
     check("r-colcheck learn \"returns\" 'teamdata::fetch_table(Sys.Date(), \"returns\")'" in notes[12],
           f"uncached loader note lost its learn command:\n{notes[12]}")
-    check("11 pipeline step(s) checked" in out.stderr and "2 step(s) skipped" in out.stderr
+    check("11 pipeline step(s) checked" in out.stderr and "3 step(s) skipped" in out.stderr
           and "checker error" not in out.stderr, f"summary unexpected:\n{out.stderr}")
     # Switched off, the package function is opaque and nothing after it is checked.
     off = subprocess.run([tool, "--json", "script/run.R"], cwd=root, capture_output=True, text=True, timeout=300,

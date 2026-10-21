@@ -197,7 +197,10 @@ note_unresolved <- function(target, rhs, key, ctx) {
   # key keeps the learn suggestion below, package or not.
   head_def <- lookup_function(head, fn, ctx)
   package_note <- function() {
-    if (!is.null(head_def) && !is.null(head_def$pkg)) {
+    # a function from a public package (CRAN, Bioconductor, base) builds its
+    # result at run time and no cache key the user could learn describes it;
+    # the note is for a team's own package, where a fixed output is likely
+    if (!is.null(head_def) && !is.null(head_def$pkg) && !public_package(head_def$pkg, ctx)) {
       ctx$unresolved[[target]] <- list(line = ctx$line, keys = character(), package_fn = head_def$file,
                                        expr = paste(deparse(head), collapse = " "), used = !identical(head, rhs),
                                        self_contained = !length(all.vars(head)) && !("function" %in% all.names(head)))
@@ -370,6 +373,19 @@ package_function <- function(pkg, fn, ctx, exported_only = TRUE) {
   }
   ctx$package_defs[[key]] <- def %||% FALSE
   def
+}
+
+# Installed from CRAN or Bioconductor, or shipped with R: the DESCRIPTION
+# carries Repository: CRAN (written at publication), biocViews, or
+# Priority: base. A team's own package, built from source or an internal
+# repository, has none of these.
+public_package <- function(pkg, ctx) {
+  memo <- ctx$public_pkgs[[pkg]]
+  if (!is.null(memo)) return(memo)
+  d <- tryCatch(suppressWarnings(utils::packageDescription(pkg)), error = function(e) NULL)
+  res <- is.list(d) && (identical(d$Repository, "CRAN") || !is.null(d$biocViews) || identical(d$Priority, "base"))
+  ctx$public_pkgs[[pkg]] <- res
+  res
 }
 
 # The definition a call reaches: a project function, or an installed package

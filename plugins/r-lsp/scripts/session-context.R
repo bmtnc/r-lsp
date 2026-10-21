@@ -34,7 +34,8 @@ cat("The R language server starts on the first LSP call or .R edit. Answers that
     "goToDefinition, hover, documentSymbol, workspaceSymbol, call hierarchy) wait for it, up to ~30 s once, then are complete",
     "for every .R file in the project (R/, tests, scripts; git-ignored files excepted) and the files they",
     "source(); a note after each LSP result lists any mentions grep finds that the answer did not",
-    "(Rmd/qmd, roxygen links, functions passed as values). Files from other repositories are indexed on",
+    "(Rmd/qmd, roxygen links; for the call hierarchy also functions passed as values). Files from other",
+    "repositories are indexed on",
     "first open. Column-name and argument mistakes are checked after each edit (r-colcheck).\n")
 # Diagnostics: which lintr config the server will use. A project or home
 # .lintr replaces the plugin's profile; say so, or a missing diagnostic reads
