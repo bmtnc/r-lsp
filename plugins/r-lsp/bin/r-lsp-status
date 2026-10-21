@@ -1,8 +1,10 @@
 #!/bin/bash
 # r-lsp-status: print the R language server's recent index events for the
-# current project (indexing started / index ready / workspace added).
-# The server writes them to <plugin data dir>/status.log; the Bash tool does
-# not carry the plugin variables, so the data directory is searched for.
+# current project (server started / indexing / index ready / workspace added).
+# The server appends them to <plugin data dir>/status.log; the Bash tool does
+# not carry the plugin variables, so the data directory is searched for. Only
+# the events of the most recently started server for this project are shown,
+# and a server that has since exited is pointed out.
 project="${CLAUDE_PROJECT_DIR:-$PWD}"
 shopt -s nullglob
 files=("${R_LSP_STATUS_FILE:-}")
@@ -10,11 +12,19 @@ files=("${R_LSP_STATUS_FILE:-}")
 found=0
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue
-  lines="$(grep -F "[$project]" "$f" | tail -n "${1:-8}")"
+  lines="$(grep -F "[$project]" "$f")"
   [ -n "$lines" ] || continue
   found=1
-  printf '%s\n' "$lines" | sed -e 's/ \[[^]]*\]//'
+  last="$(printf '%s\n' "$lines" | grep -n 'R LSP: server started' | tail -n 1 | cut -d: -f1)"
+  if [ -n "$last" ]; then
+    lines="$(printf '%s\n' "$lines" | tail -n +"$last")"
+    pid="$(printf '%s\n' "$lines" | head -n 1 | sed -n 's/.*(pid \([0-9]*\).*/\1/p')"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      echo "The server that wrote these events (pid $pid) has exited. A new server starts on the next LSP call or .R edit; until its own 'index ready' appears here, cross-file answers are not complete."
+    fi
+  fi
+  printf '%s\n' "$lines" | tail -n "${1:-8}" | sed -e 's/ \[[^]]*\]//'
 done
 if [ "$found" = 0 ]; then
-  echo "No R LSP status events for $project yet (the server starts on the first .R edit)."
+  echo "No R LSP status events for $project yet (the server starts on the first LSP call or .R edit)."
 fi

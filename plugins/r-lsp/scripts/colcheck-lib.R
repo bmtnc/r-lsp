@@ -226,12 +226,17 @@ walk_block <- function(block, ctx, last = walk_expr) {
   stmts <- as.list(block)[-1L]
   srcs <- attr(block, "srcref")
   saved_line <- ctx$line
+  saved_end <- ctx$line_end
   result <- NULL
   for (i in seq_along(stmts)) {
-    if (!is.null(srcs) && length(srcs) > i) ctx$line <- as.integer(srcs[[i + 1L]][[1L]])
+    if (!is.null(srcs) && length(srcs) > i) {
+      ctx$line <- as.integer(srcs[[i + 1L]][[1L]])
+      ctx$line_end <- as.integer(srcs[[i + 1L]][[3L]])
+    }
     result <- if (i == length(stmts)) last(stmts[[i]], ctx) else walk_expr(stmts[[i]], ctx)
   }
   ctx$line <- saved_line
+  ctx$line_end <- saved_end
   result
 }
 
@@ -274,7 +279,7 @@ call_user_function <- function(e, name, ctx) {
     arg_cols[[p]] <- frame_columns(a, ctx, used = param_used_as_frame(fdef[[3L]], p))
   }
   saved <- list(frames = ctx$frames, variables = ctx$variables, unknown = ctx$unknown_frames,
-                line = ctx$line, file = ctx$file)
+                line = ctx$line, line_end = ctx$line_end, file = ctx$file)
   # `if ("x" %in% names(df))`: the body handles frames with and without x,
   # so x counts as present for the parameter rather than reported
   guarded <- guarded_columns(fdef[[3L]])
@@ -298,6 +303,7 @@ call_user_function <- function(e, name, ctx) {
   ctx$variables <- saved$variables
   ctx$unknown_frames <- saved$unknown
   ctx$line <- saved$line
+  ctx$line_end <- saved$line_end
   ctx$file <- saved$file
   result
 }
@@ -469,7 +475,10 @@ frame_columns <- function(e, ctx, used = FALSE) {
     if (!is.call(rhs)) return(NULL)
     rhs_fn <- call_name(rhs)
     lhs <- frame_columns(e[[2L]], ctx, used = used || rhs_fn %in% verb_names || !is.null(ctx$functions[[rhs_fn]]))
-    if (is.null(lhs)) return(NULL)
+    if (is.null(lhs)) {
+      if (!is.na(rhs_fn)) count_step(ctx, "skipped", rhs_fn)
+      return(NULL)
+    }
     if (!is.na(rhs_fn) && !is.null(ctx$functions[[rhs_fn]])) {
       ctx$frames[[".colcheck_lhs"]] <- lhs
       return(call_user_function(pipe_into(rhs, as.name(".colcheck_lhs")), rhs_fn, ctx))
@@ -512,6 +521,7 @@ frame_columns <- function(e, ctx, used = FALSE) {
   if (length(e) >= 2L) {
     inner <- frame_columns(e[[2L]], ctx, used = used || fn %in% verb_names)
     if (!is.null(inner)) return(apply_verb(e, inner, ctx, piped = FALSE))
+    count_step(ctx, "skipped", fn)
   }
   # anything else is a loader the checker cannot open: try the schema cache
   if (!(fn %in% verb_names) && !(fn %in% c("function", "{", "(", "if", "for", "while", "repeat", "$", "@", "[", "[["))) {
@@ -571,11 +581,46 @@ selection_names <- function(args) {
   out
 }
 
+# Lines of a file the walker is in (the checked file or a project function's).
+file_lines <- function(ctx, file) {
+  hit <- ctx$line_cache[[file]]
+  if (is.null(hit)) {
+    hit <- quiet(readLines(file, warn = FALSE), character())
+    ctx$line_cache[[file]] <- hit
+  }
+  hit
+}
+
+# The line to report for `name`: ctx$line is where the current statement
+# starts, which for a pipeline is its first line; the first line of the
+# statement that mentions the name (outside a comment) is the one to show.
+pin_line <- function(ctx, name) {
+  if (is.null(ctx$line) || is.na(ctx$line)) return(ctx$line)
+  txt <- file_lines(ctx, ctx$file)
+  to <- ctx$line_end
+  if (is.null(to) || is.na(to) || to < ctx$line) to <- ctx$line
+  rng <- seq.int(ctx$line, min(to, length(txt)))
+  if (!length(rng) || rng[[1L]] > length(txt)) return(ctx$line)
+  pat <- paste0("(^|[^A-Za-z0-9._])`?", gsub("([.])", "\\\\\\1", name), "`?([^A-Za-z0-9._]|$)")
+  code <- sub("#.*$", "", txt[rng])
+  hit <- rng[grepl(pat, code, perl = TRUE)]
+  if (length(hit)) hit[[1L]] else ctx$line
+}
+
+# Pipeline steps seen: checked against a known column set, or skipped
+# because the frame's columns are unknowable. Keyed so that the walker
+# visiting a pipeline twice counts it once.
+count_step <- function(ctx, kind, fn) {
+  if (!(fn %in% verbs)) return(invisible())
+  ctx$stats[[kind]] <- union(ctx$stats[[kind]], paste(ctx$file, ctx$line, fn))
+  invisible()
+}
+
 report <- function(ctx, name, cols) {
   src <- attr(cols, "source") %||% "the data"
   via <- if (length(ctx$call_sites)) ctx$call_sites[[length(ctx$call_sites)]] else NULL
   ctx$findings[[length(ctx$findings) + 1L]] <- list(
-    kind = "column", file = ctx$file, line = ctx$line, name = name, source = src,
+    kind = "column", file = ctx$file, line = pin_line(ctx, name), name = name, source = src,
     columns = as.character(cols), via = via,
     message = sprintf("'%s' is not a column at this point (columns: %s; data from %s%s)", name,
                       paste(head(cols, 12), collapse = ", "), src,
@@ -593,6 +638,7 @@ check_symbols <- function(syms, cols, ctx) {
 apply_verb <- function(call, cols, ctx, piped) {
   fn <- call_name(call)
   if (is.na(fn)) return(NULL)
+  count_step(ctx, "checked", fn)
   args <- call_args(call)
   if (!piped && length(args)) args <- args[-1L]
   nms <- names(args) %||% rep("", length(args))
@@ -740,6 +786,75 @@ verb_names <- unique(c(verbs, "slice_head", "slice_tail", "slice_min", "slice_ma
                        "drop_na", "fill", "relocate", "ungroup", "rowwise", "glimpse", "print", "head",
                        "tail", "collect", "compute", "as_tibble", "as.data.frame", "tally", "add_count"))
 
+# --- argument names ----------------------------------------------------------
+# A call to a project function with an argument name its definition does not
+# have runs anyway when R can partial-match it (flow_metric= for flow_metrics)
+# and fails only at run time otherwise; lintr does not look. Functions with
+# `...` accept anything, so they are not checked; neither are names that a
+# default package also defines (a project's own `filter` is not the call's
+# target for sure).
+
+builtin_name <- function(nm) {
+  for (p in c("base", "stats", "utils", "methods", "graphics", "grDevices")) {
+    if (exists(nm, envir = asNamespace(p), inherits = FALSE)) return(TRUE)
+  }
+  FALSE
+}
+
+check_call_args <- function(e, name, ctx) {
+  def <- ctx$functions[[name]]
+  if (is.null(def) || isTRUE(ctx$in_negative_test) || builtin_name(name)) return(invisible())
+  head <- e[[1L]]
+  if (is.call(head)) {
+    # pkg::f(): only the project's own package names these functions
+    if (is.null(ctx$pkg_name) || !identical(as.character(head[[2L]]), ctx$pkg_name)) return(invisible())
+  }
+  formals <- names(def$fn[[2L]]) %||% character()
+  if ("..." %in% formals) return(invisible())
+  args <- as.list(e)[-1L]
+  nms <- names(args) %||% rep("", length(args))
+  forwards <- any(vapply(args, function(a) is.symbol(a) && identical(as.character(a), "..."), TRUE))
+  shown <- paste(formals, collapse = ", ")
+  used <- character()
+  add <- function(nm, message) {
+    ctx$findings[[length(ctx$findings) + 1L]] <<- list(
+      kind = "argument", file = ctx$file, line = pin_line(ctx, nm), name = nm, source = NA_character_,
+      columns = character(), message = message)
+  }
+  for (nm in unique(nms[nzchar(nms)])) {
+    if (nm %in% formals) { used <- c(used, nm); next }
+    partial <- formals[startsWith(formals, nm)]
+    if (length(partial) == 1L) {
+      used <- c(used, partial)
+      add(nm, sprintf("%s() has no argument '%s'; R partial-matches it to '%s' silently, so use the full name",
+                      name, nm, partial))
+    } else if (length(partial) > 1L) {
+      add(nm, sprintf("'%s' is ambiguous in %s(): it partially matches %s", nm, name, paste(partial, collapse = " and ")))
+    } else {
+      add(nm, sprintf("%s() has no argument '%s' (its arguments are: %s)", name, nm, shown))
+    }
+  }
+  npos <- sum(!nzchar(nms))
+  if (!forwards && npos > length(formals) - length(unique(used))) {
+    add(name, sprintf("%s() takes %d argument(s) (%s) but %d were given", name, length(formals), shown, length(args)))
+  }
+  invisible()
+}
+
+# `x %>% f(a = 1)`: f(x, a = 1) is the call to check, for every step of the chain.
+check_pipe_args <- function(e, ctx) {
+  while (is.call(e) && call_name(e) %in% c("%>%", "%<>%", "%T>%") && length(e) == 3L) {
+    rhs <- e[[3L]]
+    if (is.symbol(rhs)) rhs <- as.call(list(rhs))
+    if (is.call(rhs)) {
+      fn <- call_name(rhs)
+      if (!is.na(fn) && !is.null(ctx$functions[[fn]])) check_call_args(pipe_into(rhs, as.name(".lhs")), fn, ctx)
+    }
+    e <- e[[2L]]
+  }
+  invisible()
+}
+
 walk_expr <- function(e, ctx) {
   if (!is.call(e)) return(invisible())
   fn <- call_name(e)
@@ -799,6 +914,7 @@ walk_expr <- function(e, ctx) {
     return(invisible())
   }
   if (!is.na(fn) && fn %in% c("%>%", "%<>%", "%T>%")) {
+    check_pipe_args(e, ctx)
     frame_columns(e, ctx)
     return(invisible())
   }
@@ -807,6 +923,7 @@ walk_expr <- function(e, ctx) {
     return(invisible())
   }
   if (!is.na(fn) && fn == "{") return(walk_block(e, ctx))
+  if (!is.na(fn) && !is.null(ctx$functions[[fn]])) check_call_args(e, fn, ctx)
   if (!is.na(fn) && (fn %in% verbs || !is.null(ctx$functions[[fn]]))) frame_columns(e, ctx)
   for (p in call_args(e)) if (is.call(p)) walk_expr(p, ctx)
   invisible()
@@ -827,6 +944,11 @@ colcheck_file <- function(file, root = NULL) {
   ctx$stale <- list()
   ctx$annotation <- NULL
   ctx$src_lines <- quiet(readLines(file, warn = FALSE), character())
+  ctx$line_cache <- list()
+  ctx$line_end <- NA_integer_
+  ctx$stats <- list(checked = character(), skipped = character())
+  ctx$pkg_name <- if (file.exists(file.path(ctx$root, "DESCRIPTION")))
+    quiet(unname(read.dcf(file.path(ctx$root, "DESCRIPTION"), fields = "Package")[1L, 1L])) else NULL
   ctx$known_names <- c("TRUE", "FALSE", "NA", "NULL", "T", "F", "Inf", "NaN", ".", ".x", ".y", ".data", ".env",
                        "desc", "n", "everything", "where", "across", "pi", "letters", "LETTERS",
                        "month.name", "month.abb", "self", "private")
@@ -843,9 +965,11 @@ colcheck_file <- function(file, root = NULL) {
   }
   for (i in seq_along(exprs)) {
     ctx$line <- if (!is.null(src)) as.integer(src[[i]][[1L]]) else NA_integer_
+    ctx$line_end <- if (!is.null(src)) as.integer(src[[i]][[3L]]) else NA_integer_
     quiet(walk_expr(exprs[[i]], ctx))
   }
-  c(ctx$findings, source_notes(ctx))
+  structure(c(ctx$findings, source_notes(ctx)),
+            stats = list(checked = length(ctx$stats$checked), skipped = length(ctx$stats$skipped)))
 }
 
 # Notes about data sources: frames the checker could not resolve that are
@@ -878,15 +1002,23 @@ source_notes <- function(ctx) {
   notes
 }
 
+# Findings for FILES, with a "stats" attribute: pipeline steps checked
+# against known columns, steps skipped (columns unknowable), files read.
 colcheck_files <- function(files, root = NULL) {
   all <- list()
+  stats <- list(checked = 0L, skipped = 0L, files = 0L)
   for (f in files) {
     if (!file.exists(f) || grepl("[.](Rmd|rmd|qmd)$", f)) next
-    all <- c(all, colcheck_file(f, root))
+    res <- colcheck_file(f, root)
+    st <- attr(res, "stats")
+    all <- c(all, res)
+    stats$files <- stats$files + 1L
+    stats$checked <- stats$checked + (st$checked %||% 0L)
+    stats$skipped <- stats$skipped + (st$skipped %||% 0L)
   }
   # The walker can visit a pipeline twice (assignment and its right-hand side).
   keys <- vapply(all, function(x) paste(x$file, x$line, x$name, x$source), "")
-  all[!duplicated(keys)]
+  structure(all[!duplicated(keys)], stats = stats)
 }
 
 relative_path <- function(file, root) {

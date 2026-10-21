@@ -13,6 +13,7 @@ findings <- tryCatch(colcheck_files(file, root), error = function(e) list())
 if (!length(findings)) quit(save = "no", status = 0)
 kinds <- vapply(findings, function(x) x$kind %||% "column", "")
 columns <- findings[kinds == "column"]
+arguments <- findings[kinds == "argument"]
 notes <- findings[kinds == "note"]
 from_cache <- any(vapply(columns, function(x) startsWith(x$source %||% "", "cached schema"), TRUE))
 
@@ -30,6 +31,11 @@ if (length(columns)) {
       "If the data really has that column, the cached schema is stale: refresh it with `r-colcheck learn KEY 'EXPR'` (the key is named above). Otherwise, if another step adds the column, ignore this."
     else
       "If the data really has that column (e.g. the file on disk is stale or another step adds it), ignore this.")
+}
+if (length(arguments)) {
+  parts <- c(parts,
+    "Calls to functions defined in this project whose argument names do not match the definition (R only fails at run time, or partial-matches silently):",
+    clip(colcheck_format(arguments, root)))
 }
 if (length(notes)) {
   parts <- c(parts,

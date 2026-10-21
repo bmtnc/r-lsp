@@ -51,6 +51,10 @@ status_state$busy <- FALSE
 # release they switch themselves off; say so once where r-lsp-status and
 # `claude --debug` can show it.
 ls_version <- utils::packageVersion("languageserver")
+# Marks where this server's events begin: r-lsp-status shows nothing from
+# before the last marker, so a previous server's "index ready" is never
+# mistaken for the current state after a reload.
+status(sprintf("server started (pid %d, languageserver %s)", Sys.getpid(), ls_version))
 if (ls_version < "0.3.19") {
   old_note <- paste0("languageserver ", ls_version, " is older than 0.3.19: renv support works, but index status, ",
                      "complete cross-file answers and other-repository support are off. Upgrade with ",

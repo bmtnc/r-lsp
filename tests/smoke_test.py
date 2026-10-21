@@ -407,10 +407,30 @@ def scenario_colcheck(s):
                          capture_output=True, text=True, timeout=120).stdout
     check("R/pipeline.R:5: 'amout'" in out and out.count("is not a column") == 1,
           f"package-wide function lookup unexpected:\n{out}")
+    # Argument names against the definition, the reported line, exit code and summary.
+    with open(os.path.join(pkg, "R", "calls.R"), "w") as f:
+        f.write("totals <- function(df, min_rows = 1) df\n"
+                "x <- readr::read_csv('data/sales.csv') %>%\n  dplyr::mutate(z = 1) %>%\n  totals(min_row = 2)\n"
+                "y <- totals(x, rows = 3)\nz <- totals(x, 1, 2)\nok <- totals(x, min_rows = 2)\n"
+                "testthat::expect_error(totals(x, nope = 1))\n")
+    run = subprocess.run([tool, "--root", pkg, os.path.join(pkg, "R", "calls.R")], capture_output=True, text=True, timeout=120)
+    lines = [l for l in run.stdout.splitlines() if l.startswith("R/calls.R:")]
+    check(any(l.startswith("R/calls.R:4:") and "partial-matches it to 'min_rows'" in l for l in lines) and
+          any(l.startswith("R/calls.R:5:") and "no argument 'rows'" in l for l in lines) and
+          any(l.startswith("R/calls.R:6:") and "takes 2 argument(s)" in l for l in lines) and len(lines) == 3,
+          f"argument check unexpected:\n{run.stdout}")
+    check(run.returncode == 1, f"r-colcheck exit code with findings was {run.returncode}")
+    check("1 pipeline step(s) checked" in run.stderr and "3 finding(s)" in run.stderr, f"summary line unexpected:\n{run.stderr}")
+    clean = subprocess.run([tool, "--root", pkg, os.path.join(pkg, "R", "load.R")], capture_output=True, text=True, timeout=120)
+    check(clean.returncode == 0 and not clean.stdout.strip() and "r-colcheck:" in clean.stderr,
+          f"clean file: exit {clean.returncode}, stdout {clean.stdout!r}, stderr {clean.stderr!r}")
     hook = os.path.join(REPO, "plugins", "r-lsp", "hooks", "post-edit.sh")
     ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": analysis}, "cwd": root},
                                 env={"CLAUDE_PROJECT_DIR": root}))
     check("'amt'" in ctx and "regoin" in ctx, f"post-edit hook context missing findings:\n{ctx[:400]}")
+    ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(pkg, "R", "calls.R")},
+                                       "cwd": pkg}, env={"CLAUDE_PROJECT_DIR": pkg}))
+    check("argument names do not match" in ctx and "no argument 'rows'" in ctx, f"post-edit hook missed argument findings:\n{ctx[:600]}")
     silent = run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": "/tmp/x.py"}})
     check(not silent.strip(), "post-edit hook spoke for a non-R file")
 
@@ -483,7 +503,11 @@ def scenario_colcheck_cache(s):
 
 
 def scenario_hooks(s):
-    """SessionStart context + index pre-warm, and the note after LSP results."""
+    """SessionStart context + index pre-warm, the note after LSP results, and
+    r-lsp-status. The LSP payloads are in the shapes Claude Code's LSP tool
+    prints (captured from real sessions): a file line followed by indented
+    "Line N:M" lines, call-hierarchy items with "[calls at: ...]", and
+    "Defined in FILE:N:M"."""
     root = s.make_package("hooks_pkg")
     start = os.path.join(REPO, "plugins", "r-lsp", "hooks", "session-start.sh")
     out = run_hook(start, {}, env={"CLAUDE_PROJECT_DIR": root}, stdin_text="{}")
@@ -495,22 +519,92 @@ def scenario_hooks(s):
             break
         time.sleep(0.5)
     check(os.path.exists(cache), f"pre-warm did not create the index cache {cache}")
+
+    # Extra files for the note heuristics: a roxygen link in a file the
+    # server returns, a script-level variable assigned in two branches, and
+    # a column created inside mutate().
+    with open(os.path.join(root, "R", "other.R"), "a") as f:
+        f.write("#' See [add_tax()] for the rate.\nlinked <- function(x) add_tax(x)\n")
+    os.makedirs(os.path.join(root, "scripts"), exist_ok=True)
+    with open(os.path.join(root, "scripts", "run.R"), "w") as f:
+        f.write("if (file.exists('cache.rds')) {\n  totals <- readRDS('cache.rds')\n} else {\n"
+                "  totals <- add_tax(1:3)\n  saveRDS(totals, 'cache.rds')\n}\n"
+                "print(totals)\nreport <- dplyr::mutate(data.frame(x = totals), net_amount = x - 1)\n"
+                "summary(report$net_amount)\n")
     lsp_hook = os.path.join(REPO, "plugins", "r-lsp", "hooks", "post-lsp.sh")
-    payload = {"tool_name": "LSP", "cwd": root,
-               "tool_input": {"operation": "findReferences", "filePath": os.path.join(root, "R", "tax.R"),
-                              "line": 5, "character": 1},
-               "tool_response": "Found 3 references across 2 files:\nR/tax.R: Line 5:1, Line 9:20\nR/other.R: Line 1:28"}
-    ctx = hook_context(run_hook(lsp_hook, payload, env={"CLAUDE_PROJECT_DIR": root}))
-    check("tests/testthat/test-tax.R" in ctx, f"post-lsp note missed the test file:\n{ctx}")
+    env = {"CLAUDE_PROJECT_DIR": root}
+
+    def lsp(op, rel, line, char, response):
+        payload = {"tool_name": "LSP", "cwd": root,
+                   "tool_input": {"operation": op, "filePath": os.path.join(root, rel), "line": line, "character": char},
+                   "tool_response": response}
+        return run_hook(lsp_hook, payload, env=env)
+
+    refs = ("Found 4 references across 3 files:\n\nR/tax.R:\n  Line 5:1\n  Line 9:20\n\nR/other.R:\n  Line 1:22\n"
+            "  Line 4:28\n\ntests/testthat/test-tax.R:\n  Line 2:16")
+    ctx = hook_context(lsp("findReferences", "R/tax.R", 5, 1, refs))
+    check("R/other.R:3:" in ctx and "[add_tax()]" in ctx, f"post-lsp note missed the roxygen link in a returned file:\n{ctx}")
+    check("R/other.R:4:" not in ctx and "test-tax.R" not in ctx, f"post-lsp note repeated lines the server returned:\n{ctx}")
+    old_shape = "Found 3 references across 2 files:\nR/tax.R: Line 5:1, Line 9:20\nR/other.R: Line 1:28"
+    ctx = hook_context(lsp("findReferences", "R/tax.R", 5, 1, old_shape))
+    check("tests/testthat/test-tax.R:2:" in ctx, f"post-lsp note (old answer shape) missed the test file:\n{ctx}")
+
+    defn = lsp("goToDefinition", "R/other.R", 1, 22, "Defined in R/tax.R:5:1")
+    check(not defn.strip(), f"post-lsp hook spoke after a definition that answered the question:\n{defn}")
+    defn = lsp("goToDefinition", "scripts/run.R", 7, 7, "Defined in scripts/run.R:4:3")
+    ctx = hook_context(defn)
+    check("scripts/run.R:2:" in ctx and "scripts/run.R:4:" not in ctx, f"definition note should list the other branch only:\n{ctx}")
+
+    with open(os.path.join(root, "tests", "testthat", "test-tax.R"), "a") as f:
+        f.write("test_that('more', {\n  expect_equal(add_tax(1), 1.2)\n  expect_equal(add_tax(2), 2.4)\n})\n")
+    calls = ("Found 2 incoming calls:\n\nR/other.R:\n  gross (Function) - Line 1 [calls at: 1:22]\n\n"
+             "tests/testthat/test-tax.R:\n  test_that (Function) - Line 4 [calls at: 5:16, 6:16]")
+    ctx = hook_context(lsp("incomingCalls", "R/tax.R", 5, 1, calls))
+    check("tests/testthat/test-tax.R:2:" in ctx and "R/tax.R:9:" in ctx and "R/other.R:4:" in ctx,
+          f"incomingCalls note missed callers:\n{ctx}")
+    check("R/other.R:1:" not in ctx and "test-tax.R:5:" not in ctx and "test-tax.R:6:" not in ctx,
+          f"incomingCalls note repeated a returned call site:\n{ctx}")
+    check("Roxygen links" in ctx and "R/other.R:3:" in ctx, f"incomingCalls note missed the roxygen link:\n{ctx}")
+
+    split = "Found 3 references across 1 files:\n\nscripts/run.R:\n  Line 4:3\n  Line 5:11\n  Line 7:7"
+    ctx = hook_context(lsp("findReferences", "scripts/run.R", 4, 3, split))
+    check("assigned at script level inside a block" in ctx and "scripts/run.R:2:" in ctx and "scripts/run.R:8:" in ctx,
+          f"script-level variable note wrong:\n{ctx}")
+    check("trust" not in ctx, f"script-level variable note tells Claude to trust a partial answer:\n{ctx}")
+    none = "No references found. This may occur if the symbol has no usages"
+    ctx = hook_context(lsp("findReferences", "scripts/run.R", 9, 16, none))
+    check("data-frame column" in ctx and "scripts/run.R:8" in ctx, f"column-name note wrong:\n{ctx}")
+
     status_file = os.path.join(s.scratch, "hooks.status.log")
     with open(status_file, "w") as f:
         f.write(f"12:00:00 [{root}] R LSP: workspace: indexing 3 files\n")
-    payload["tool_response"] = "No references found. This may occur if the symbol has no usages"
+    payload = {"tool_name": "LSP", "cwd": root,
+               "tool_input": {"operation": "findReferences", "filePath": os.path.join(root, "R", "tax.R"),
+                              "line": 5, "character": 1},
+               "tool_response": none}
     ctx = hook_context(run_hook(lsp_hook, payload, env={"CLAUDE_PROJECT_DIR": root, "R_LSP_STATUS_FILE": status_file}))
     check("still indexing" in ctx, f"post-lsp note did not report the running index:\n{ctx}")
-    covered = dict(payload, tool_response="R/tax.R R/other.R tests/testthat/test-tax.R")
+    covered = dict(payload, tool_response="R/tax.R R/other.R tests/testthat/test-tax.R scripts/run.R")
     quiet = run_hook(lsp_hook, covered, env={"CLAUDE_PROJECT_DIR": root})
     check(not quiet.strip(), f"post-lsp hook spoke although every file was covered:\n{quiet}")
+
+    # r-lsp-status shows only the newest server's events and notices a dead one.
+    status_tool = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-lsp-status")
+    with open(status_file, "w") as f:
+        f.write(f"12:00:00 [{root}] R LSP: server started (pid 999999, languageserver 0.3.20)\n"
+                f"12:00:01 [{root}] R LSP: index ready (3 files, 1.0 s)\n"
+                f"12:05:00 [{root}] R LSP: server started (pid {os.getpid()}, languageserver 0.3.20)\n"
+                f"12:05:01 [{root}] R LSP: workspace: indexing 3 files\n")
+    shown = subprocess.run([status_tool], env=dict(os.environ, CLAUDE_PROJECT_DIR=root, R_LSP_STATUS_FILE=status_file),
+                           capture_output=True, text=True).stdout
+    check("index ready" not in shown and "indexing 3 files" in shown and "exited" not in shown,
+          f"r-lsp-status showed a previous server's events:\n{shown}")
+    with open(status_file, "w") as f:
+        f.write(f"12:00:00 [{root}] R LSP: server started (pid 999999, languageserver 0.3.20)\n"
+                f"12:00:01 [{root}] R LSP: index ready (3 files, 1.0 s)\n")
+    shown = subprocess.run([status_tool], env=dict(os.environ, CLAUDE_PROJECT_DIR=root, R_LSP_STATUS_FILE=status_file),
+                           capture_output=True, text=True).stdout
+    check("has exited" in shown, f"r-lsp-status did not notice the dead server:\n{shown}")
 
 
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,

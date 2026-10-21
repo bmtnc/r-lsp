@@ -6,9 +6,13 @@
 #  - For findReferences / incomingCalls: grep the project for the symbol and
 #    list every mention the server's answer did not return, line by line, in
 #    whatever file (tests, scripts, roxygen links, comments, other
-#    assignments of the same variable). Files git ignores are skipped.
-#  - For goToDefinition with no result: list lines that look like a
-#    definition of the symbol anywhere in the project.
+#    assignments of the same variable), returned files included. Files git
+#    ignores are skipped. A name with no top-level definition is classified
+#    with the parser: assigned at script level inside a block (the server
+#    scopes it to the block, so its answer is partial), created as an
+#    argument name (a data-frame column), or local to a function.
+#  - For goToDefinition: list other lines that assign the symbol; with no
+#    result, lines that look like a definition anywhere in the project.
 #  - For a null answer at the first character of a symbol: suggest retrying
 #    one character to the right (a known off-by-one in the server).
 `%||%` <- function(a, b) if (is.null(a)) b else a
@@ -32,6 +36,14 @@ status_file <- Sys.getenv("R_LSP_STATUS_FILE",
 if (file.exists(status_file)) {
   lines <- tryCatch(readLines(status_file, warn = FALSE), error = function(e) character())
   mine <- grep(paste0("[", root, "]"), lines, fixed = TRUE, value = TRUE)
+  # only the most recently started server's events; a server that has
+  # exited (plugin reload) left "indexing" lines that mean nothing now
+  marker <- grep("R LSP: server started", mine, fixed = TRUE)
+  if (length(marker)) {
+    mine <- mine[tail(marker, 1):length(mine)]
+    pid <- sub("^.*\\(pid ([0-9]+).*$", "\\1", mine[[1L]])
+    if (grepl("^[0-9]+$", pid) && !isTRUE(tools::pskill(as.integer(pid), 0L))) mine <- character()
+  }
   if (length(mine)) {
     last <- tail(mine, 1)
     if (grepl(": indexing ", last, fixed = TRUE) && !grepl("index ready", last, fixed = TRUE)) {
@@ -96,19 +108,70 @@ project_files <- function() {
   f[!grepl("/(renv|packrat|[.]git|node_modules|[.]Rproj[.]user)/", f) & file.exists(f)]
 }
 
-# The (file, line) pairs the server's answer names, in Claude Code's format
-# "R/tax.R: Line 5:1, Line 9:20". Empty when the answer carries no lines.
+# The (file, line) pairs the server's answer names. Claude Code prints the
+# LSP tool's result in three shapes:
+#   findReferences   "R/a.R:" on a line of its own, then "  Line 5:1" lines
+#   call hierarchy   "R/a.R:" then "  f (Function) - Line 59 [calls at: 97:15]"
+#   goToDefinition   "Defined in R/a.R:27:1"
+# and the older one-line "R/a.R: Line 5:1, Line 9:20". For a call hierarchy
+# item the call positions count as answered, not only the item's line.
+line_numbers <- function(s) {
+  nums <- sub("Line\\s+", "", regmatches(s, gregexpr("Line\\s+\\d+", s))[[1L]])
+  calls <- regmatches(s, regexec("\\[call(s|ed) (at|from): ([^]]*)\\]", s))[[1L]]
+  if (length(calls) >= 4L) nums <- c(nums, sub(":.*$", "", trimws(strsplit(calls[[4L]], ",")[[1L]])))
+  nums
+}
 answered_lines <- function(text) {
   out <- character()
-  for (ln in strsplit(text, "\n", fixed = TRUE)[[1L]]) {
-    m <- regmatches(ln, regexec("^\\s*(\\S+?):\\s*(Line\\s+\\d+.*)$", ln))[[1L]]
-    if (length(m) < 3L) next
-    nums <- regmatches(m[[3L]], gregexpr("Line\\s+(\\d+)", m[[3L]]))[[1L]]
-    for (n in sub("Line\\s+", "", nums)) out <- c(out, paste0(m[[2L]], ":", n))
+  cur <- NULL
+  add <- function(f, nums) {
+    if (startsWith(f, "/")) f <- rel(f)
+    for (n in nums) out <<- c(out, paste0(f, ":", n))
   }
-  out
+  for (ln in strsplit(text, "\n", fixed = TRUE)[[1L]]) {
+    m <- regmatches(ln, regexec("^\\s*Defined in (\\S+?):(\\d+)(:\\d+)?\\s*$", ln, perl = TRUE))[[1L]]
+    if (length(m) >= 3L) { add(m[[2L]], m[[3L]]); next }
+    m <- regmatches(ln, regexec("^(\\S+?):\\s*(Line\\s+\\d+.*)$", ln, perl = TRUE))[[1L]]
+    if (length(m) >= 3L) { cur <- m[[2L]]; add(cur, line_numbers(m[[3L]])); next }
+    m <- regmatches(ln, regexec("^(\\S+?):\\s*$", ln, perl = TRUE))[[1L]]
+    if (length(m) >= 2L) { cur <- m[[2L]]; next }
+    if (!is.null(cur) && grepl("^\\s+.*Line\\s+\\d+", ln)) add(cur, line_numbers(ln))
+  }
+  unique(out)
 }
-answered_files <- function(text) unique(sub(":.*$", "", answered_lines(text)))
+answered_files <- function(text) unique(sub(":[0-9]+$", "", answered_lines(text)))
+
+# How the queried file assigns `name`: "script" when some assignment sits
+# outside every function body (inside an if/else or loop at script level
+# counts), "function" when all of them are inside one, "none" otherwise.
+# The server scopes a block assignment to its block, so a script-level
+# variable assigned in two branches gets two disjoint reference sets.
+assignment_kind <- function(path, name) {
+  pd <- tryCatch(utils::getParseData(parse(path, keep.source = TRUE)), error = function(e) NULL)
+  if (is.null(pd) || !nrow(pd)) return("none")
+  pd <- pd[order(pd$line1, pd$col1, -pd$line2, -pd$col2), ]
+  parent_of <- setNames(pd$parent, pd$id)
+  token_of <- setNames(pd$token, pd$id)
+  kids <- split(pd$id, pd$parent)
+  kinds <- character()
+  for (sid in pd$id[pd$token == "SYMBOL" & pd$text == name]) {
+    p <- parent_of[[as.character(sid)]]
+    if (is.na(p) || p <= 0) next
+    g <- parent_of[[as.character(p)]]
+    if (is.na(g) || g <= 0) next
+    ch <- kids[[as.character(g)]]
+    if (length(ch) < 2L || ch[[1L]] != p ||
+        !(token_of[[as.character(ch[[2L]])]] %in% c("LEFT_ASSIGN", "EQ_ASSIGN"))) next
+    inside <- FALSE
+    a <- parent_of[[as.character(g)]]
+    while (!is.na(a) && a > 0) {
+      if (any(token_of[as.character(kids[[as.character(a)]])] %in% c("FUNCTION", "OP-LAMBDA"))) { inside <- TRUE; break }
+      a <- parent_of[[as.character(a)]]
+    }
+    kinds <- c(kinds, if (inside) "function" else "script")
+  }
+  if ("script" %in% kinds) "script" else if (length(kinds)) "function" else "none"
+}
 
 if (!is.null(sym) && nzchar(sym$name) && op %in% c("findReferences", "incomingCalls", "goToDefinition")) {
   files <- project_files()
@@ -120,12 +183,34 @@ if (!is.null(sym) && nzchar(sym$name) && op %in% c("findReferences", "incomingCa
                       "(setMethod|setGeneric|assign)\\([[:space:]]*[\"']", name, "[\"']")
     top_def_pat <- paste0("^`?", esc, "`?[[:space:]]*(<-|=|<<-)")
     call_pat <- paste0("(^|[^A-Za-z0-9._])", esc, "[[:space:]]*\\(")
+    # `name = value` as an argument (indented, or after "(" or ","): how a
+    # column is created inside mutate()/summarise()/tibble()
+    col_pat <- paste0("(^[[:space:]]+|[(,][[:space:]]*)`?", esc, "`?[[:space:]]*=[^=]")
+    # ... and only inside a data-masking call: a default in function(x, name = 1)
+    # or an ordinary named argument is not a column
+    verb_ctx <- "(^|[^A-Za-z0-9._])(mutate|summarise|summarize|transmute|reframe|tibble|data[.]frame|tribble|group_by|count|rename|select)[[:space:]]*\\("
+    doc_pat <- paste0("^[[:space:]]*#'.*\\[", esc, "\\(\\)\\]")
+    # Is line i inside a data-masking call? Walk up to the line that opens
+    # the enclosing call: a verb means yes; a function signature, a blank
+    # line or a block opener means the argument belongs to something else.
+    in_masking_call <- function(txt, i) {
+      for (j in i:max(1L, i - 40L)) {
+        if (grepl("function[[:space:]]*\\(", txt[[j]])) return(FALSE)
+        if (grepl(verb_ctx, txt[[j]], perl = TRUE)) return(TRUE)
+        if (j < i && (!nzchar(trimws(txt[[j]])) || grepl("[{]\\s*$", txt[[j]]))) return(FALSE)
+      }
+      FALSE
+    }
     known <- answered_lines(resp_text)
     known_files <- answered_files(resp_text)
     by_line <- length(known) > 0L
     hits <- character()
     call_hits <- character()
+    doc_hits <- character()
+    col_hits <- character()
     top_level_def <- FALSE
+    queried <- rel(file)
+    same_file <- character()
     for (p in files) {
       txt <- tryCatch(readLines(p, warn = FALSE), error = function(e) character())
       idx <- grep(pat, txt, perl = TRUE)
@@ -133,7 +218,7 @@ if (!is.null(sym) && nzchar(sym$name) && op %in% c("findReferences", "incomingCa
       r <- rel(p)
       if (any(grepl(top_def_pat, txt[idx], perl = TRUE))) top_level_def <- TRUE
       if (op == "goToDefinition") {
-        idx <- idx[grepl(def_pat, txt[idx], perl = TRUE)]
+        idx <- idx[grepl(def_pat, txt[idx], perl = TRUE) & !(paste0(r, ":", idx) %in% known)]
       } else if (by_line) {
         idx <- idx[!(paste0(r, ":", idx) %in% known)]
       } else if (r %in% known_files || basename(p) %in% basename(known_files) ||
@@ -143,37 +228,61 @@ if (!is.null(sym) && nzchar(sym$name) && op %in% c("findReferences", "incomingCa
       for (i in idx) {
         line <- sprintf("%s:%d: %s", r, i, substr(trimws(txt[[i]]), 1, 110))
         hits <- c(hits, line)
-        if (grepl(call_pat, txt[[i]], perl = TRUE) && !grepl("^[[:space:]]*#", txt[[i]])) call_hits <- c(call_hits, line)
+        if (r == queried) same_file <- c(same_file, line)
+        is_comment <- grepl("^[[:space:]]*#", txt[[i]])
+        if (grepl(call_pat, txt[[i]], perl = TRUE) && !is_comment) call_hits <- c(call_hits, line)
+        if (grepl(doc_pat, txt[[i]], perl = TRUE)) doc_hits <- c(doc_hits, line)
+        if (grepl(col_pat, txt[[i]], perl = TRUE) && !is_comment && in_masking_call(txt, i)) col_hits <- c(col_hits, line)
       }
     }
+    files_of <- function(h) unique(sub(":.*$", "", h))
+    listed <- function(h, n = 15, hint = "rg -nw %s") paste0(
+      paste(head(h, n), collapse = "\n  "),
+      if (length(h) > n) sprintf(paste0("\n  ... and %d more (", hint, ")"), length(h) - n, name) else "")
     if (length(hits)) {
-      if (op == "goToDefinition" && null_answer) {
-        notes <- c(notes, paste0("Lines that look like a definition of `", name, "` (grep, whole project):\n  ",
-          paste(head(hits, 10), collapse = "\n  ")))
+      if (op == "goToDefinition") {
+        notes <- c(notes, if (null_answer) {
+          paste0("Lines that look like a definition of `", name, "` (grep, whole project):\n  ", listed(hits, 10))
+        } else {
+          paste0("Other lines that assign `", name, "`, which the server's definition does not cover (a variable",
+            " assigned in several branches or files, or a redefinition):\n  ", listed(hits, 10))
+        })
       } else if (op == "incomingCalls") {
         if (length(call_hits)) {
           notes <- c(notes, paste0(
             if (null_answer) "The server's 'no incoming calls' is incomplete. " else "The server's caller list is incomplete. ",
-            "grep finds ", length(call_hits), " call(s) of `", name, "` it did not return (scripts, tests and Rmd are outside",
-            " the server's call hierarchy; so are calls through purrr/apply or do.call). Treat these as callers:\n  ",
-            paste(head(call_hits, 15), collapse = "\n  "),
-            if (length(call_hits) > 15) sprintf("\n  ... and %d more (rg -nw '%s\\(' )", length(call_hits) - 15, name) else ""))
+            "grep finds ", length(call_hits), " call(s) of `", name, "` it did not return (Rmd files and calls through",
+            " purrr/apply or do.call are outside the server's call hierarchy). Treat these as callers:\n  ",
+            listed(call_hits, hint = "rg -nw '%s\\(' ")))
         }
+        if (length(doc_hits)) {
+          notes <- c(notes, paste0("Roxygen links to `", name, "` (not calls, but a rename must update them):\n  ",
+            listed(doc_hits, 10)))
+        }
+      } else if (!top_level_def && assignment_kind(file, name) == "script") {
+        notes <- c(notes, paste0("`", name, "` is assigned at script level inside a block (an if/else or loop body) in ",
+          queried, ". The server scopes such assignments to their block, so its answer can be one branch's",
+          " assignment and the uses after it, not the whole variable. Treat the server's list plus these",
+          " as the reference set before a rename:\n  ", listed(same_file, 20),
+          if (length(setdiff(files_of(hits), queried))) paste0("\n  Other files mentioning the name: ",
+            paste(head(setdiff(files_of(hits), queried), 5), collapse = ", ")) else ""))
+      } else if (!top_level_def && length(col_hits)) {
+        notes <- c(notes, paste0("`", name, "` has no script-level definition in the project, but it is created as",
+          " an argument name (`", name, " = ...`) at ", sub(": .*$", "", col_hits[[1L]]), ", so it may be a",
+          " data-frame column rather than a variable. The server does not track columns, and 'No references",
+          " found' means nothing for one. Check these before a rename:\n  ", listed(hits)))
       } else if (!top_level_def) {
         # no `name <- ...` at column 1 anywhere: a local variable, argument or data column
         notes <- c(notes, paste0("`", name, "` has no top-level definition in the project, so it is probably a local variable, ",
           "argument or data column; the server's scoped answer is the one to trust. For the record, grep finds ",
-          length(hits), " other mention(s) of that name in ", length(unique(sub(":.*$", "", hits))),
-          " file(s), most likely unrelated: ", paste(head(unique(sub(":.*$", "", hits)), 5), collapse = ", "),
-          if (length(unique(sub(":.*$", "", hits))) > 5) ", ..." else ""))
+          length(hits), " other mention(s) of that name in ", length(files_of(hits)),
+          " file(s), most likely unrelated: ", paste(head(files_of(hits), 5), collapse = ", "),
+          if (length(files_of(hits)) > 5) ", ..." else ""))
       } else {
-        nfiles <- length(unique(sub(":.*$", "", hits)))
-        notes <- c(notes, paste0("grep finds ", length(hits), " mention(s) of `", name, "` in ", nfiles,
-          " file(s) that the server's answer does not list. The server resolves references by scope (a package's R/,",
-          " open files and source()d files) and skips roxygen `[", name, "()]` links, comments, strings and tests/scripts",
-          " it does not treat as related. Check these before a rename or signature change:\n  ",
-          paste(head(hits, 15), collapse = "\n  "),
-          if (length(hits) > 15) sprintf("\n  ... and %d more (rg -nw %s)", length(hits) - 15, name) else ""))
+        notes <- c(notes, paste0("grep finds ", length(hits), " mention(s) of `", name, "` in ", length(files_of(hits)),
+          " file(s) that the server's answer does not list. The server resolves references by scope and",
+          " skips roxygen `[", name, "()]` links, comments, strings and Rmd files.",
+          " Check these before a rename or signature change:\n  ", listed(hits)))
       }
     }
   }

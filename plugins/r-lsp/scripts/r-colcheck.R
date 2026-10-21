@@ -22,9 +22,14 @@ if (!length(args)) {
   quit(save = "no", status = 0)
 }
 findings <- colcheck_files(args, root)
+st <- attr(findings, "stats")
+kinds <- vapply(findings, function(x) x$kind %||% "column", "")
 if (as_json) {
-  cat(jsonlite::toJSON(findings, auto_unbox = TRUE, pretty = TRUE), "\n")
+  cat(jsonlite::toJSON(unclass(findings), auto_unbox = TRUE, pretty = TRUE), "\n")
 } else {
   for (line in colcheck_format(findings, root)) cat(line, "\n", sep = "")
 }
-quit(save = "no", status = 0)
+# So that silence means "checked and clean", not "nothing was checkable".
+message(sprintf("r-colcheck: %d pipeline step(s) checked against known columns in %d file(s); %d step(s) skipped (columns unknowable); %d finding(s), %d note(s).",
+                st$checked, st$files, st$skipped, sum(kinds != "note"), sum(kinds == "note")))
+quit(save = "no", status = if (any(kinds != "note")) 1L else 0L)
