@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -720,6 +721,30 @@ def scenario_hooks(s):
     shown = subprocess.run([status_tool], env=dict(os.environ, CLAUDE_PROJECT_DIR=root, R_LSP_STATUS_FILE=status_file),
                            capture_output=True, text=True).stdout
     check("has exited" in shown, f"r-lsp-status did not notice the dead server:\n{shown}")
+
+    # The monitor forwards only the events Claude can act on, for this
+    # directory only, and drops the timestamp and tag.
+    monitor = os.path.join(REPO, "plugins", "r-lsp", "hooks", "monitor-status.sh")
+    data_dir = os.path.join(s.scratch, "monitor_data")
+    os.makedirs(data_dir, exist_ok=True)
+    # The monitor tags on $PWD, which bash resolves to the real path (the
+    # scratch dir sits under a symlink on macOS), as Claude Code's cwd is.
+    tag = os.path.realpath(root)
+    proc = subprocess.Popen(["bash", monitor, data_dir], cwd=tag, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, start_new_session=True)
+    time.sleep(1.0)
+    with open(os.path.join(data_dir, "status.log"), "a") as f:
+        f.write(f"12:00:00 [{tag}] R LSP: server started (pid 1, languageserver 0.3.20)\n"
+                f"12:00:01 [{tag}] R LSP: loaded 3 test/script files as documents\n"
+                f"12:00:01 [{tag}] R LSP: workspace: indexing 3 files\n"
+                f"12:00:02 [{tag}] R LSP: index ready (3 files, 1.0 s)\n"
+                f"12:00:03 [{tag}/elsewhere] R LSP: index ready (9 files, 1.0 s)\n"
+                f"12:00:04 [{tag}] R LSP: added workspace /tmp/other (with its renv library)\n")
+    time.sleep(1.5)
+    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    forwarded = proc.communicate(timeout=10)[0].splitlines()
+    check(forwarded == ["R LSP: index ready (3 files, 1.0 s)", "R LSP: added workspace /tmp/other (with its renv library)"],
+          f"monitor forwarded the wrong lines:\n{forwarded}")
 
 
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,

@@ -85,18 +85,35 @@ index_files <- function(self) {
   }
   n
 }
+# The first index of a run is logged when it starts. A later rescan (the
+# server re-walks the workspace whenever a batch of documents opens) is
+# usually a no-op that finishes in a tenth of a second from the cache, so its
+# "indexing" line is held back until it has run for half a second; a rescan
+# that never gets that far leaves no trace. Both lines or neither: the
+# post-LSP note reads an "indexing" line with no "index ready" after it as
+# "still building", so a held line is never written on its own.
+status_state$announced <- FALSE
+status_state$first <- TRUE
 note_busy <- function(self, what) {
   if (!status_state$busy) {
     status_state$busy <- TRUE
     status_state$started <- proc.time()[[3L]]
-    status(paste0(what, ": indexing ", index_files(self), " files"))
+    status_state$what <- what
+    status_state$announced <- status_state$first
+    status_state$first <- FALSE
+    if (status_state$announced) status(paste0(what, ": indexing ", index_files(self), " files"))
   }
 }
 note_idle <- function(self) {
-  if (status_state$busy && !index_busy(self)) {
+  if (!status_state$busy) return(invisible())
+  elapsed <- proc.time()[[3L]] - status_state$started
+  if (!status_state$announced && elapsed >= 0.5) {
+    status_state$announced <- TRUE
+    status(paste0(status_state$what, ": indexing ", index_files(self), " files"))
+  }
+  if (!index_busy(self)) {
     status_state$busy <- FALSE
-    status(sprintf("index ready (%d files, %.1f s)", index_files(self),
-      proc.time()[[3L]] - status_state$started))
+    if (status_state$announced) status(sprintf("index ready (%d files, %.1f s)", index_files(self), elapsed))
   }
 }
 
@@ -174,7 +191,9 @@ tryCatch({
     f <- orig_pe
     environment(f) <- environment()
     f()
-    tryCatch(if (index_busy(self)) note_busy(self, "workspace") else note_idle(self),
+    # note_idle runs while busy too: it writes a held "indexing" line once
+    # a rescan has run long enough to be worth reporting.
+    tryCatch({ if (index_busy(self)) note_busy(self, "workspace"); note_idle(self) },
              error = function(e) NULL)
   }, overwrite = TRUE)
 }, error = function(e) message("r-lsp: status patch disabled: ", conditionMessage(e)))

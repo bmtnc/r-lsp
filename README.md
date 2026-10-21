@@ -126,7 +126,7 @@ Beyond the server itself, the plugin uses the other channels Claude Code gives a
 
 - **A skill** (`skills/r-lsp/SKILL.md`) tells Claude when to use the LSP tool, what each answer covers, and how to check data-frame column names.
 - **Hooks** add what the server cannot say: a `SessionStart` hook prints the project's shape and warms the index cache; after each LSP result a hook appends the mentions `grep` finds in files the server does not index and says whether the index is still building; after each `.R` edit a hook runs the column-name check.
-- **A monitor** streams the server's "indexing" / "index ready" events to Claude.
+- **A monitor** tells Claude when the index is ready and when a second repository joins the workspace; the other status events stay in the log for `r-lsp-status`.
 - **Shell tools** on Claude's `PATH`: `r-colcheck`, `r-callmap` and `r-lsp-status`.
 
 ## Index, completeness and other repositories
@@ -134,7 +134,7 @@ Beyond the server itself, the plugin uses the other channels Claude Code gives a
 The server indexes in the background after it starts (on the first LSP call or `.R` edit). Three things make that visible and safe:
 
 - **Complete answers.** References, definitions, workspace symbols and call hierarchy wait for the index and the parse queue before answering (up to 30 s, `R_LSP_INDEX_WAIT`). Without this, a references call right after opening a file returned 0 results on dplyr, which Claude reads as "nothing calls this".
-- **Status events.** The server writes "server started (pid N)" / "indexing N files" / "index ready (N files, T s)" / "added workspace" to `<plugin data dir>/status.log`. The monitor forwards this project's lines to Claude; `r-lsp-status` prints them on demand, only those of the most recently started server, and says when that server has exited (after `/reload-plugins` the old server's "index ready" is not the new server's state); the post-LSP hook warns when an answer was given while indexing.
+- **Status events.** The server writes "server started (pid N)" / "indexing N files" / "index ready (N files, T s)" / "added workspace" to `<plugin data dir>/status.log`. The monitor forwards this project's "index ready" and "added workspace" lines to Claude (the others change nothing Claude should do next); a rescan of an unchanged workspace, which the server runs whenever a batch of documents opens and finishes from its cache in a tenth of a second, is not logged at all unless it runs for half a second, so a session's log holds a few lines, not a dozen; `r-lsp-status` prints the log on demand, only those of the most recently started server, and says when that server has exited (after `/reload-plugins` the old server's "index ready" is not the new server's state); the post-LSP hook warns when an answer was given while indexing.
 - **Pre-warm.** At session start, a background `Rscript` builds the server's persistent index cache for the project, so the first index is near-instant. (It speeds up the file index, not the parse of package `R/` files, which still takes a few seconds per hundred files.)
 
 **Other repositories.** Claude Code sends the server one root, the session's directory. When Claude opens a file outside every known workspace (another repository, `/add-dir`), the server adds that file's project root (found by `DESCRIPTION`, `.git`, `*.Rproj`, `renv.lock`, `_targets.R`, `.here`) as a workspace, indexes it, and attaches its renv library. Navigation then works there too.

@@ -10,6 +10,12 @@ data_dir="$1"
 file="$data_dir/status.log"
 mkdir -p "$data_dir" 2>/dev/null
 touch "$file" 2>/dev/null || exit 0
+# Only the events that change what Claude should do next are forwarded:
+# the index becoming ready (a lookup can be trusted or retried now), a second
+# repository joining the workspace, and a too-old languageserver. The rest
+# ("server started", "loaded N files", "indexing") stays in the log for
+# r-lsp-status and the post-LSP note.
 tail -n 0 -F "$file" 2>/dev/null \
   | grep --line-buffered -F "[$PWD]" \
+  | grep --line-buffered -E "index ready|added workspace|older than" \
   | sed -u -e 's/^[0-9:]* \[[^]]*\] //'
