@@ -723,6 +723,15 @@ selection_names <- function(args) {
       inner <- selection_names(as.list(a)[-1L])
       if (is.null(inner)) return(NULL)
       out <- c(out, inner)
+    } else if (is.call(a) && call_name(a) == "all_of" && length(a) == 2L) {
+      # all_of("a") or all_of(c("a", "b")): the names must exist, so they are
+      # checked; all_of(keys) with a variable, or any_of() (missing names
+      # allowed), stays unresolved
+      inner <- if (is.character(a[[2L]])) a[[2L]] else
+        if (is.call(a[[2L]]) && identical(call_name(a[[2L]]), "c") &&
+            all(vapply(as.list(a[[2L]])[-1L], is.character, TRUE))) unlist(as.list(a[[2L]])[-1L]) else NULL
+      if (is.null(inner)) return(NULL)
+      out <- c(out, inner)
     } else return(NULL)
   }
   out

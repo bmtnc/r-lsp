@@ -31,3 +31,5 @@ bad9 <- sales |> summarise(m = mean(amount), .by = region) |> mutate(k = year)  
 bad10 <- sales |> summarise(m = mean(amount), .by = regoin)                          # bad
 bad11 <- sales %>% mutate(m = mean(amount), .by = c(region, yaer))                   # bad
 bad12 <- sales %>% filter(amount > mean(amount), .by = regin)                        # bad
+bad13 <- sales %>% summarise(m = mean(amount), .by = dplyr::all_of("regoin"))            # bad
+bad14 <- sales %>% select(all_of(c("region", "amuont")))                                 # bad

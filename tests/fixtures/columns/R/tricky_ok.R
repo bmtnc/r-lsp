@@ -29,3 +29,6 @@ k2 <- sales %>% mutate(m = mean(amount), .by = c(region, year)) %>% select(regio
 keys <- c("region")
 k3 <- sales %>% summarise(m = mean(amount), .by = dplyr::all_of(keys)) %>% mutate(z = m)
 k4 <- sales %>% slice_max(amount, n = 1, by = region)
+k5 <- sales %>% summarise(m = mean(amount), .by = all_of(c("region", "year"))) %>% select(region, year, m)
+k6 <- sales %>% select(dplyr::all_of("region")) %>% mutate(r2 = region)
+k7 <- sales %>% summarise(m = mean(amount), .by = dplyr::any_of("regoin"))
