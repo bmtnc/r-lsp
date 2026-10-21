@@ -66,8 +66,7 @@ callmap_target_calls <- "^tar_(target|target_raw|file|files|files_input|file_rea
 # A name as written in NAMESPACE or an argument: symbol, string or pkg::name.
 arg_name <- function(x) {
   if (is.symbol(x) || (is.character(x) && length(x) == 1L)) return(as.character(x))
-  if (is.call(x) && length(x) == 3L && as.character(x[[1L]]) %in% c("::", ":::")) return(as.character(x[[3L]]))
-  NA_character_
+  ns_name(x)
 }
 
 namespace_info <- function(root) {

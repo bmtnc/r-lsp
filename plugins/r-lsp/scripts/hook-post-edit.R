@@ -9,7 +9,11 @@ file <- input$tool_input$file_path
 if (is.null(file) || !is.character(file) || !grepl("[.][Rr]$", file) || !file.exists(file)) quit(save = "no", status = 0)
 root <- Sys.getenv("CLAUDE_PROJECT_DIR", input$cwd %||% getwd())
 source(file.path(script_dir, "colcheck-lib.R"), local = TRUE)
-findings <- tryCatch(colcheck_files(file, root), error = function(e) list())
+# A failure of the checker itself is reported, never swallowed: silence must
+# mean "checked and clean".
+findings <- tryCatch(colcheck_files(file, root), error = function(e) list(list(
+  kind = "error", file = file, line = 1L, name = NA_character_, source = NA_character_, columns = character(),
+  message = sprintf("r-colcheck could not run on this file (%s). This is a checker bug worth reporting.", conditionMessage(e)))))
 
 # --- the plugin's bug linters, when the server cannot run them ---------------
 # A project or home .lintr replaces the profile in the language server (lintr
@@ -47,6 +51,7 @@ kinds <- vapply(findings, function(x) x$kind %||% "column", "")
 columns <- findings[kinds == "column"]
 arguments <- findings[kinds == "argument"]
 notes <- findings[kinds == "note"]
+errors <- findings[kinds == "error"]
 from_cache <- any(vapply(columns, function(x) startsWith(x$source %||% "", "cached schema"), TRUE))
 
 clip <- function(lines, n = 15) {
@@ -74,6 +79,11 @@ if (length(notes)) {
     "Data sources the checker cannot open (nothing downstream of these is checked):",
     clip(colcheck_format(notes, root), 5),
     "The r-lsp skill explains `r-colcheck learn`: run it once per dataset, with --source for the file that defines the loader.")
+}
+if (length(errors)) {
+  parts <- c(parts,
+    "Statements the checker gave up on (a bug in r-colcheck, not in the code; nothing downstream of them is checked):",
+    clip(colcheck_format(errors, root), 5))
 }
 if (length(lint_lines) || !is.null(lint_failure)) {
   parts <- c(parts,

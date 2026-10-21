@@ -51,7 +51,7 @@ After editing a pipeline, `r-colcheck path/to/file.R` checks every bare column n
 
 ### Data the checker cannot open: the schema cache
 
-Data read from S3, a database or a project loader (`returns <- s3_read("returns/monthly")`) has no local file to open. For those, the checker uses `.colcheck/schemas.json`, a cache of observed column names keyed by the string the code passes to its loader (the S3 key, URI or dataset name). It matches any string literal in the loader call, or a `# cols: KEY` comment on the assignment line when the call carries no key.
+Data read from S3, a database or a project loader (`returns <- s3_read("returns/monthly")`) has no local file to open. For those, the checker uses `.colcheck/schemas.json`, a cache of observed column names keyed by the string the code passes to its loader (the S3 key, URI or dataset name). It matches any string literal in the loader call, or a `# cols: KEY` comment on the assignment line when the call carries no key. A cache hit is taken before the function's code is read (a loader whose columns depend on an argument can never be read from its body), also for a loader call inside a package function the checker is following; `# cols:` names the expression the line assigns, not a sub-expression.
 
 When a frame comes from a source that is not cached and the code then pipes it into verbs, the post-edit note says so and nothing downstream of it is checked:
 
@@ -65,8 +65,10 @@ Act on it when you are about to write or change code against that frame:
 r-colcheck learn "holdings/latest" 's3_read("holdings/latest")' --source R/loaders.R
 ```
 
-`learn` runs the expression once in the project (renv active, the shell's AWS credentials, no `--vanilla`) and records the names and types; arrow datasets give their schema without downloading rows, anything else is materialized once. `--source FILE.R` loads the file that defines the loader; pass files of function definitions only, never a script that runs a pipeline or writes data. Run it from anywhere in the project. `r-colcheck schemas` lists what is cached and how old each entry is; `r-colcheck forget KEY` drops one.
+`learn` runs the expression once in the project (renv active, the shell's AWS credentials, no `--vanilla`) and records the names and types; arrow datasets give their schema without downloading rows, anything else is materialized once. The code is matched on the key, not on the expression, so when the project's loader materializes a whole table, learn from a cheaper expression that reads the same source (`r-colcheck learn "orders" 'arrow::open_dataset("s3://bucket/orders/")'`); the entry still matches every `fetch_table(date, "orders")` in the code. `--source FILE.R` loads the file that defines the loader; pass files of function definitions only, never a script that runs a pipeline or writes data. Run it from anywhere in the project. `r-colcheck schemas` lists what is cached and how old each entry is; `r-colcheck forget KEY` drops one.
 
 Refresh an entry only on evidence: the check reports a column you are sure exists (the cache is stale, re-run `learn` for that key; when the entry is more than 90 days old the note says so next to the findings), or the user says the data changed. Never run `learn` from a hook or in a loop; it reaches the network.
+
+A line saying `r-colcheck hit an error ... and gave up on this statement` is a bug in the checker, not in the code: nothing downstream of that statement was checked, so fall back to reading the data source for that frame, and tell the user, with the statement, so it can be reported.
 
 The cache is local by default: `.colcheck/` is created with its own `.gitignore`. Deleting `.colcheck/.gitignore` commits it so teammates share the entries.

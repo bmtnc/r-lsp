@@ -38,6 +38,37 @@ quiet <- function(expr, default = NULL) {
   tryCatch(suppressWarnings(suppressMessages(expr)), error = function(e) default)
 }
 
+# Run one unit of checking (a top-level statement, a followed function) and,
+# if the checker itself fails, record that against the statement instead of
+# dropping it silently: a lost statement must not look like a clean one.
+# R_LSP_COLCHECK_DEBUG=1 prints the call stack of each failure to stderr.
+guarded <- function(ctx, where, expr) {
+  debug <- nzchar(Sys.getenv("R_LSP_COLCHECK_DEBUG"))
+  at <- list(file = ctx$file, line = ctx$line)
+  tryCatch(
+    withCallingHandlers(suppressWarnings(suppressMessages(expr)), error = function(err) {
+      if (debug) {
+        cat(file = stderr(), sprintf("r-colcheck: %s:%s: %s%s\n", at$file, at$line, conditionMessage(err),
+                                     if (is.null(where)) "" else sprintf(" (following %s)", where)))
+        calls <- sys.calls()
+        cat(file = stderr(), paste0("  ", vapply(calls, function(cl) paste(deparse(cl)[[1L]], collapse = ""), "")[seq_len(min(30L, length(calls)))], collapse = "\n"), "\n")
+      }
+    }),
+    error = function(err) {
+      ctx$errors[[length(ctx$errors) + 1L]] <- list(file = at$file, line = at$line, where = where,
+                                                    message = conditionMessage(err))
+      NULL
+    })
+}
+
+error_findings <- function(ctx) {
+  lapply(ctx$errors, function(er) list(
+    kind = "error", file = er$file, line = er$line, name = NA_character_, source = NA_character_,
+    columns = character(),
+    message = sprintf("r-colcheck hit an error %sand gave up on this statement (%s); nothing downstream of it is checked. This is a checker bug worth reporting; R_LSP_COLCHECK_DEBUG=1 shows where it happened.",
+                      if (is.null(er$where)) "" else sprintf("while following %s() ", er$where), er$message)))
+}
+
 colcheck_root <- function(path) {
   dir <- normalizePath(dirname(path), mustWork = FALSE)
   markers <- c("DESCRIPTION", ".git", "renv.lock", "_targets.R", ".here")
@@ -98,8 +129,11 @@ cached_columns <- function(e, ctx) {
       if (!is.null(cols)) return(cols)
     }
   }
+  # `# cols: KEY` names the columns of the expression the line assigns (its
+  # pipeline head), never of a sub-expression met on the way, such as the
+  # loader's first argument
   key <- ctx$annotation
-  if (!is.null(key)) {
+  if (!is.null(key) && (is.null(ctx$annotation_head) || identical(e, ctx$annotation_head))) {
     ctx$annotation <- NULL
     return(schema_columns(key, ctx))
   }
@@ -323,7 +357,7 @@ package_function <- function(pkg, fn, ctx, exported_only = TRUE) {
 lookup_function <- function(e, fn, ctx) {
   if (is.na(fn)) return(NULL)
   head <- if (is.call(e)) e[[1L]] else NULL
-  if (is.call(head) && as.character(head[[1L]]) %in% c("::", ":::") && length(head) == 3L) {
+  if (!is.na(ns_name(head)) && is.symbol(head[[2L]])) {
     return(package_function(as.character(head[[2L]]), fn, ctx, exported_only = identical(as.character(head[[1L]]), "::")))
   }
   if (!is.null(ctx$pkg_scope)) return(package_function(ctx$pkg_scope, fn, ctx, exported_only = FALSE))
@@ -342,6 +376,29 @@ negative_expectations <- c("expect_error", "expect_warning", "expect_condition",
 call_user_function <- function(e, name, ctx, def = lookup_function(e, name, ctx)) {
   if (is.null(def) || def$file %in% ctx$call_stack || length(ctx$call_stack) >= 4L) return(NULL)
   if (isTRUE(ctx$in_negative_test)) return(NULL)
+  saved <- list(frames = ctx$frames, variables = ctx$variables, unknown = ctx$unknown_frames,
+                line = ctx$line, line_end = ctx$line_end, file = ctx$file, call_stack = ctx$call_stack,
+                call_sites = ctx$call_sites, in_function = ctx$in_function, pkg_scope = ctx$pkg_scope)
+  result <- guarded(ctx, def$file, follow_function(e, def, ctx))
+  ctx$frames <- saved$frames
+  ctx$variables <- saved$variables
+  ctx$unknown_frames <- saved$unknown
+  ctx$line <- saved$line
+  ctx$line_end <- saved$line_end
+  ctx$file <- saved$file
+  ctx$call_stack <- saved$call_stack
+  ctx$call_sites <- saved$call_sites
+  ctx$in_function <- saved$in_function
+  ctx$pkg_scope <- saved$pkg_scope
+  # Columns that came out of a package function: say so, since the function
+  # may have dropped or renamed what the cached source had.
+  if (!is.null(result) && !is.null(def$pkg) && is.null(saved$pkg_scope)) {
+    attr(result, "source") <- sprintf("%s() (read from its code)", def$file)
+  }
+  result
+}
+
+follow_function <- function(e, def, ctx) {
   fdef <- def$fn
   proto <- quiet(eval(call("function", fdef[[2L]], NULL)))
   if (!is.function(proto)) return(NULL)
@@ -358,8 +415,6 @@ call_user_function <- function(e, name, ctx, def = lookup_function(e, name, ctx)
     if (!(is.symbol(a) || is.call(a))) next
     arg_cols[[p]] <- frame_columns(a, ctx, used = param_used_as_frame(fdef[[3L]], p))
   }
-  saved <- list(frames = ctx$frames, variables = ctx$variables, unknown = ctx$unknown_frames,
-                line = ctx$line, line_end = ctx$line_end, file = ctx$file)
   # `if ("x" %in% names(df))`: the body handles frames with and without x,
   # so x counts as present for the parameter rather than reported
   guarded <- guarded_columns(fdef[[3L]])
@@ -373,27 +428,9 @@ call_user_function <- function(e, name, ctx, def = lookup_function(e, name, ctx)
   ctx$call_sites <- c(ctx$call_sites, sprintf("%s:%s", relative_path(ctx$file, ctx$root), ctx$line))
   ctx$file <- def$file
   ctx$call_stack <- c(ctx$call_stack, def$file)
-  saved_in <- ctx$in_function
-  saved_scope <- ctx$pkg_scope
   ctx$in_function <- TRUE
   ctx$pkg_scope <- def$pkg
-  result <- tryCatch(body_columns(fdef[[3L]], ctx), error = function(err) NULL)
-  ctx$pkg_scope <- saved_scope
-  ctx$in_function <- saved_in
-  # Columns that came out of a package function: say so, since the function
-  # may have dropped or renamed what the cached source had.
-  if (!is.null(result) && !is.null(def$pkg) && is.null(saved_scope)) {
-    attr(result, "source") <- sprintf("%s() (read from its code)", def$file)
-  }
-  ctx$call_stack <- ctx$call_stack[-length(ctx$call_stack)]
-  ctx$call_sites <- ctx$call_sites[-length(ctx$call_sites)]
-  ctx$frames <- saved$frames
-  ctx$variables <- saved$variables
-  ctx$unknown_frames <- saved$unknown
-  ctx$line <- saved$line
-  ctx$line_end <- saved$line_end
-  ctx$file <- saved$file
-  result
+  body_columns(fdef[[3L]], ctx)
 }
 
 # Column names a body tests for before using: string literals inside `if`
@@ -494,12 +531,19 @@ readers <- c("read_csv", "read_csv2", "read_tsv", "read_delim", "read.csv", "rea
 
 # --- expression helpers -----------------------------------------------------
 
+# `pkg::name` or `pkg:::name` as a call head: the bare name, else NA. The head
+# of `pkg::factory(x)()` is a call whose own head is another call, never a
+# symbol, so every helper that reads a head goes through here.
+ns_name <- function(h) {
+  if (is.call(h) && length(h) == 3L && is.symbol(h[[1L]]) && as.character(h[[1L]]) %in% c("::", ":::") &&
+      (is.symbol(h[[3L]]) || is.character(h[[3L]]))) as.character(h[[3L]]) else NA_character_
+}
+
 call_name <- function(e) {
   if (!is.call(e)) return(NA_character_)
   h <- e[[1L]]
   if (is.symbol(h)) return(as.character(h))
-  if (is.call(h) && as.character(h[[1L]]) %in% c("::", ":::")) return(as.character(h[[3L]]))
-  NA_character_
+  ns_name(h)
 }
 
 string_arg <- function(e) if (is.character(e) && length(e) == 1L) e else NULL
@@ -600,25 +644,38 @@ frame_columns <- function(e, ctx, used = FALSE) {
     attr(cols, "source") <- "tribble() literal"
     return(cols)
   }
-  # a project function: bind its parameters, check its body, take its result;
-  # when the body does not resolve (a loader), the cache below still can
-  fn_def <- lookup_function(e, fn, ctx)
-  if (!is.null(fn_def)) {
-    via_function <- call_user_function(e, fn, ctx, def = fn_def)
-    if (!is.null(via_function)) return(via_function)
-  }
-  # native pipe is parsed into nested calls: verb(frame_expr, ...)
-  if (length(e) >= 2L) {
-    inner <- frame_columns(e[[2L]], ctx, used = used || fn %in% verb_names)
+  # native pipe is parsed into nested calls: verb(frame_expr, ...); a ggplot
+  # chain is `+` calls nested the same way
+  if (fn %in% verb_names || fn == "+") {
+    if (length(e) < 2L) return(NULL)
+    inner <- frame_columns(e[[2L]], ctx, used = TRUE)
     if (!is.null(inner)) return(apply_verb(e, inner, ctx, piped = FALSE))
     count_step(ctx, "skipped", fn)
+    return(NULL)
   }
-  # anything else is a loader the checker cannot open: try the schema cache
-  if (!(fn %in% verb_names) && !(fn %in% c("function", "{", "(", "if", "for", "while", "repeat", "$", "@", "[", "[["))) {
-    return(cached_columns(e, ctx))
+  if (fn %in% c("{", "(")) return(if (length(e) >= 2L) frame_columns(e[[length(e)]], ctx, used = used) else NULL)
+  if (fn %in% c("function", "if", "for", "while", "repeat", "$", "@", "[", "[[")) return(NULL)
+  # any other call: a cache entry matching one of its literals, or the line's
+  # `# cols:`, is the user's own statement of what comes out and beats reading
+  # the function (a loader's columns depend on its arguments, not its code)
+  cached <- cached_columns(e, ctx)
+  if (!is.null(cached)) return(cached)
+  # a project or package function: bind its parameters, check its body, take its result
+  fn_def <- lookup_function(e, fn, ctx)
+  if (!is.null(fn_def)) return(call_user_function(e, fn, ctx, def = fn_def))
+  # any other call around a frame expression, `tryCatch({ pipeline }, ...)`,
+  # `suppressWarnings(pipeline)`: the pipeline inside is checked, and a wrapper
+  # that returns its argument passes the columns through
+  if (length(e) >= 2L) {
+    inner <- frame_columns(e[[2L]], ctx, used = used)
+    if (!is.null(inner) && fn %in% passthrough_calls) return(inner)
   }
   NULL
 }
+
+# Calls whose value is their first argument, as far as columns go.
+passthrough_calls <- c("tryCatch", "try", "withCallingHandlers", "suppressWarnings", "suppressMessages",
+                       "invisible", "identity", "local", "force", "structure")
 
 # Calls whose arguments are selections or quoted code, never bare columns to check.
 quoting_calls <- c("across", "if_any", "if_all", "pick", "c_across", "where", "all_of", "any_of",
@@ -960,11 +1017,17 @@ walk_expr <- function(e, ctx) {
     }
     key <- line_annotation(ctx)
     ctx$annotation <- key
+    ctx$annotation_head <- pipeline_head(e[[3L]])
     cols <- frame_columns(e[[3L]], ctx)
     # an annotation no source consumed (the right-hand side is a symbol or a
     # user function) still names the columns of the result
     if (is.null(cols) && !is.null(ctx$annotation)) cols <- schema_columns(ctx$annotation, ctx)
     ctx$annotation <- NULL
+    ctx$annotation_head <- NULL
+    # nested expressions first, while the target still means what it meant
+    # before this line: in `x <- x %>% a() %>% b()` every step reads the old x
+    check_ggplot(e[[3L]], ctx)
+    if (is.call(e[[3L]]) && !identical(call_name(e[[3L]]), "function")) walk_expr(e[[3L]], ctx)
     if (!is.null(cols)) {
       ctx$frames[[target]] <- cols
       ctx$unresolved[[target]] <- NULL
@@ -974,8 +1037,6 @@ walk_expr <- function(e, ctx) {
       note_unresolved(target, e[[3L]], key, ctx)
     }
     ctx$variables <- union(ctx$variables, target)
-    check_ggplot(e[[3L]], ctx)
-    if (is.call(e[[3L]]) && !identical(call_name(e[[3L]]), "function")) walk_expr(e[[3L]], ctx)
     return(invisible())
   }
   if (!is.na(fn) && fn %in% c("library", "require")) {
@@ -1058,9 +1119,9 @@ colcheck_file <- function(file, root = NULL) {
   for (i in seq_along(exprs)) {
     ctx$line <- if (!is.null(src)) as.integer(src[[i]][[1L]]) else NA_integer_
     ctx$line_end <- if (!is.null(src)) as.integer(src[[i]][[3L]]) else NA_integer_
-    quiet(walk_expr(exprs[[i]], ctx))
+    guarded(ctx, NULL, walk_expr(exprs[[i]], ctx))
   }
-  structure(c(ctx$findings, source_notes(ctx)),
+  structure(c(ctx$findings, source_notes(ctx), error_findings(ctx)),
             stats = list(checked = length(ctx$stats$checked), skipped = length(ctx$stats$skipped)))
 }
 
@@ -1104,15 +1165,19 @@ source_notes <- function(ctx) {
 # against known columns, steps skipped (columns unknowable), files read.
 colcheck_files <- function(files, root = NULL) {
   all <- list()
-  stats <- list(checked = 0L, skipped = 0L, files = 0L)
+  stats <- list(checked = 0L, skipped = 0L, files = 0L, errors = 0L)
   for (f in files) {
     if (!file.exists(f) || grepl("[.](Rmd|rmd|qmd)$", f)) next
-    res <- colcheck_file(f, root)
+    res <- tryCatch(colcheck_file(f, root), error = function(err) list(list(
+      kind = "error", file = f, line = 1L, name = NA_character_, source = NA_character_, columns = character(),
+      message = sprintf("r-colcheck could not check this file at all (%s). This is a checker bug worth reporting.",
+                        conditionMessage(err)))))
     st <- attr(res, "stats")
     all <- c(all, res)
     stats$files <- stats$files + 1L
     stats$checked <- stats$checked + (st$checked %||% 0L)
     stats$skipped <- stats$skipped + (st$skipped %||% 0L)
+    stats$errors <- stats$errors + sum(vapply(res, function(x) identical(x$kind, "error"), TRUE))
   }
   # The walker can visit a pipeline twice (assignment and its right-hand side).
   keys <- vapply(all, function(x) paste(x$file, x$line, x$name, x$source), "")

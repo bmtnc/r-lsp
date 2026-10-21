@@ -1,3 +1,4 @@
 export(fetch_table)
 export(clean_orders)
+export(load_clean)
 export(opaque)

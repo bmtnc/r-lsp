@@ -30,6 +30,7 @@ if (as_json) {
   for (line in colcheck_format(findings, root)) cat(line, "\n", sep = "")
 }
 # So that silence means "checked and clean", not "nothing was checkable".
-message(sprintf("r-colcheck: %d pipeline step(s) checked against known columns in %d file(s); %d step(s) skipped (columns unknowable); %d finding(s), %d note(s).",
-                st$checked, st$files, st$skipped, sum(kinds != "note"), sum(kinds == "note")))
-quit(save = "no", status = if (any(kinds != "note")) 1L else 0L)
+message(sprintf("r-colcheck: %d pipeline step(s) checked against known columns in %d file(s); %d step(s) skipped (columns unknowable); %d finding(s), %d note(s)%s.",
+                st$checked, st$files, st$skipped, sum(!(kinds %in% c("note", "error"))), sum(kinds == "note"),
+                if (st$errors > 0L) sprintf("; %d statement(s) dropped by a checker error (listed above; R_LSP_COLCHECK_DEBUG=1 shows where)", st$errors) else ""))
+quit(save = "no", status = if (any(!(kinds %in% c("note", "error")))) 1L else 0L)

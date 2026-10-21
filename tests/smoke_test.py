@@ -398,6 +398,39 @@ def scenario_colcheck(s):
     bad = {i for i, line in enumerate(src, 1) if line.rstrip().endswith("# bad")}
     check(bad <= reported, f"r-colcheck missed lines {sorted(bad - reported)}:\n{out}")
     check(reported <= bad, f"r-colcheck flagged correct lines {sorted(reported - bad)}:\n{out}")
+    # Call shapes a parser walker gets wrong if it assumes a call's head is a
+    # symbol or `pkg::name`: both tools must survive every one of them.
+    shapes = os.path.join(root, "R", "shapes.R")
+    with open(shapes, "w") as f:
+        f.write("library(magrittr)\n"
+                "shapes_fn <- function(x) x\n"
+                "a <- purrr::insistently(shapes_fn)(1)\n"
+                "b <- (function(x) x)(2)\n"
+                "c2 <- shapes_fn(shapes_fn)(3)\n"
+                "d <- list(f = shapes_fn)$f(4)\n"
+                "e <- list(shapes_fn)[[1]](5)\n"
+                "g <- base::identity(shapes_fn)(base::identity(shapes_fn)(6))\n"
+                "h <- `::`(base, identity)(7)\n"
+                "df <- tibble::tibble(a = 1)\n"
+                "df %>% dplyr::select(zz) # bad\n")
+    out = subprocess.run([tool, "--root", root, shapes], capture_output=True, text=True, timeout=120)
+    check(out.returncode == 1 and "R/shapes.R:11: 'zz'" in out.stdout and "error" not in out.stdout
+          and "checker error" not in out.stderr, f"odd call shapes broke r-colcheck:\n{out.stdout}{out.stderr}")
+    cm = subprocess.run([os.path.join(REPO, "plugins", "r-lsp", "bin", "r-callmap"), "--root", root],
+                        capture_output=True, text=True, timeout=120)
+    check(cm.returncode == 0 and "shapes_fn" in cm.stdout, f"odd call shapes broke r-callmap:\n{cm.stdout}{cm.stderr}")
+    # A frame reassigned from itself: every step reads the old frame, not the result.
+    again = os.path.join(root, "R", "again.R")
+    with open(again, "w") as f:
+        f.write("library(magrittr)\n"
+                "x <- tibble::tibble(a = 1, b = 2)\n"
+                "x <- x %>% dplyr::filter(a > 0) %>% dplyr::select(b)\n"
+                "x <- dplyr::select(dplyr::filter(x, b > 0), b)\n"
+                "x %>% dplyr::select(a) # bad\n"
+                "n <- nrow(x %>% dplyr::filter(zz > 1)) # bad\n")
+    out = subprocess.run([tool, "--root", root, again], capture_output=True, text=True, timeout=120)
+    got = {int(l.split(":")[1]) for l in out.stdout.splitlines() if l.startswith("R/again.R:")}
+    check(got == {5, 6}, f"reassignment from itself mis-checked (lines {sorted(got)}):\n{out.stdout}")
     tricky = subprocess.run([tool, "--root", root, os.path.join(root, "R", "tricky_ok.R")],
                             capture_output=True, text=True, timeout=120).stdout
     check(not tricky.strip(), f"r-colcheck flagged correct tricky code:\n{tricky}")
@@ -536,7 +569,16 @@ def scenario_colcheck_packages(s):
         "b <- teamdata::opaque(raw)\n"
         "unknown <- b %>% dplyr::mutate(q = nothing)\n"
         "r <- teamdata::fetch_table(Sys.Date(), \"returns\")\n"
-        "r2 <- r %>% dplyr::mutate(x = y)\n")
+        "r2 <- r %>% dplyr::mutate(x = y)\n"
+        # `# cols:` names the assigned expression, not the loader's first argument
+        "tagged <- teamdata::fetch_table(Sys.Date(), \"nightly\") # cols: customers\n"
+        "bad4 <- tagged %>% dplyr::select(regionn)\n"
+        # a loader inside a followed function hits the cache by its own literal
+        "inner <- teamdata::load_clean(Sys.Date())\n"
+        "bad5 <- inner %>% dplyr::select(id, amount, status)\n"
+        # reassignment: every step reads the old frame
+        "orders <- orders %>% dplyr::filter(total > 0) %>% dplyr::select(id)\n"
+        "ok2 <- orders %>% dplyr::select(id)\n")
     root = s.make_renv_project("colcheck_pkgs", {}, extra_packages=("teamdata",))
     for rel, text in (("script/run.R", script), (".colcheck/schemas.json", schemas)):
         os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
@@ -547,9 +589,13 @@ def scenario_colcheck_packages(s):
     check(out.returncode == 1, f"r-colcheck exited {out.returncode} (expected 1, findings):\n{out.stderr}")
     findings = json.loads(out.stdout)
     cols = {(f["line"], f["name"]) for f in findings if f["kind"] == "column"}
-    check(cols == {(6, "amount"), (7, "idd"), (9, "extra")}, f"column findings unexpected: {sorted(cols)}\n{out.stdout}")
-    src = {f["source"] for f in findings if f["kind"] == "column"}
-    check(src == {"teamdata::clean_orders() (read from its code)"}, f"finding source unexpected: {src}")
+    check(cols == {(6, "amount"), (7, "idd"), (9, "extra"), (15, "regionn"), (17, "status")},
+          f"column findings unexpected: {sorted(cols)}\n{out.stdout}")
+    src = {f["line"]: f["source"] for f in findings if f["kind"] == "column"}
+    check(src[6] == src[9] == "teamdata::clean_orders() (read from its code)", f"finding source unexpected: {src}")
+    check(src[15].startswith("cached schema \"customers\""), f"annotated loader source unexpected: {src[15]}")
+    check(src[17] == "teamdata::load_clean() (read from its code)", f"inner-loader source unexpected: {src[17]}")
+    check(not [f for f in findings if f["kind"] == "error"], f"checker errors:\n{out.stdout}")
     notes = {f["line"]: f["message"] for f in findings if f["kind"] == "note"}
     check(sorted(notes) == [10, 12], f"notes unexpected:\n{notes}")
     check("teamdata::opaque()" in notes[10] and "could not be read from its code" in notes[10],
@@ -557,13 +603,15 @@ def scenario_colcheck_packages(s):
     # A self-contained package loader with a literal key keeps the learn suggestion.
     check("r-colcheck learn \"returns\" 'teamdata::fetch_table(Sys.Date(), \"returns\")'" in notes[12],
           f"uncached loader note lost its learn command:\n{notes[12]}")
-    check("4 pipeline step(s) checked" in out.stderr and "2 step(s) skipped" in out.stderr,
-          f"summary unexpected:\n{out.stderr}")
+    check("9 pipeline step(s) checked" in out.stderr and "2 step(s) skipped" in out.stderr
+          and "checker error" not in out.stderr, f"summary unexpected:\n{out.stderr}")
     # Switched off, the package function is opaque and nothing after it is checked.
     off = subprocess.run([tool, "--json", "script/run.R"], cwd=root, capture_output=True, text=True, timeout=300,
                          env=dict(os.environ, R_LSP_COLCHECK_PACKAGES="false"))
-    check(off.returncode == 0 and "0 pipeline step(s) checked" in off.stderr,
+    check(off.returncode == 1 and "1 pipeline step(s) checked" in off.stderr,
           f"R_LSP_COLCHECK_PACKAGES=false still followed the package function:\n{off.stderr}")
+    off_cols = {(f["line"], f["name"]) for f in json.loads(off.stdout) if f["kind"] == "column"}
+    check(off_cols == {(15, "regionn")}, f"with packages off, only the cache should answer: {sorted(off_cols)}")
 
 def scenario_lint_fallback(s):
     """A project .lintr replaces the plugin's profile in the server (lintr
