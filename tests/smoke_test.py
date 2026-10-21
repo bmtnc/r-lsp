@@ -513,6 +513,109 @@ def scenario_colcheck_cache(s):
     check(probe_cols == ["renv_on"], f"learn ran without renv active: columns {probe_cols}")
 
 
+def scenario_callmap(s):
+    """r-callmap: the static call map of a package, its neighbourhood view and
+    JSON, with no server. The chain avoids one-letter names: a project function
+    called `c` would rightly attract every c() call in the fixture."""
+    root = os.path.join(s.scratch, "callmap")
+    files = {
+        "DESCRIPTION": "Package: callmapfix\nTitle: Fixture\nVersion: 0.0.1\nDescription: r-callmap fixture.\nLicense: MIT\n",
+        "NAMESPACE": "export(outer_step)\nexport(run_all)\nS3method(print, myclass)\n",
+        "R/chain.R": ("outer_step <- function(x, n = 1) {\n  y <- middle_step(x)\n  y + n\n}\n\n"
+                      "middle_step <- function(x) {\n  inner_step(x) * 2\n}\n\n"
+                      "inner_step <- function(x) {\n  x + 1\n}\n"),
+        "R/apply.R": ("run_all <- function(xs, how = \"fast\") {\n  out <- lapply(xs, helper)\n"
+                      "  do.call(\"by_string\", list(out))\n}\n\nhelper <- function(x) x * 3\n\n"
+                      "by_string <- function(parts) {\n  Reduce(`+`, parts)\n}\n\n"
+                      "wrap <- function(x, inner_step) {\n  lapply(x, inner_step)\n}\n"),
+        "R/print.R": ("describe <- function(obj, ...) {\n  UseMethod(\"describe\")\n}\n\n"
+                      "describe.myclass <- function(obj, ...) {\n  helper(obj$value)\n}\n\n"
+                      "print.myclass <- function(x, ...) {\n  cat(\"myclass\", describe(x), \"\\n\")\n  invisible(x)\n}\n\n"
+                      "orphan <- function() {\n  \"nobody calls me\"\n}\n"),
+        "tests/testthat/test-a.R": "test_that(\"outer_step works\", {\n  expect_equal(outer_step(1), 5)\n})\n",
+        "scripts/run.R": "source(\"R/apply.R\")\nres <- run_all(list(1, 2))\nprint(res)\n",
+        "vignettes/intro.Rmd": "---\ntitle: x\n---\n\n```{r}\nouter_step(1)\n```\n",
+    }
+    for rel, text in files.items():
+        dest = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w") as f:
+            f.write(text)
+    tool = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-callmap")
+
+    def run(*args, cwd=None):
+        out = subprocess.run([tool, *args], cwd=cwd or root, capture_output=True, text=True, timeout=120)
+        check(out.returncode == 0, f"r-callmap {' '.join(args)} exited {out.returncode}:\n{out.stderr}")
+        return out.stdout
+
+    # From a subdirectory with no --root: the wrapper finds the package root.
+    full = run(cwd=os.path.join(root, "R"))
+    lines = full.splitlines()
+    check("static call map of" in lines[0] and "1 Rmd/qmd not parsed" in lines[0] and "11 functions in 5 files" in lines[0],
+          f"header unexpected:\n{full[:600]}")
+
+    def def_line(rel, sig):
+        loc = f"{rel}:{line_of(os.path.join(root, rel), sig.split('(')[0] + ' <- function')}"
+        hit = [l for l in lines if l.strip().startswith(loc + " ") and sig in l]
+        check(len(hit) == 1, f"no definition line '{loc} {sig}':\n{full}")
+        return hit[0]
+
+    outer = def_line("R/chain.R", "outer_step(x, n)")
+    middle = def_line("R/chain.R", "middle_step(x)")
+    inner = def_line("R/chain.R", "inner_step(x)")
+    run_all = def_line("R/apply.R", "run_all(xs, how)")
+    helper = def_line("R/apply.R", "helper(x)")
+    by_string = def_line("R/apply.R", "by_string(parts)")
+    wrap = def_line("R/apply.R", "wrap(x, inner_step)")
+    method = def_line("R/print.R", "print.myclass(x, ...)")
+    check("calls: middle_step" in outer and "[exported]" in outer and "called by: tests/testthat/test-a.R" in outer,
+          f"outer_step line unexpected:\n{outer}")
+    check("calls: inner_step" in middle and "called by: outer_step" in middle and "[exported]" not in middle,
+          f"middle_step line unexpected:\n{middle}")
+    check("called by: middle_step" in inner and "wrap" not in inner, f"inner_step line unexpected (a parameter is not the function):\n{inner}")
+    check("helper (as value)" in run_all and "by_string (by string)" in run_all and "[exported]" in run_all
+          and "called by: scripts/run.R" in run_all, f"run_all line unexpected:\n{run_all}")
+    check("run_all (as value)" in helper and "describe.myclass" in helper, f"helper line unexpected:\n{helper}")
+    check("called by: run_all (by string)" in by_string, f"by_string line unexpected:\n{by_string}")
+    check("calls:" not in wrap and "called by:" not in wrap, f"wrap line unexpected:\n{wrap}")
+    check("[S3 method of print]" in method and "calls: describe" in method, f"S3 method line unexpected:\n{method}")
+    check("[S3 method of describe]" in def_line("R/print.R", "describe.myclass(obj, ...)"), "describe.myclass not tagged as an S3 method")
+    check(any(l.startswith("scripts/run.R") and "sources: R/apply.R" in l and "run_all" in l for l in lines),
+          f"script heading unexpected:\n{full}")
+    entry = full.split("Entry points (not called by any project function):")[1].split("Unreferenced")[0]
+    unref = full.split("Unreferenced (no callers anywhere):")[1].split("\n\n")[0]
+    check("outer_step [exported]" in entry and "run_all [exported]" in entry and "middle_step" not in entry,
+          f"entry points unexpected:\n{entry}")
+    check("orphan" in unref and "wrap" in unref and "print.myclass" not in unref and "outer_step" not in unref,
+          f"unreferenced unexpected:\n{unref}")
+    check("Recursion/cycles" not in full, f"cycles reported for an acyclic fixture:\n{full}")
+
+    # Neighbourhood: callers two levels up, with call sites, and nothing unrelated.
+    near = run("inner_step")
+    check("static" in near.splitlines()[0], f"neighbourhood header unexpected:\n{near}")
+    body = near.split("inner_step(x)", 1)[1]
+    chain = os.path.join(root, "R", "chain.R")
+    mid_def, mid_call = line_of(chain, "middle_step <- function"), line_of(chain, "inner_step(x) * 2")
+    top_def, top_call = line_of(chain, "outer_step <- function"), line_of(chain, "y <- middle_step(x)")
+    check(f"    middle_step   R/chain.R:{mid_def}   (call at R/chain.R:{mid_call})" in body and
+          f"      outer_step   R/chain.R:{top_def}   (call at R/chain.R:{top_call})" in body,
+          f"neighbourhood callers unexpected:\n{near}")
+    for unrelated in ("helper", "run_all", "orphan", "wrap", "describe"):
+        check(unrelated not in body, f"neighbourhood of inner_step mentions {unrelated}:\n{near}")
+    missing = run("innr_step")
+    check("not defined in the project" in missing and "inner_step" in missing, f"unknown name output unexpected:\n{missing}")
+
+    data = json.loads(run("--json"))
+    by_name = {d["name"]: d for d in data}
+    check(len(data) == 11 and by_name["outer_step"]["exported"] is True and by_name["print.myclass"]["kind"] == "s3_method",
+          f"JSON map unexpected:\n{json.dumps(data)[:800]}")
+    check({"name": "helper", "kind": "value", "line": 2} in by_name["run_all"]["calls"] and
+          any(c["by"] == "scripts/run.R" and c["line"] == 2 for c in by_name["run_all"]["called_by"]),
+          f"JSON edges unexpected:\n{json.dumps(by_name['run_all'])}")
+    sub = json.loads(run("--json", "inner_step"))
+    check(sorted(d["name"] for d in sub) == ["inner_step", "middle_step", "outer_step"], f"JSON neighbourhood unexpected:\n{sub}")
+
+
 def scenario_hooks(s):
     """SessionStart context + index pre-warm, the note after LSP results, and
     r-lsp-status. The LSP payloads are in the shapes Claude Code's LSP tool
@@ -522,7 +625,8 @@ def scenario_hooks(s):
     root = s.make_package("hooks_pkg")
     start = os.path.join(REPO, "plugins", "r-lsp", "hooks", "session-start.sh")
     out = run_hook(start, {}, env={"CLAUDE_PROJECT_DIR": root}, stdin_text="{}")
-    check("R LSP plugin: R package 'pkgtwo'" in out, f"session-start context unexpected:\n{out}")
+    check("R LSP plugin: R package 'pkgtwo'" in out and "static call map of all" in out,
+          f"session-start context unexpected:\n{out}")
     cache = rscript(f'cat(file.path(tools::R_user_dir("languageserver", "cache"), "workspace-index", '
                     f'paste0(digest::digest(normalizePath("{root}"), algo = "xxhash64"), ".rds")))').strip()
     for _ in range(60):
@@ -621,7 +725,7 @@ def scenario_hooks(s):
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,
              scenario_renv_old_lintr, scenario_renv_old_purrr,
              scenario_complete_answers, scenario_shared_scope, scenario_other_repository,
-             scenario_colcheck, scenario_colcheck_cache, scenario_hooks]
+             scenario_colcheck, scenario_colcheck_cache, scenario_callmap, scenario_hooks]
 
 
 def main():

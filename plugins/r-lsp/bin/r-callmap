@@ -1,0 +1,19 @@
+#!/bin/bash
+# r-callmap [--json] [--root DIR] [--depth N] [NAME ...]
+#   A static call map of the R project: every function with its file:line,
+#   what project functions it calls and what calls it (functions, tests,
+#   scripts). With NAME, the callers and callees around NAME only.
+#   See scripts/callmap-lib.R for what counts as a call.
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+
+# The project root: the nearest directory up from here with a project marker.
+root="${CLAUDE_PROJECT_DIR:-$PWD}"
+d="$PWD"
+while [ "$d" != "/" ]; do
+  if [ -e "$d/renv.lock" ] || [ -e "$d/DESCRIPTION" ] || [ -e "$d/.git" ] || [ -e "$d/.here" ] \
+     || [ -e "$d/_targets.R" ] || ls "$d"/*.Rproj >/dev/null 2>&1; then root="$d"; break; fi
+  d="$(dirname "$d")"
+done
+
+# An explicit --root later in "$@" wins over this default.
+exec Rscript --vanilla "$here/../scripts/r-callmap.R" --root "$root" "$@"

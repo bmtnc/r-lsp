@@ -68,9 +68,10 @@ If a step fails, see [Troubleshooting](#troubleshooting).
 
 ### Using it
 
-Nothing to do: the skill tells Claude when to use the LSP tool and what each answer covers, the hooks add context on their own, and the two shell tools are on Claude's `PATH`. The pieces you can ask for by name:
+Nothing to do: the skill tells Claude when to use the LSP tool and what each answer covers, the hooks add context on their own, and the three shell tools are on Claude's `PATH`. The pieces you can ask for by name:
 
 - `r-colcheck path/to/file.R` — column names in tidyverse code vs the data the file reads (also runs after every `.R` edit). `r-colcheck learn KEY 'EXPR'` caches the column names of data the checker cannot open (S3, databases) so those pipelines are checked too.
+- `r-callmap` — the project's call map in one listing: every function with its file:line, what it calls and what calls it, including tests and scripts. `r-callmap NAME` shows one function's callers and callees. Useful before a refactor.
 - `r-lsp-status` — recent index events for this project.
 
 Environment variables, set in the shell that starts Claude Code: `R_LSP_AGENT_LINTERS=false` to use lintr's default rules instead of the plugin's profile; `R_LSP_INDEX_WAIT=<seconds>` to change how long cross-file answers wait for indexing (default 30); `R_LSP_LOAD_MAX=<n>` to cap how many test and script files are loaded at startup (default 600); `R_LSP_STATUS_FILE=<path>` to move the status log.
@@ -92,10 +93,11 @@ r-lsp/
 │       │   ├── r-lsp-wrapper   # Starts the server (environment, lint profile)
 │       │   ├── r-lsp-server.R  # The server with the plugin's patches
 │       │   ├── r-colcheck      # Column names vs the data a script reads; `learn` fills the schema cache
+│       │   ├── r-callmap       # Static call map of the project, or of one function's neighbourhood
 │       │   └── r-lsp-status    # Recent index events for this project
 │       ├── hooks/              # SessionStart context + pre-warm, post-edit and post-LSP notes
 │       ├── monitors/           # Streams index events to Claude
-│       ├── scripts/            # R code behind the hooks and r-colcheck
+│       ├── scripts/            # R code behind the hooks, r-colcheck and r-callmap
 │       ├── skills/r-lsp/       # Tells Claude how to use all of this
 │       ├── lintr/
 │       │   ├── agent_linters.R # Diagnostics profile (bugs only, tidyverse-aware)
@@ -125,7 +127,7 @@ Beyond the server itself, the plugin uses the other channels Claude Code gives a
 - **A skill** (`skills/r-lsp/SKILL.md`) tells Claude when to use the LSP tool, what each answer covers, and how to check data-frame column names.
 - **Hooks** add what the server cannot say: a `SessionStart` hook prints the project's shape and warms the index cache; after each LSP result a hook appends the mentions `grep` finds in files the server does not index and says whether the index is still building; after each `.R` edit a hook runs the column-name check.
 - **A monitor** streams the server's "indexing" / "index ready" events to Claude.
-- **Shell tools** on Claude's `PATH`: `r-colcheck` and `r-lsp-status`.
+- **Shell tools** on Claude's `PATH`: `r-colcheck`, `r-callmap` and `r-lsp-status`.
 
 ## Index, completeness and other repositories
 
@@ -167,6 +169,28 @@ R/report.R:17: 'holdings' comes from a source the checker cannot open (s3_read("
 
 `learn` creates `.colcheck/` with its own `.gitignore` (`*`), so the cache stays local by default; delete that file to commit the cache and share it with the team.
 
+## The call map
+
+Claude Code's LSP tool hands out the call graph one function at a time: `incomingCalls` or `outgoingCalls` at a cursor position. Nobody maps a package that way, so before a refactor an agent greps a name and reads whole files to work out what calls what. `r-callmap` prints the whole map at once from R's own parser, so Claude reads one listing and opens only the files it names. The point is fewer files read, not speed: grep is faster for a single name.
+
+```
+r-callmap: static call map of /path/to/pkg (11 functions in 5 files; 1 Rmd/qmd not parsed).
+Static: misses calls built from strings at runtime (eval(parse()), names pasted together), S4 dispatch, ...
+
+R/apply.R
+  R/apply.R:1    run_all(xs, how)    [exported]   calls: helper (as value), by_string (by string)   called by: scripts/run.R
+  R/apply.R:6    helper(x)           called by: run_all (as value), describe.myclass
+  R/apply.R:8    by_string(parts)    called by: run_all (by string)
+```
+
+Each line is one definition: file:line, arguments, tags (`[exported]` from NAMESPACE, `[S3 method of print]`, `[S3 generic]`), the project functions it calls and its callers. Calls from code outside any function (tests, scripts, top-level statements) are attributed to the file, with a count when there are several. Functions passed as values (`lapply(x, f)`, `purrr::map(x, f)`, `do.call(f, ...)`, any bare project function name used as a value) are tagged `(as value)`; names passed as strings to `do.call()`, `match.fun()`, `get()` or the apply family, and `Recall()`, are tagged `(by string)`. Calls into packages are left out; `pkg::f()` counts when `pkg` is the project's own package. Files are listed in `Collate` order (else alphabetically), then `tests/`, then the rest; a script's heading shows the files it `source()`s and the project functions its top-level code calls. After the listing come the entry points (functions no project function calls, with the files that do), the unreferenced functions, and any recursion or mutual recursion. R6 methods are listed as `Class$method`, with `self$m()` and `private$m()` calls inside the class resolved; in `_targets.R`, each `tar_target()` is listed as `target name` with the functions its command calls.
+
+`r-callmap NAME` prints the neighbourhood instead: the definition, its callers expanded upward and its callees downward to `--depth` levels (default 2) with each call site's file:line, cycles cut. An S3 method's callers include its generic's callers, through the generic; a generic lists the methods it dispatches to. An unknown name gets the nearest defined names. `--json` gives the map or the neighbourhood as a list of `{name, file, line, args, exported, kind, calls, called_by}` objects. It always exits 0.
+
+Which definition a call reaches: a function in a script or a test file (a file with top-level code) is visible to that file and to the files that `source()` it; functions in `R/` and in files that only define functions are visible everywhere; among several visible definitions of a name, the one in the same file wins. Parameters and local variables that share a project function's name are not counted as uses of it. A file that does not parse is listed in the header as skipped, with the parse error. Git-ignored R files (a `scripts/scratch/` directory) are included, since a refactor has to update them too; the server's startup loader skips them. On a 90-file package (69 functions) a full run takes 0.4 s; on a 236-file one (177 functions), 1.0 s. The session-start context says how many functions the map would list.
+
+Measured on that 90-file package with a planning task (a function two levels below the scripts gains a required argument; list every call site, every signature that must change to thread it through, and the tests), both with the same model and the same tools: an agent told to run `r-callmap NAME` first answered in 22 s over 2 turns and opened no source file; the same agent with grep and Read took 86 s over 11 turns and opened 4 files. Both answers were complete, including the two call sites where the function is passed as a value to `purrr::map()`; the grep agent, having read the files, also noted which calls pass arguments by position. The map is for the plan; the files still get read before the edit.
+
 ## What this gives Claude Code
 
 - **Diagnostics**: after every `.R` file edit, syntax errors and likely bugs (see [Diagnostics](#diagnostics)). They reach only the main conversation, and Claude Code may deliver them a turn late; the hooks below are synchronous.
@@ -174,6 +198,7 @@ R/report.R:17: 'holdings' comes from a source the checker cannot open (s3_read("
 - **Go-to-definition, find references, call hierarchy**: complete for every `.R` file in the project (a package's `R/`, tests, scripts; loaded at startup) and for other repositories Claude opens files in. The note after each result lists what `grep` finds that the answer did not: roxygen `[f()]` links, Rmd, calls through `map()`/`do.call()`, and the other assignments of a script variable the server scoped to one branch.
 - **Workspace symbol search**: every R file in the project.
 - **After each edit**: the column-name check (`r-colcheck`) for tidyverse code, and the argument-name check for calls to the project's own functions.
+- **A call map**: `r-callmap` lists every function with what it calls and what calls it, for planning a refactor from one listing.
 - **At session start**: the project's shape and index state, as context.
 
 Claude Code's LSP tool has no completion, rename or code-action operations, so the server's support for those is unused.
@@ -203,7 +228,8 @@ To turn the profile off and get lintr's defaults, set `R_LSP_AGENT_LINTERS=false
 
 - **Scope of references**: the server itself fully parses a package's `R/` plus files that are open or `source()`d. The plugin loads every other `.R` file in the project the same way at startup (tests, scripts, `data-raw/`; git-ignored files excepted; up to `R_LSP_LOAD_MAX`, default 600), so callers there are in the server's answer from a cold start. Rmd and Quarto files are not loaded; the post-LSP hook lists every mention `grep` finds that the answer does not, line by line, so read the two together.
 - **Script variables assigned in a block**: the server scopes an assignment inside `if`/`else` or a loop body to that block, so a script-level variable assigned in two branches gets two disjoint reference sets and a definition that names one branch. The post-LSP note recognizes the case (the assignment is outside every function) and lists the other mentions in the file instead of calling the server's answer complete. A name that is only created as `name = ...` inside `mutate()`, `summarise()` or `tibble()` is a column, which the server does not track; the note says so and lists where it is created. (languageserver 0.3.19 scoped each open document to its package root or `source()` closure and evicted loaded documents outside that closure, so hover, definition and call hierarchy from a script or test into `R/` returned nothing; the plugin's shared-scope and loader patches restore one scope per workspace.)
-- **Call graph gaps**: functions passed as values (`map(x, f)`, `lapply`, `do.call`), S3 dispatch (`print(x)` to `print.myclass`) and R6 methods are not edges in the call hierarchy. (Since 0.3.19 the server also answered `outgoingCalls` from a shallow index that dropped calls after `!` or a unary minus, inside subscripts and inside `if` conditions, 4 of 26 on a real function; the plugin declines that shortcut so the full parse answers.)
+- **Call graph gaps**: functions passed as values (`map(x, f)`, `lapply`, `do.call`), S3 dispatch (`print(x)` to `print.myclass`) and R6 methods are not edges in the call hierarchy; `r-callmap` lists functions passed as values, S3 methods with their generic, and R6 calls made inside the class. (Since 0.3.19 the server also answered `outgoingCalls` from a shallow index that dropped calls after `!` or a unary minus, inside subscripts and inside `if` conditions, 4 of 26 on a real function; the plugin declines that shortcut so the full parse answers.)
+- **The call map is static**: `r-callmap` reads the parse trees and runs nothing. Calls built from strings at runtime (`eval(parse())`, names pasted together), S4 dispatch, R6 calls through an object (`obj$method()`), `super$` calls and code in Rmd/qmd are not edges. A project function named like a base function (`c`, `filter`) attracts every call to that name, which is what R does too. A local variable sharing a project function's name inside a data-masking verb can still show up as an `(as value)` edge.
 - **Argument checks cover project functions only**: `r-colcheck` reports wrong, partially matching or surplus arguments in calls to functions defined in the project; a wrong argument name in a call to a package function is not reported by anything.
 - **Files outside the project**: a file edited outside the session's repository (a scratch file under `/tmp`) is linted against its own directory, so the repository's `.lintr` does not apply and its functions read as undefined there.
 - **Silent parse errors in some files**: an R file whose roxygen contains inline code such as `` `r lifecycle::badge("deprecated")` `` gets no diagnostics at all when it fails to parse (lintr treats the file as a literate document). Rmd chunks with a syntax error are dropped silently.
@@ -350,11 +376,11 @@ To confirm the LSP can see renv packages, not just global ones:
 
 ### Dependencies
 
-The only external dependency is the `languageserver` R package, from CRAN; it installs `lintr`, `jsonlite`, `digest` and the rest of what the hooks use. No fork, no custom builds. The wrapper and hooks are plain bash, the server patches, the diagnostics profile and the column checker are plain R, and the plugin config is plain JSON. `r-colcheck` uses `readr`, `arrow`, `readxl`, `haven` or `fst` when they are installed and falls back to base R (or stays silent for formats it cannot read) when they are not.
+The only external dependency is the `languageserver` R package, from CRAN; it installs `lintr`, `jsonlite`, `digest` and the rest of what the hooks use. No fork, no custom builds. The wrapper and hooks are plain bash, the server patches, the diagnostics profile, the column checker and the call map are plain R, and the plugin config is plain JSON. `r-colcheck` uses `readr`, `arrow`, `readxl`, `haven` or `fst` when they are installed and falls back to base R (or stays silent for formats it cannot read) when they are not.
 
 ### Testing
 
-`tests/smoke_test.py` starts the wrapper on scratch projects and talks to it over LSP, the way Claude Code does. It checks planted bugs, a tidyverse script, renv-only packages, a project pinning an old `lintr`, a project pinning an old `purrr`, complete references on an 80-file package asked right after opening (with the status events), navigation into a second repository, the column checker on its fixture and through the post-edit hook, and the session-start and post-LSP hooks. It needs R with `languageserver`, `lintr` and `renv` installed (plus `tidyverse` for the tidyverse scenario):
+`tests/smoke_test.py` starts the wrapper on scratch projects and talks to it over LSP, the way Claude Code does. It checks planted bugs, a tidyverse script, renv-only packages, a project pinning an old `lintr`, a project pinning an old `purrr`, complete references on an 80-file package asked right after opening (with the status events), navigation into a second repository, the column checker on its fixture and through the post-edit hook, the call map on a fixture package (no server), and the session-start and post-LSP hooks. It needs R with `languageserver`, `lintr` and `renv` installed (plus `tidyverse` for the tidyverse scenario):
 
 ```bash
 python3 tests/smoke_test.py            # all scenarios

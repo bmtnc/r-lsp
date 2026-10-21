@@ -1,10 +1,23 @@
 # SessionStart hook: a few lines of context about the R project for Claude.
 # Printed to stdout, which Claude Code adds to Claude's context.
 root <- normalizePath(commandArgs(TRUE)[1], mustWork = FALSE)
-rfiles <- list.files(root, pattern = "[.][Rr]$", recursive = TRUE, full.names = TRUE)
-rfiles <- rfiles[!grepl("/(renv|packrat|[.]git|node_modules)/", rfiles)]
+script_dir <- dirname(normalizePath(sub("^--file=", "", grep("^--file=", commandArgs(), value = TRUE)[1])))
+# The same discovery r-callmap uses, so the counts agree. stderr is discarded
+# by the hook, so a broken library must not cost the lines below.
+have_callmap <- tryCatch({
+  source(file.path(script_dir, "colcheck-lib.R"), local = TRUE)
+  source(file.path(script_dir, "callmap-lib.R"), local = TRUE)
+  TRUE
+}, error = function(e) FALSE)
+found <- if (have_callmap) callmap_files(root) else {
+  r <- list.files(root, pattern = "[.][Rr]$", recursive = TRUE, full.names = TRUE)
+  m <- list.files(root, pattern = "[.](Rmd|rmd|qmd)$", recursive = TRUE, full.names = TRUE)
+  skip <- "/(renv|packrat|[.]git|node_modules)/"
+  list(r = r[!grepl(skip, r)], rmd = m[!grepl(skip, m)])
+}
+rfiles <- found$r
 tests <- rfiles[grepl("/tests?/", rfiles)]
-rmd <- list.files(root, pattern = "[.](Rmd|rmd|qmd)$", recursive = TRUE)
+rmd <- found$rmd
 is_pkg <- file.exists(file.path(root, "DESCRIPTION"))
 name <- if (is_pkg) tryCatch(read.dcf(file.path(root, "DESCRIPTION"), fields = "Package")[1, 1],
   error = function(e) NA) else NA
@@ -22,3 +35,13 @@ cat("The R language server starts on the first .R edit. Cross-file answers (find
     "results for R/ files; a note after each LSP result lists any mentions grep finds in files the",
     "server does not index (tests/, scripts, Rmd). Files from other repositories are indexed on",
     "first open. Column-name mistakes in tidyverse code are checked after each edit (r-colcheck).\n")
+# Counting definitions parses every file: ~0.3 s for 240 files. Above 500
+# files the sentence goes without the count to keep the hook fast.
+n_defs <- if (have_callmap && length(rfiles) <= 500L) tryCatch({
+  defs <- new_defs()
+  for (f in rfiles) scan_file(f, "", defs)
+  sum(vapply(defs$rows, function(d) d$kind != "target", TRUE))
+}, error = function(e) NA_integer_) else NA_integer_
+cat(sprintf(paste("`r-callmap` prints a static call map of%s (what calls what, tests and scripts included);",
+                  "run it, or `r-callmap NAME`, before a refactor and open only the files it names.\n"),
+            if (is.na(n_defs)) " the project's functions" else sprintf(" all %d functions", n_defs)))

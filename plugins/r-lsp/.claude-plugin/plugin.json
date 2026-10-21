@@ -1,7 +1,7 @@
 {
   "name": "r-lsp",
-  "version": "1.5.1",
-  "description": "R language server for Claude Code with renv support, tidyverse-aware diagnostics and a column-name check.",
+  "version": "1.6.0",
+  "description": "R language server for Claude Code with renv support, tidyverse-aware diagnostics, a column-name check and a static call map.",
   "author": {
     "name": "Barry Matanic",
     "url": "https://github.com/bmtnc"

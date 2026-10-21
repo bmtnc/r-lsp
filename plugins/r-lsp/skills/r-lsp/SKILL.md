@@ -1,6 +1,6 @@
 ---
 name: r-lsp
-description: Working in an R repository (.R, .Rmd, .qmd files, R packages, tidyverse/dplyr scripts, renv projects, Shiny, targets). How to use the R language server through the LSP tool, what each answer does and does not cover, how to check data-frame column names, and the plugin's shell tools (r-colcheck, r-lsp-status). Use whenever reading, navigating, refactoring or editing R code.
+description: Working in an R repository (.R, .Rmd, .qmd files, R packages, tidyverse/dplyr scripts, renv projects, Shiny, targets). How to use the R language server through the LSP tool, what each answer does and does not cover, how to check data-frame column names, and the plugin's shell tools (r-callmap, r-colcheck, r-lsp-status). Use whenever reading, navigating, refactoring or editing R code.
 ---
 
 # R code intelligence in this repository
@@ -15,8 +15,15 @@ The R language server runs for `.R`, `.Rmd` and `.qmd` files. It starts on the f
 | What does `f` take? | `hover` | signature + roxygen for project functions; the full help page for package functions |
 | What is in this file? | `documentSymbol` | top-level functions and variables |
 | Find by name | `workspaceSymbol` | every R file in the project, including tests and scripts |
+| How is the code structured / what depends on what? | `r-callmap` (shell), `r-callmap NAME` | every function at once: file:line, arguments, the project functions it calls and its callers (functions, tests, scripts), including `map(x, f)` `(as value)` and `do.call("f")` `(by string)` edges; static parse, see below |
 
 Positions are 1-based; point at the symbol itself, not the bracket or comma before it.
+
+## Before a refactor
+
+Run `r-callmap` (the whole project) or `r-callmap NAME` (that function's callers and callees, two levels each way, with every call site's file:line; `--depth N` for more) before reading source files. Plan the change from the map, then open only the files it names; do not read through `R/` to work out what calls what. It also lists entry points, functions nobody calls and recursion. After the edits, the post-edit diagnostics report a call to a function that no longer exists and the argument check reports calls whose argument names no longer match. `--json` gives the same data as JSON.
+
+It reads the code without running it: calls built from strings at runtime, S4 dispatch, R6 calls through an object (`obj$m()`) and code in Rmd/qmd are not in it, and only functions defined in the project appear.
 
 ## What to trust
 
