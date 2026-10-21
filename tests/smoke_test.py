@@ -939,6 +939,16 @@ def scenario_hooks(s):
     forwarded = proc.communicate(timeout=10)[0].splitlines()
     check(forwarded == ["R LSP: index ready (3 files, 1.0 s)", "R LSP: added workspace /tmp/other (with its renv library)"],
           f"monitor forwarded the wrong lines:\n{forwarded}")
+    # Outside an R project the monitor exits at once instead of tailing.
+    no_r = os.path.join(s.scratch, "not_r_project", "src")
+    os.makedirs(no_r, exist_ok=True)
+    with open(os.path.join(no_r, "main.py"), "w") as f:
+        f.write("print(1)\n")
+    try:
+        idle = subprocess.run(["bash", monitor, data_dir], cwd=os.path.dirname(no_r), capture_output=True, text=True, timeout=5)
+        check(idle.returncode == 0 and not idle.stdout, f"monitor misbehaved in a non-R directory: {idle.returncode} {idle.stdout!r}")
+    except subprocess.TimeoutExpired:
+        check(False, "monitor kept running in a directory with no R files")
 
 
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,

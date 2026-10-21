@@ -7,6 +7,13 @@
 # projects are filtered out.
 data_dir="$1"
 [ -n "$data_dir" ] || exit 0
+# Nothing to watch outside an R project: the same test the session-start
+# hook applies (an R, Rmd or qmd file within three levels, renv and git
+# internals excepted, and Rscript on PATH), so a session in a directory
+# with no R code runs no monitor at all.
+command -v Rscript >/dev/null 2>&1 || exit 0
+find "$PWD" -maxdepth 3 \( -name '*.R' -o -name '*.r' -o -name '*.Rmd' -o -name '*.qmd' \) \
+     -not -path '*/renv/*' -not -path '*/.git/*' -print -quit 2>/dev/null | grep -q . || exit 0
 file="$data_dir/status.log"
 mkdir -p "$data_dir" 2>/dev/null
 touch "$file" 2>/dev/null || exit 0
