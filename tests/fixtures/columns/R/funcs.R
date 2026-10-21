@@ -54,3 +54,21 @@ guarded <- function(df) {
   df |> filter(share > 0.1)
 }
 g1 <- guarded(sales)
+
+# A helper that rewrites columns in place keeps the column set; one whose
+# output cannot be worked out stops tracking with a note at the call site
+# naming the step inside it, also for a direct call.
+to_chr <- function(df, cols) df %>% mutate(across(all_of(cols), as.character))
+widen <- function(df) {
+  df %>%
+    pivot_wider(names_from = year, values_from = amount)
+}
+opaque_fn <- function(df) do.call(rbind, df)
+tc <- to_chr(sales, c("year"))
+bad7 <- tc |> filter(yeer > 1)                                                        # bad
+wd <- widen(sales)
+wd |> filter(zz > 1)
+op <- sales %>% opaque_fn()
+op |> filter(zz > 1)
+ws <- widen_src(sales)
+ws |> filter(zz > 1)

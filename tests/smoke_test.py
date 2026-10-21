@@ -415,8 +415,16 @@ def scenario_colcheck(s):
     out = subprocess.run([tool, "--root", root, analysis], capture_output=True, text=True, timeout=120).stdout
     reported = {int(line.split(":")[1]) for line in out.splitlines()
                 if line.startswith("R/analysis.R:") and ("is not a column" in line or "no argument" in line)}
-    check("'ok7' is known up to pivot_wider(" in out and "'ok9' is known up to mutate(across(where(is.numeric), scale))" in out,
-          f"stop notes missing for pivot_wider()/across(where()):\n{out}")
+    check("'ok7' is known up to pivot_wider(" in out and "'ok9' is known up to" not in out,
+          f"stop note missing for pivot_wider(), or across(where()) in mutate() still stops tracking:\n{out}")
+    # --steps: the column set after every verb, as text and as JSON
+    steps = subprocess.run([tool, "--steps", "--root", root, analysis], capture_output=True, text=True, timeout=120).stdout
+    check("R/analysis.R:18: select(region) => region" in steps and "=> (unknown)" in steps,
+          f"--steps listing unexpected:\n{steps}")
+    sj = json.loads(subprocess.run([tool, "--json", "--steps", "--root", root, analysis],
+                                   capture_output=True, text=True, timeout=120).stdout)
+    check(set(sj) == {"findings", "steps"} and any(st["line"] == 18 and st["columns"] == ["region"] for st in sj["steps"]),
+          f"--json --steps shape unexpected: {list(sj)}")
     with open(analysis) as f:
         src = f.read().splitlines()
     bad = {i for i, line in enumerate(src, 1) if line.rstrip().endswith("# bad")}
@@ -459,18 +467,32 @@ def scenario_colcheck(s):
                             capture_output=True, text=True, timeout=120).stdout
     tricky_findings = [l for l in tricky.splitlines() if "is not a column" in l or "no argument" in l]
     check(not tricky_findings, f"r-colcheck flagged correct tricky code:\n{tricky}")
-    check("'k' is known up to summarise(across(c(amount, year), mean), .by = region)" in tricky
-          and "cannot be worked out statically" in tricky, f"stop note missing for summarise(across()):\n{tricky}")
+    check("'k' is known up to" not in tricky
+          and "'k24' is known up to summarise(across(where(is.numeric), mean), .by = region)" in tricky
+          and "cannot be worked out statically" in tricky, f"stop notes for summarise(across()) unexpected:\n{tricky}")
 
     # Frames passed through project functions (same file, source()d file), both pipes.
     funcs = os.path.join(root, "R", "funcs.R")
     out = subprocess.run([tool, "--root", root, funcs], capture_output=True, text=True, timeout=120).stdout
-    reported = {int(line.split(":")[1]) for line in out.splitlines() if line.startswith("R/funcs.R:")}
+    reported = {int(line.split(":")[1]) for line in out.splitlines()
+                if line.startswith("R/funcs.R:") and ("is not a column" in line or "no argument" in line)}
     with open(funcs) as f:
         bad = {i for i, line in enumerate(f.read().splitlines(), 1) if line.rstrip().endswith("# bad")}
     check(bad <= reported, f"function tracking missed lines {sorted(bad - reported)}:\n{out}")
     check(reported <= bad, f"function tracking flagged correct lines {sorted(reported - bad)}:\n{out}")
-    check("helpers_src.R" not in out, f"findings attributed to the sourced helper file:\n{out}")
+    check("helpers_src.R" not in [l.split(":")[0] for l in out.splitlines()], f"findings attributed to the sourced helper file:\n{out}")
+    # a stop inside a followed project function is reported at the call site, with the step inside
+    check("'wd' is known up to widen(sales)" in out
+          and "inside widen() at its pivot_wider(names_from = year, values_from = amount) (R/funcs.R:" in out
+          and "r-colcheck learn \"widen\"" in out,
+          f"stop inside a followed function not reported at the call site:\n{out}")
+    check("'op' is known up to opaque_fn()" in out and "following its code gave no column set" in out,
+          f"direct call of an opaque project function got no note:\n{out}")
+    ws_note = [l for l in out.splitlines() if "'ws' is known up to widen_src(sales)" in l]
+    check(ws_note and "inside widen_src() at its pivot_wider(" in ws_note[0] and "(R/helpers_src.R:" not in ws_note[0],
+          f"a one-expression helper in another file must get the note without a made-up line:\n{out}")
+    steps = subprocess.run([tool, "--steps", "--root", root, funcs], capture_output=True, text=True, timeout=120).stdout
+    check("R/funcs.R:11: mutate(., big = amount > 100) =>" in steps, f"|> chain steps not shown as verb(., ...):\n{steps}")
 
     # In a package, functions from every file under R/ are known without source().
     pkg = os.path.join(s.scratch, "pkgcols")
@@ -605,6 +627,8 @@ def scenario_colcheck_packages(s):
                           "customers": entry("customers", ["customer_id", "region"]),
                           # keyed on the function: no literal in the call, no comment on the line
                           "teamdata::taxonomy": entry("taxonomy", ["product", "category"]),
+                          # keyed on the function and an argument value: the output depends on it
+                          "teamdata::taxonomy(level = \"fine\")": entry("taxonomy", ["product", "category", "subcategory"]),
                           "fixed_table": dict(entry("fixed", ["code", "label"]),
                                               columns=[{"name": "code", "type": "character"}, {"name": "label", "type": "character"},
                                                        {"name": "series", "type": "list",
@@ -650,7 +674,12 @@ def scenario_colcheck_packages(s):
         "ser <- fixed_table() %>% dplyr::filter(code != \"x\") %>% tidyr::unnest(series)\n"
         "bad9 <- ser %>% dplyr::select(code, d, rr)\n"
         "h <- fixed_table() %>% tidyr::hoist(series, first = \"d\", second = \"qq\")\n"
-        "h %>% dplyr::select(first, second, code, serie)\n")
+        "h %>% dplyr::select(first, second, code, serie)\n"
+        # a key with an argument beats the bare function key; a piped helper hits the cache too
+        "tx2 <- teamdata::taxonomy(raw, customers, level = \"fine\")\n"
+        "bad10 <- tx2 %>% dplyr::select(subcategory, categry)\n"
+        "tx3 <- raw %>% teamdata::taxonomy(customers)\n"
+        "bad11 <- tx3 %>% dplyr::select(product, categry)\n")
     root = s.make_renv_project("colcheck_pkgs", {}, extra_packages=("teamdata", "cranlike"))
     for rel, text in (("script/run.R", script), (".colcheck/schemas.json", schemas)):
         os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
@@ -661,7 +690,7 @@ def scenario_colcheck_packages(s):
     check(out.returncode == 1, f"r-colcheck exited {out.returncode} (expected 1, findings):\n{out.stderr}")
     findings = json.loads(out.stdout)
     cols = {(f["line"], f["name"]) for f in findings if f["kind"] == "column"}
-    check(cols == {(6, "amount"), (7, "idd"), (9, "extra"), (15, "regionn"), (17, "status"), (21, "categry"), (23, "labell"), (28, "idd"), (32, "rr"), (33, "qq"), (34, "serie")},
+    check(cols == {(6, "amount"), (7, "idd"), (9, "extra"), (15, "regionn"), (17, "status"), (21, "categry"), (23, "labell"), (28, "idd"), (32, "rr"), (33, "qq"), (34, "serie"), (36, "categry"), (38, "categry")},
           f"column findings unexpected: {sorted(cols)}\n{out.stdout}")
     src = {f["line"]: f["source"] for f in findings if f["kind"] == "column"}
     check(src[6] == src[9] == "teamdata::clean_orders() (read from its code)", f"finding source unexpected: {src}")
@@ -670,6 +699,8 @@ def scenario_colcheck_packages(s):
     check(src[21].startswith("cached schema \"teamdata::taxonomy\"") and src[23].startswith("cached schema \"fixed_table\""),
           f"function-keyed cache sources unexpected: {src[21]} / {src[23]}")
     check(src[32].startswith("cached schema \"fixed_table\""), f"unnested frame lost its source: {src[32]}")
+    check(src[36].startswith('cached schema "teamdata::taxonomy(level = "fine")"') and src[38].startswith('cached schema "teamdata::taxonomy", '),
+          f"call-shaped key / piped cache sources unexpected: {src[36]} / {src[38]}")
     check(not [f for f in findings if f["kind"] == "error"], f"checker errors:\n{out.stdout}")
     notes = {f["line"]: f["message"] for f in findings if f["kind"] == "note"}
     check(sorted(notes) == [10, 12, 29], f"notes unexpected (a CRAN-style package and a pull() pipeline must get none):\n{notes}")
@@ -682,15 +713,15 @@ def scenario_colcheck_packages(s):
     # A self-contained package loader with a literal key keeps the learn suggestion.
     check("r-colcheck learn \"returns\" 'teamdata::fetch_table(Sys.Date(), \"returns\")'" in notes[12],
           f"uncached loader note lost its learn command:\n{notes[12]}")
-    check("21 pipeline step(s) checked" in out.stderr and "4 step(s) skipped" in out.stderr
+    check("23 pipeline step(s) checked" in out.stderr and "4 step(s) skipped" in out.stderr
           and "checker error" not in out.stderr, f"summary unexpected:\n{out.stderr}")
     # Switched off, the package function is opaque and nothing after it is checked.
     off = subprocess.run([tool, "--json", "script/run.R"], cwd=root, capture_output=True, text=True, timeout=300,
                          env=dict(os.environ, R_LSP_COLCHECK_PACKAGES="false"))
-    check(off.returncode == 1 and "13 pipeline step(s) checked" in off.stderr,
+    check(off.returncode == 1 and "15 pipeline step(s) checked" in off.stderr,
           f"R_LSP_COLCHECK_PACKAGES=false still followed the package function:\n{off.stderr}")
     off_cols = {(f["line"], f["name"]) for f in json.loads(off.stdout) if f["kind"] == "column"}
-    check(off_cols == {(15, "regionn"), (21, "categry"), (23, "labell"), (28, "idd"), (32, "rr"), (33, "qq"), (34, "serie")},
+    check(off_cols == {(15, "regionn"), (21, "categry"), (23, "labell"), (28, "idd"), (32, "rr"), (33, "qq"), (34, "serie"), (36, "categry"), (38, "categry")},
           f"with packages off, only the cache should answer: {sorted(off_cols)}")
 
 def scenario_lint_fallback(s):

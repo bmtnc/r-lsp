@@ -1,5 +1,5 @@
 #!/bin/bash
-# r-colcheck [--json] [--root DIR] FILE.R ...
+# r-colcheck [--json] [--steps] [--root DIR] FILE.R ...
 #   Check bare column names in tidyverse code against the real columns of the
 #   data the code reads. See scripts/colcheck-lib.R for what is resolved.
 #

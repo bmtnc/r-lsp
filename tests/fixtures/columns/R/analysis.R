@@ -15,7 +15,7 @@ ok5 <- mtcars %>% mutate(kpl = mpg * 0.425)
 ok6 <- tibble(a = 1:3, b = letters[1:3]) %>% filter(a > 1)
 ok7 <- sales %>% pivot_wider(names_from = year, values_from = amount) %>% select(`2020`)
 ok8 <- function(df) df %>% filter(whatever > 1)
-ok9 <- sales %>% mutate(across(where(is.numeric), scale)) %>% select(zzz)
+ok9 <- sales %>% mutate(across(where(is.numeric), scale)) %>% select(region)
 ok10 <- sales %>% count(region, name = "rows") %>% filter(rows > 2)
 p_ok <- ggplot(sales, aes(x = year, y = amount, colour = region)) + geom_point()
 
@@ -46,3 +46,9 @@ bad24 <- sales %>% filter(amount > 0) %>% pull(amuont)                          
 bad25 <- sales |> pull(var = regoin)                                                         # bad
 bad26 <- tibble(id = 1, data = list(tibble(d = 1, r = 2))) %>% unnest(data) %>% filter(zzz == 1)   # bad
 bad27 <- tibble(id = 1, data = list(tibble(d = 1, r = 2))) %>% hoist(data, first = "dd")            # bad
+bad28 <- sales %>% mutate(across(where(is.numeric), scale)) %>% select(zzz)                           # bad
+bad29 <- sales %>% mutate(across(c(amount, year), as.character, .names = "{.col}_chr")) %>% select(amount_chr, year_chrr)   # bad
+bad30 <- sales %>% mutate(across(c(amount), list(m = mean, s = sd))) %>% select(amount_m, amount_sd)   # bad
+bad31 <- sales %>% transmute(across(c(region, amount), identity)) %>% select(year)                    # bad
+bad32 <- sales %>% summarise(across(c(amount, year), mean), .by = region) %>% mutate(zz = amuont)     # bad
+bad33 <- sales %>% mutate(pick(region, amount)) %>% select(regoin)                                    # bad
