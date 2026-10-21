@@ -42,3 +42,5 @@ bad20 <- sales %>% summarise(across(all_of(c("amount", "yaer")), mean), .by = re
 bad21 <- sales %>% rowwise() %>% mutate(s = sum(c_across(amuont:year)))                      # bad
 bad22 <- sales %>% group_by(across(c(region, year))) %>% summarise(m = mean(amount)) %>% mutate(z = regoin)  # bad
 bad23 <- sales %>% group_by(yr = year * 2) %>% summarise(m = mean(amount)) %>% mutate(z = yrr)   # bad
+bad24 <- sales %>% filter(amount > 0) %>% pull(amuont)                                       # bad
+bad25 <- sales |> pull(var = regoin)                                                         # bad

@@ -449,7 +449,7 @@ follow_function <- function(e, def, ctx) {
   for (p in names(supplied)) {
     a <- supplied[[p]]
     if (!(is.symbol(a) || is.call(a))) next
-    arg_cols[[p]] <- frame_columns(a, ctx, used = param_used_as_frame(fdef[[3L]], p))
+    arg_cols[[p]] <- as_frame(frame_columns(a, ctx, used = param_used_as_frame(fdef[[3L]], p)))
   }
   # `if ("x" %in% names(df))`: the body handles frames with and without x,
   # so x counts as present for the parameter rather than reported
@@ -620,6 +620,21 @@ keep_source <- function(cols, template) {
   cols
 }
 
+# A third outcome beside known columns and NULL (unknown): the expression is
+# not a data frame at all, because a terminal verb turned it into a vector
+# or a scalar (pull(), nrow(), names()). It flows through pipes and wrappers
+# untouched, binds its target as a plain variable rather than an unresolved
+# frame (so no "source the checker cannot open" note blames the loader the
+# pipeline started from), and reads as unknown wherever a frame is required.
+not_frame <- structure(character(), not_frame = TRUE)
+is_not_frame <- function(x) isTRUE(attr(x, "not_frame"))
+as_frame <- function(x) if (is_not_frame(x)) NULL else x
+
+# Verbs whose result is not a frame. pull() names a column and is checked;
+# the rest take no column names, so a frame that only reaches them is not
+# "used" in the sense that earns an unresolved-source note.
+terminal_calls <- c("pull", "nrow", "ncol", "dim", "names", "colnames", "deframe")
+
 # Column set of an expression that produces a data frame, or NULL (unknown).
 # `used`: the caller applies a column-using verb to the result, so an
 # unresolved frame here is worth a note.
@@ -643,11 +658,12 @@ frame_columns <- function(e, ctx, used = FALSE) {
     if (!is.call(rhs)) return(NULL)
     rhs_fn <- call_name(rhs)
     rhs_def <- lookup_function(rhs, rhs_fn, ctx)
-    lhs <- frame_columns(e[[2L]], ctx, used = used || rhs_fn %in% verb_names || !is.null(rhs_def))
+    lhs <- frame_columns(e[[2L]], ctx, used = used || rhs_fn %in% column_verbs || !is.null(rhs_def))
     if (is.null(lhs)) {
       if (!is.na(rhs_fn)) count_step(ctx, "skipped", rhs_fn)
       return(NULL)
     }
+    if (is_not_frame(lhs)) return(lhs)
     if (!is.null(rhs_def)) {
       ctx$frames[[".colcheck_lhs"]] <- lhs
       return(call_user_function(pipe_into(rhs, as.name(".colcheck_lhs")), rhs_fn, ctx, def = rhs_def))
@@ -684,7 +700,8 @@ frame_columns <- function(e, ctx, used = FALSE) {
   # chain is `+` calls nested the same way
   if (fn %in% verb_names || fn == "+") {
     if (length(e) < 2L) return(NULL)
-    inner <- frame_columns(e[[2L]], ctx, used = TRUE)
+    inner <- frame_columns(e[[2L]], ctx, used = used || fn %in% column_verbs)
+    if (is_not_frame(inner)) return(inner)
     if (!is.null(inner)) return(apply_verb(e, inner, ctx, piped = FALSE))
     count_step(ctx, "skipped", fn)
     return(NULL)
@@ -889,6 +906,14 @@ apply_verb <- function(call, cols, ctx, piped) {
     }
   }
   has_nonsymbol_pos <- function() any(vapply(pos, function(p) !is.symbol(p), TRUE))
+  if (fn %in% terminal_calls) {
+    if (fn == "pull") {
+      var <- if ("var" %in% nms) args[["var"]] else if (length(pos)) pos[[1L]] else NULL
+      sel <- if (is.null(var) || is.numeric(var)) NULL else selection_names(list(var))
+      if (!is.null(sel)) check_symbols(sel, cols, ctx)
+    }
+    return(not_frame)
+  }
   # `.by =` is the one dot-argument that names columns of the incoming frame
   # (bare, `c(a, b)`, a helper); check it like group_by()'s arguments. When a
   # name is wrong the result is unknown: the pipeline fails there at run time,
@@ -983,7 +1008,7 @@ apply_verb <- function(call, cols, ctx, piped) {
       if (!is.null(lhs_names)) check_symbols(lhs_names, cols, ctx)
     }
     if (fn %in% c("semi_join", "anti_join")) return(with_groups(cols))
-    other <- frame_columns(if (length(pos)) pos[[1L]] else args[["y"]], ctx, used = TRUE)
+    other <- as_frame(frame_columns(if (length(pos)) pos[[1L]] else args[["y"]], ctx, used = TRUE))
     if (is.null(other)) return(NULL)
     return(with_groups(unique(c(cols, other))))
   }
@@ -1007,7 +1032,7 @@ check_ggplot <- function(e, ctx) {
   base <- e[[2L]]
   while (is.call(base) && identical(call_name(base), "+")) base <- base[[2L]]
   if (!is.call(base) || !identical(call_name(base), "ggplot") || length(base) < 2L) return(invisible())
-  cols <- frame_columns(base[[2L]], ctx, used = TRUE)
+  cols <- as_frame(frame_columns(base[[2L]], ctx, used = TRUE))
   if (is.null(cols)) return(invisible())
   layers <- list()
   node <- e
@@ -1025,13 +1050,15 @@ check_ggplot <- function(e, ctx) {
 # Verb calls the walker checks when they appear on their own.
 verbs <- c("mutate", "filter", "summarise", "summarize", "select", "arrange", "group_by", "rename",
            "transmute", "distinct", "count", "pivot_longer", "pivot_wider", "ggplot", "slice", "reframe",
-           "left_join", "inner_join", "right_join", "full_join", "semi_join", "anti_join")
+           "left_join", "inner_join", "right_join", "full_join", "semi_join", "anti_join", "pull")
 
 # Everything apply_verb() understands: a call to one of these is a pipeline
 # step, never a data source.
 verb_names <- unique(c(verbs, "slice_head", "slice_tail", "slice_min", "slice_max", "slice_sample",
                        "drop_na", "fill", "relocate", "ungroup", "rowwise", "glimpse", "print", "head",
-                       "tail", "collect", "compute", "as_tibble", "as.data.frame", "tally", "add_count"))
+                       "tail", "collect", "compute", "as_tibble", "as.data.frame", "tally", "add_count",
+                       terminal_calls))
+column_verbs <- setdiff(verb_names, setdiff(terminal_calls, "pull"))
 
 # --- argument names ----------------------------------------------------------
 # A call to a project function with an argument name its definition does not
@@ -1123,6 +1150,15 @@ walk_expr <- function(e, ctx) {
     if (is.null(cols) && !is.null(ctx$annotation)) cols <- schema_columns(ctx$annotation, ctx)
     ctx$annotation <- NULL
     ctx$annotation_head <- NULL
+    if (is_not_frame(cols)) {
+      ctx$frames[[target]] <- NULL
+      ctx$unresolved[[target]] <- NULL
+      ctx$unknown_frames <- setdiff(ctx$unknown_frames, target)
+      ctx$variables <- union(ctx$variables, target)
+      check_ggplot(e[[3L]], ctx)
+      if (is.call(e[[3L]]) && !identical(call_name(e[[3L]]), "function")) walk_expr(e[[3L]], ctx)
+      return(invisible())
+    }
     # nested expressions first, while the target still means what it meant
     # before this line: in `x <- x %>% a() %>% b()` every step reads the old x
     check_ggplot(e[[3L]], ctx)
