@@ -377,7 +377,121 @@ input_frame <- function(a, ctx) {
     if (any(vapply(parts, is_open, TRUE))) attr(out, "open") <- TRUE
     return(out)
   }
-  as_frame(frame_columns(a, ctx, used = TRUE))
+  cols <- as_frame(frame_columns(a, ctx, used = TRUE))
+  if (is.null(cols)) NULL else unlisted(cols)
+}
+
+# --- lists of frames: split() and the mappers -------------------------------
+# split(df, df$g) / group_split() turn a frame into a list of frames with the
+# same columns (a column set carrying a `listed` attribute); map(), imap(),
+# lapply() over it walk the lambda once with its parameter bound to that
+# frame, so the body is checked at its own lines, and give a list of the
+# body's result columns; map_dfr()/map_df() give that frame, and bind_rows()
+# or list_rbind() of the list (input_frame) does the same. A listed set is
+# not a frame anywhere a frame is consumed: verbs and joins give up on it.
+listed_calls <- c("split", "group_split")
+mapping_calls <- c("map", "imap", "lapply", "map_dfr", "map_df")
+is_listed <- function(cols) isTRUE(attr(cols, "listed"))
+listed <- function(cols) { attr(cols, "listed") <- TRUE; cols }
+unlisted <- function(cols) { attr(cols, "listed") <- NULL; cols }
+
+split_frames <- function(call, cols, ctx, piped) {
+  fn <- call_name(call)
+  args <- call_args(call)
+  data_expr <- if (piped) as.name(".") else if (length(args)) args[[1L]] else NULL
+  if (!piped && length(args)) args <- args[-1L]
+  nms <- names(args) %||% rep("", length(args))
+  cols <- unlisted(cols)
+  if (fn == "split") {
+    f <- if ("f" %in% nms) args[["f"]] else if (any(!nzchar(nms))) args[!nzchar(nms)][[1L]] else NULL
+    check_symbols(dollar_columns(f, data_expr), cols, ctx)
+    return(listed(keep_source(structure(as.character(cols), groups = attr(cols, "groups") %||% character()), cols)))
+  }
+  pos <- args[!nzchar(nms)]
+  g <- if (length(pos)) grouping_names(pos, ctx) else attr(cols, "groups") %||% character()
+  if (is.null(g) || anyNA(g)) return(NULL)
+  if (length(pos)) check_symbols(g, cols, ctx)
+  keep <- !identical(args[[".keep"]], FALSE)
+  out <- if (keep) as.character(cols) else setdiff(as.character(cols), g)
+  listed(keep_source(structure(out, groups = character()), cols))
+}
+
+# The column names a split() factor names on the data itself: `.$g`,
+# `df$g`, `list(df$a, df$b)`, `~ g`.
+dollar_columns <- function(f, data_expr) {
+  if (!is.call(f)) return(character())
+  fn <- call_name(f)
+  if (identical(fn, "$") && length(f) == 3L && is.symbol(f[[3L]])) {
+    base <- f[[2L]]
+    own <- is.symbol(base) && (identical(as.character(base), ".") || (!is.null(data_expr) && identical(base, data_expr)))
+    return(if (own) as.character(f[[3L]]) else character())
+  }
+  if (identical(fn, "~") && length(f) == 2L) return(all.vars(f))
+  if (fn %in% c("list", "c", "interaction")) return(unlist(lapply(call_args(f), dollar_columns, data_expr = data_expr)))
+  character()
+}
+
+map_over <- function(call, cols, ctx, piped) {
+  fn <- call_name(call)
+  args <- call_args(call)
+  if (!piped && length(args)) args <- args[-1L]
+  nms <- names(args) %||% rep("", length(args))
+  f <- if (".f" %in% nms) args[[".f"]] else if ("FUN" %in% nms) args[["FUN"]] else if (any(!nzchar(nms))) args[!nzchar(nms)][[1L]] else NULL
+  if (is.null(f)) return(NULL)
+  extra <- args[!(nms %in% c(".f", "FUN", ".x", "X", ".l"))]
+  if (any(!nzchar(nms))) extra <- extra[-match(TRUE, !nzchar(names(extra) %||% rep("", length(extra))))]
+  result <- lambda_columns(f, unlisted(cols), ctx, with_index = fn == "imap", extra = extra, shown = call)
+  if (is.null(result)) return(NULL)
+  if (fn %in% c("map_dfr", "map_df")) unlisted(result) else listed(result)
+}
+
+# The columns a lambda returns for one element frame: a formula (`.x`, `.`,
+# `..1` bound), a function literal (its first formal, the second for imap),
+# or a named function followed like any project or package function.
+lambda_columns <- function(f, frame, ctx, with_index = FALSE, extra = list(), shown = f) {
+  if (is.symbol(f) || (is.call(f) && !is.na(ns_name(f)))) {
+    ctx$frames[[".colcheck_el"]] <- frame
+    on.exit(ctx$frames[[".colcheck_el"]] <- NULL, add = TRUE)
+    call <- as.call(c(list(f, as.name(".colcheck_el")), extra))
+    fn <- call_name(call)
+    def <- lookup_function(call, fn, ctx)
+    if (is.null(def)) return(NULL)
+    return(as_frame(call_user_function(call, fn, ctx, def = def, shown = f)))
+  }
+  if (!is.call(f)) return(NULL)
+  fn <- call_name(f)
+  params <- character()
+  body <- NULL
+  if (identical(fn, "~") && length(f) == 2L) {
+    params <- c(".x", ".", "..1")
+    body <- f[[2L]]
+  } else if (identical(fn, "function") && length(f) >= 3L) {
+    formals_ <- names(f[[2L]]) %||% character()
+    if (!length(formals_)) return(NULL)
+    params <- formals_[[1L]]
+    body <- f[[3L]]
+  } else return(NULL)
+  saved <- list(frames = ctx$frames, variables = ctx$variables, unknown = ctx$unknown_frames,
+                strings = ctx$strings, in_function = ctx$in_function, stopped = ctx$stopped,
+                annotation = ctx$annotation, annotation_head = ctx$annotation_head)
+  for (p in params) ctx$frames[[p]] <- frame
+  ctx$variables <- union(ctx$variables, c(params, ".y", ".i"))
+  if (with_index && identical(fn, "function") && length(names(f[[2L]])) >= 2L) ctx$variables <- union(ctx$variables, names(f[[2L]])[[2L]])
+  ctx$in_function <- TRUE
+  result <- as_frame(body_columns(body, ctx))
+  inner <- if (is.null(saved$stopped)) ctx$stopped else NULL
+  ctx$frames <- saved$frames
+  ctx$variables <- saved$variables
+  ctx$unknown_frames <- saved$unknown
+  ctx$strings <- saved$strings
+  ctx$in_function <- saved$in_function
+  ctx$stopped <- saved$stopped
+  ctx$annotation <- saved$annotation          # the statement's `# cols:` survives the body walk
+  ctx$annotation_head <- saved$annotation_head
+  if (is.null(result) && !is.null(inner)) {
+    note_stop(ctx, shown, call_name(shown) %||% "lambda", NULL, reason = sprintf("inside its lambda at %s, %s", inner$expr, inner$reason))
+  }
+  result
 }
 
 not_loaders <- c("bind_rows", "bind_cols", "rbind", "cbind", "merge", "rbindlist", "tryCatch", "try",
@@ -561,7 +675,8 @@ call_user_function <- function(e, name, ctx, def = lookup_function(e, name, ctx)
   saved <- list(frames = ctx$frames, variables = ctx$variables, unknown = ctx$unknown_frames,
                 line = ctx$line, line_end = ctx$line_end, file = ctx$file, call_stack = ctx$call_stack,
                 call_sites = ctx$call_sites, in_function = ctx$in_function, pkg_scope = ctx$pkg_scope,
-                stopped = ctx$stopped, strings = ctx$strings)
+                stopped = ctx$stopped, strings = ctx$strings,
+                annotation = ctx$annotation, annotation_head = ctx$annotation_head)
   errors_before <- length(ctx$errors)
   result <- guarded(ctx, def$file, follow_function(e, def, ctx))
   # the step inside the body that lost the columns, if the body recorded one
@@ -570,6 +685,8 @@ call_user_function <- function(e, name, ctx, def = lookup_function(e, name, ctx)
   ctx$follow_known <- ctx$follow_known[-length(ctx$follow_known)]
   ctx$stopped <- saved$stopped
   ctx$strings <- saved$strings
+  ctx$annotation <- saved$annotation          # the call line's `# cols:` survives the body walk
+  ctx$annotation_head <- saved$annotation_head
   ctx$frames <- saved$frames
   ctx$variables <- saved$variables
   ctx$unknown_frames <- saved$unknown
@@ -843,7 +960,18 @@ frame_columns <- function(e, ctx, used = FALSE) {
     rhs_def <- lookup_function(rhs, rhs_fn, ctx)
     # a cache entry for a piped helper, `df %>% clean()`, beats following its
     # code, as it does for the direct call `clean(df)`; verbs never match
-    cached <- if (!is.na(rhs_fn) && !(rhs_fn %in% c(verb_names, combining_calls))) cached_columns(rhs, ctx) else NULL
+    cached <- if (!is.na(rhs_fn) && !(rhs_fn %in% c(verb_names, combining_calls, listed_calls, mapping_calls))) cached_columns(rhs, ctx) else NULL
+    if (!is.na(rhs_fn) && rhs_fn %in% c(listed_calls, mapping_calls) && is.null(rhs_def)) {
+      lhs <- frame_columns(e[[2L]], ctx, used = TRUE)
+      if (is.null(lhs) || is_not_frame(lhs)) return(if (is.null(lhs)) NULL else lhs)
+      if (rhs_fn %in% mapping_calls && !is_listed(lhs)) return(NULL)
+      result <- if (rhs_fn %in% listed_calls) split_frames(rhs, lhs, ctx, piped = TRUE)
+        else map_over(rhs, lhs, ctx, piped = TRUE)
+      record_step(ctx, rhs, result)
+      if (is.null(result) && (rhs_fn %in% listed_calls || is_listed(lhs)))
+        note_stop(ctx, rhs, rhs_fn, NULL, reason = "the columns its lambda returns cannot be worked out")
+      return(result)
+    }
     if (!is.na(rhs_fn) && rhs_fn %in% combining_calls && is.null(rhs_def)) {
       first <- input_frame(e[[2L]], ctx)
       result <- if (is.null(first)) NULL else bound_rows(rhs, first, ctx)
@@ -920,6 +1048,24 @@ frame_columns <- function(e, ctx, used = FALSE) {
   }
   if (fn %in% c("{", "(")) return(if (length(e) >= 2L) frame_columns(e[[length(e)]], ctx, used = used) else NULL)
   if (fn %in% c("function", "if", "for", "while", "repeat", "$", "@", "[", "[[")) return(NULL)
+  if (fn %in% c(listed_calls, mapping_calls) && is.null(lookup_function(e, fn, ctx))) {
+    args <- call_args(e)
+    nms <- names(args) %||% rep("", length(args))
+    data <- if (fn %in% mapping_calls && any(c(".x", "X") %in% nms)) args[[intersect(c(".x", "X"), nms)[[1L]]]]
+      else if (fn == "group_split" && "x" %in% nms) args[["x"]] else if (length(args)) args[[1L]] else NULL
+    if (is.null(data)) return(NULL)
+    first <- frame_columns(data, ctx, used = TRUE)
+    if (is.null(first) || is_not_frame(first)) return(if (is.null(first)) NULL else first)
+    if (fn %in% mapping_calls && !is_listed(first)) return(NULL)
+    result <- if (fn %in% listed_calls) split_frames(e, first, ctx, piped = FALSE)
+      else map_over(e, first, ctx, piped = FALSE)
+    shown <- e
+    if (length(e) >= 2L && is.call(e[[2L]])) shown[[2L]] <- as.name(".")
+    record_step(ctx, shown, result)
+    if (is.null(result) && (fn %in% listed_calls || is_listed(first)))
+      note_stop(ctx, e, fn, NULL, reason = "the columns its lambda returns cannot be worked out")
+    return(result)
+  }
   if (fn %in% combining_calls && is.null(lookup_function(e, fn, ctx))) {
     args <- call_args(e)
     nms <- names(args) %||% rep("", length(args))
@@ -986,18 +1132,18 @@ collect_symbols <- function(e, acc = character()) {
 # walked, since it holds function names, not columns. A selection the
 # resolver cannot read (`starts_with()`, `where()`, `all_of(variable)`,
 # `any_of()`) leaves the whole island unchecked, as before.
-island_selection <- function(e) {
+island_selection <- function(e, ctx = NULL) {
   fn <- call_name(e)
   if (is.na(fn)) return(NULL)
   args <- call_args(e)
   nms <- names(args) %||% rep("", length(args))
-  if (fn == "all_of") return(selection_names(list(e)))
-  if (fn == "pick") return(selection_names(args))
+  if (fn == "all_of") return(selection_names(list(e), ctx))
+  if (fn == "pick") return(selection_names(args, ctx))
   if (fn %in% c("across", "if_any", "if_all", "c_across")) {
     slot <- if (fn == "c_across") "cols" else ".cols"
     sel <- if (slot %in% nms) args[[slot]] else if (any(!nzchar(nms))) args[!nzchar(nms)][[1L]] else NULL
     if (is.null(sel)) return(NULL)
-    return(selection_names(list(sel)))
+    return(selection_names(list(sel), ctx))
   }
   NULL
 }
@@ -1011,7 +1157,7 @@ island_selection <- function(e) {
 # "{.col}_{.fn}", the list's names or positions as `.fn`), which needs the
 # selection. NULL when the names cannot be worked out. A bare symbol as
 # `.fns` counts as one function: `across(cols, mean)` is the common shape.
-across_names <- function(e) {
+across_names <- function(e, ctx = NULL) {
   fn <- call_name(e)
   if (identical(fn, "pick")) return(character())
   if (!identical(fn, "across")) return(NULL)
@@ -1031,7 +1177,7 @@ across_names <- function(e) {
     fnm <- names(fa) %||% rep("", length(fa))
     ifelse(nzchar(fnm), fnm, as.character(seq_along(fa)))
   } else "1"
-  sel <- island_selection(e)
+  sel <- island_selection(e, ctx)
   if (is.null(sel)) return(NULL)
   holes <- regmatches(tpl, gregexpr("\\{[^}]*\\}", tpl))[[1L]]
   if (!all(holes %in% c("{.col}", "{col}", "{.fn}", "{fn}"))) return(NULL)
@@ -1146,15 +1292,7 @@ assertion_of <- function(e, ctx) {
       else FALSE
     return(result(frame_of(pick(cfg$frame)), string_vector(pick(cfg$columns), ctx), exact, want))
   }
-  membership <- function(x) {   # all(cols %in% names(df)) or cols %in% names(df)
-    if (is.call(x) && identical(call_name(x), "(") && length(x) == 2L) x <- x[[2L]]
-    if (is.call(x) && identical(call_name(x), "all") && length(x) == 2L) x <- x[[2L]]
-    if (is.call(x) && identical(call_name(x), "%in%") && length(x) == 3L) {
-      f <- frame_of(x[[3L]])
-      if (!is.null(f) && is.call(x[[3L]])) return(result(f, string_vector(x[[2L]], ctx), FALSE, NULL))
-    }
-    NULL
-  }
+  membership <- function(x) names_membership(x, ctx)
   if (fn %in% c("stopifnot", "assert_that")) {   # stopifnot("message" = cond) names its conditions
     for (a in args) { m <- membership(a); if (!is.null(m)) { m$fn <- fn; return(m) } }
     return(NULL)
@@ -1189,6 +1327,42 @@ assertion_of <- function(e, ctx) {
   NULL
 }
 
+# `all(cols %in% names(df))` or `cols %in% names(df)`: the frame and the
+# names, or NULL.
+names_membership <- function(x, ctx) {
+  if (is.call(x) && identical(call_name(x), "(") && length(x) == 2L) x <- x[[2L]]
+  if (is.call(x) && identical(call_name(x), "all") && length(x) == 2L) x <- x[[2L]]
+  if (is.call(x) && identical(call_name(x), "%in%") && length(x) == 3L && is.call(x[[3L]])) {
+    nm <- x[[3L]]
+    if (call_name(nm) %in% c("names", "colnames") && length(nm) == 2L && is.symbol(nm[[2L]])) {
+      cols <- string_vector(x[[2L]], ctx)
+      if (!is.null(cols) && length(cols)) return(list(frame = as.character(nm[[2L]]), cols = unique(cols), exact = FALSE, fn = "if"))
+    }
+  }
+  NULL
+}
+
+# `if (all(cols %in% names(df))) { ... }`: inside the branch the frame has
+# those columns (added to a known frame, an open set for an unknown one);
+# outside it nothing changes. The else branch is walked as before.
+walk_guarded_if <- function(e, ctx) {
+  m <- names_membership(e[[2L]], ctx)
+  if (is.null(m)) return(FALSE)
+  nm <- m$frame
+  saved <- ctx$frames[[nm]]
+  saved_unknown <- ctx$unknown_frames
+  if (!is.null(saved) && !is_listed(saved)) {
+    ctx$frames[[nm]] <- keep_source(structure(unique(c(as.character(saved), m$cols)), groups = attr(saved, "groups") %||% character()), saved)
+  } else if (is.null(saved)) {
+    apply_assertion(m, ctx)
+  }
+  walk_expr(e[[3L]], ctx)
+  ctx$frames[[nm]] <- saved
+  ctx$unknown_frames <- saved_unknown
+  if (length(e) >= 4L) walk_expr(e[[4L]], ctx)
+  TRUE
+}
+
 apply_assertion <- function(a, ctx) {
   nm <- a$frame
   cur <- ctx$frames[[nm]]
@@ -1212,10 +1386,10 @@ apply_assertion <- function(a, ctx) {
 # The grouping columns a group_by() names: a selection, an island, or a
 # computed group (`group_by(yr = year(date))`, which also adds the column).
 # NULL when any of them cannot be resolved.
-grouping_names <- function(pos) {
+grouping_names <- function(pos, ctx = NULL) {
   out <- character()
   for (a in pos) {
-    g <- if (is.call(a) && call_name(a) %in% c("across", "pick")) island_selection(a) else selection_names(list(a))
+    g <- if (is.call(a) && call_name(a) %in% c("across", "pick")) island_selection(a, ctx) else selection_names(list(a), ctx)
     if (is.null(g)) return(NULL)
     out <- c(out, g)
   }
@@ -1232,25 +1406,27 @@ local_names <- function(e, acc = character()) {
   acc
 }
 
-selection_names <- function(args) {
+selection_names <- function(args, ctx = NULL) {
   out <- character()
   for (a in args) {
     if (is.symbol(a)) out <- c(out, as.character(a))
     else if (is.character(a)) out <- c(out, a)
     else if (is.call(a) && call_name(a) %in% c("-", "!") && length(a) == 2L) {
-      inner <- selection_names(list(a[[2L]]))
+      inner <- selection_names(list(a[[2L]]), ctx)
       if (is.null(inner)) return(NULL)
       out <- c(out, inner)
     } else if (is.call(a) && call_name(a) %in% c(":", "c")) {
-      inner <- selection_names(as.list(a)[-1L])
+      inner <- selection_names(as.list(a)[-1L], ctx)
       if (is.null(inner)) return(NULL)
       out <- c(out, inner)
     } else if (is.call(a) && call_name(a) == "all_of" && length(a) == 2L) {
-      # all_of("a") or all_of(c("a", "b")): the names must exist, so they are
-      # checked; all_of(keys) with a variable, or any_of() (missing names
-      # allowed), stays unresolved
-      inner <- if (is.character(a[[2L]])) a[[2L]] else
-        if (is.call(a[[2L]]) && identical(call_name(a[[2L]]), "c") &&
+      # all_of("a"), all_of(c("a", "b")), or all_of(keys) with a vector the
+      # code states (a literal bound earlier, a switch(), a helper returning
+      # one): the names must exist, so they are checked; any_of() (missing
+      # names allowed) stays unresolved
+      inner <- if (!is.null(ctx)) string_vector(a[[2L]], ctx)
+        else if (is.character(a[[2L]])) a[[2L]]
+        else if (is.call(a[[2L]]) && identical(call_name(a[[2L]]), "c") &&
             all(vapply(as.list(a[[2L]])[-1L], is.character, TRUE))) unlist(as.list(a[[2L]])[-1L]) else NULL
       if (is.null(inner)) return(NULL)
       out <- c(out, inner)
@@ -1334,6 +1510,7 @@ record_step <- function(ctx, call, cols) {
     file = ctx$file, line = ctx$line, call = one_line(call),
     columns = if (is.null(cols)) NULL else as.character(cols),
     open = is_open(cols),
+    listed = is_listed(cols),
     groups = if (anyNA(groups)) NULL else as.character(groups),
     source = attr(cols, "source") %||% NA_character_)
   invisible()
@@ -1342,6 +1519,7 @@ record_step <- function(ctx, call, cols) {
 apply_verb_impl <- function(call, cols, ctx, piped) {
   fn <- call_name(call)
   if (is.na(fn)) return(NULL)
+  if (is_listed(cols)) { count_step(ctx, "skipped", fn); return(NULL) }
   count_step(ctx, if (is_open(cols)) "skipped" else "checked", fn)
   args <- call_args(call)
   if (!piped && length(args)) args <- args[-1L]
@@ -1371,7 +1549,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     added <- character()
     for (p in pos) {
       if (is.symbol(p)) next
-      a <- if (is.call(p)) across_names(p) else NULL
+      a <- if (is.call(p)) across_names(p, ctx) else NULL
       if (is.null(a)) return(NULL)
       added <- c(added, a)
     }
@@ -1381,8 +1559,8 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     kept <- character()
     for (p in pos) {
       if (is.symbol(p)) { kept <- c(kept, as.character(p)); next }
-      sel <- if (is.call(p)) island_selection(p) else NULL
-      a <- if (is.call(p)) across_names(p) else NULL
+      sel <- if (is.call(p)) island_selection(p, ctx) else NULL
+      a <- if (is.call(p)) across_names(p, ctx) else NULL
       if (is.null(sel) || is.null(a)) return(NULL)
       kept <- c(kept, if (length(a)) a else sel)
     }
@@ -1392,7 +1570,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     inner <- attr(cols, "inner") %||% list()
     col_arg <- if (fn == "hoist") (if (".col" %in% nms) args[[".col"]] else if (length(pos)) pos[[1L]] else NULL)
       else if ("cols" %in% nms) args[["cols"]] else if ("col" %in% nms) args[["col"]] else if (length(pos)) pos[[1L]] else NULL
-    sel <- if (is.null(col_arg)) NULL else selection_names(list(col_arg))
+    sel <- if (is.null(col_arg)) NULL else selection_names(list(col_arg), ctx)
     if (is.null(sel)) return(NULL)
     bad <- check_symbols(sel, cols, ctx)
     if (length(bad)) return(NULL)
@@ -1419,7 +1597,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
   if (fn %in% terminal_calls) {
     if (fn == "pull") {
       var <- if ("var" %in% nms) args[["var"]] else if (length(pos)) pos[[1L]] else NULL
-      sel <- if (is.null(var) || is.numeric(var)) NULL else selection_names(list(var))
+      sel <- if (is.null(var) || is.numeric(var)) NULL else selection_names(list(var), ctx)
       if (!is.null(sel)) check_symbols(sel, cols, ctx)
     }
     return(not_frame)
@@ -1429,7 +1607,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
   # name is wrong the result is unknown: the pipeline fails there at run time,
   # and carrying the misspelling into the output would only flag the correct
   # name downstream.
-  by_sel <- if (".by" %in% nms) selection_names(list(args[[".by"]])) else NULL
+  by_sel <- if (".by" %in% nms) selection_names(list(args[[".by"]]), ctx) else NULL
   if (!is.null(by_sel) && length(check_symbols(by_sel, cols, ctx))) return(NULL)
 
   if (fn %in% c("filter", "arrange", "slice", "slice_head", "slice_tail", "slice_min", "slice_max",
@@ -1440,7 +1618,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
   }
   if (fn == "group_by") {
     check_all()
-    g <- grouping_names(pos)
+    g <- grouping_names(pos, ctx)
     computed <- names(named)
     add <- isTRUE(args[[".add"]] %||% FALSE)
     # a grouping that cannot be resolved is unknown (NA), never empty: the
@@ -1470,7 +1648,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     return(closed(with_groups(unique(c(by, kept, names(named))), character())))
   }
   if (fn == "select") {
-    sel <- selection_names(c(pos, unname(named)))
+    sel <- selection_names(c(pos, unname(named)), ctx)
     if (is.null(sel)) {
       check_symbols(unlist(lapply(pos, masked_symbols)), cols, ctx)
       return(NULL)
@@ -1489,7 +1667,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
   }
   if (fn %in% c("count", "tally", "add_count")) {
     check_all()
-    g <- selection_names(pos)
+    g <- selection_names(pos, ctx)
     if (is.null(g)) return(NULL)
     nm <- if (!is.null(args[["name"]])) string_arg(args[["name"]]) %||% "n" else "n"
     if (fn != "add_count" && groups_unknown) return(NULL)
@@ -1498,7 +1676,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
   }
   if (fn == "distinct") {
     check_all()
-    g <- selection_names(pos)
+    g <- selection_names(pos, ctx)
     if (is.null(g)) return(NULL)
     if (!length(g) || isTRUE(args[[".keep_all"]] %||% FALSE)) return(with_groups(cols))
     if (groups_unknown) return(NULL)
@@ -1507,7 +1685,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
   if (fn == "pivot_longer") {
     spec <- if (length(pos)) pos[[1L]] else args[["cols"]]
     if (is.null(spec)) return(NULL)
-    sel <- selection_names(list(spec))
+    sel <- selection_names(list(spec), ctx)
     if (is.null(sel)) return(NULL)
     check_symbols(sel, cols, ctx)
     neg <- is.call(spec) && call_name(spec) %in% c("-", "!")
@@ -1524,14 +1702,14 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     }
     if (fn %in% c("semi_join", "anti_join")) return(with_groups(cols))
     other <- as_frame(frame_columns(if (length(pos)) pos[[1L]] else args[["y"]], ctx, used = TRUE))
-    if (is.null(other)) return(NULL)
+    if (is.null(other) || is_listed(other)) return(NULL)
     joined <- with_groups(unique(c(cols, other)))
     if (is_open(other)) attr(joined, "open") <- TRUE
     return(joined)
   }
   if (fn %in% c("pivot_wider")) {
     for (k in c("names_from", "values_from", "id_cols")) if (!is.null(args[[k]])) {
-      s <- selection_names(list(args[[k]]))
+      s <- selection_names(list(args[[k]]), ctx)
       if (!is.null(s)) check_symbols(s, cols, ctx)
     }
     return(NULL)
@@ -1669,9 +1847,10 @@ walk_expr <- function(e, ctx) {
     ctx$annotation_head <- pipeline_head(e[[3L]])
     ctx$stopped <- NULL
     cols <- frame_columns(e[[3L]], ctx)
-    # an annotation no source consumed (the right-hand side is a symbol or a
-    # user function) still names the columns of the result
-    if (is.null(cols) && !is.null(ctx$annotation)) cols <- schema_columns(ctx$annotation, ctx)
+    # an annotation no source consumed (the right-hand side is a symbol, a
+    # user function, a split/map statement) names the columns of the result:
+    # the user's statement of what the line assigns beats what was inferred
+    if (!is.null(ctx$annotation) && !is_not_frame(cols)) cols <- schema_columns(ctx$annotation, ctx) %||% cols
     ctx$annotation <- NULL
     ctx$annotation_head <- NULL
     if (is_not_frame(cols)) {
@@ -1738,6 +1917,7 @@ walk_expr <- function(e, ctx) {
     return(invisible())
   }
   if (!is.na(fn) && fn == "{") return(walk_block(e, ctx))
+  if (!is.na(fn) && fn == "if" && length(e) >= 3L && walk_guarded_if(e, ctx)) return(invisible())
   if (!is.na(fn) && !is.null(ctx$functions[[fn]])) check_call_args(e, fn, ctx)
   if (!is.na(fn) && (fn %in% verbs || !is.null(ctx$functions[[fn]]))) frame_columns(e, ctx)
   for (p in call_args(e)) if (is.call(p)) walk_expr(p, ctx)
@@ -1893,7 +2073,7 @@ colcheck_files <- function(files, root = NULL) {
 steps_format <- function(steps, root = NULL) {
   vapply(steps, function(s) sprintf("%s:%s: %s => %s", relative_path(s$file, root), s$line, s$call,
     if (is.null(s$columns)) "(unknown)" else paste0(
-      if (isTRUE(s$open)) "at least " else "", paste(s$columns, collapse = ", "),
+      if (isTRUE(s$listed)) "each: " else "", if (isTRUE(s$open)) "at least " else "", paste(s$columns, collapse = ", "),
       if (length(s$groups)) sprintf(" [grouped by %s]", paste(s$groups, collapse = ", ")) else "")), "")
 }
 

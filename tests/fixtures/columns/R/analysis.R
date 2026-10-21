@@ -58,3 +58,10 @@ bad36 <- list(sales, scores) %>% bind_rows() %>% select(scoree)                 
 bad37 <- bind_rows(sales, scores, .id = "src") %>% select(srcc)                                       # bad
 bad38 <- rbind(sales, sales) %>% filter(amuont > 1)                                                   # bad
 bad39 <- sales %>% mutate(.src = "a") %>% select(.srcc, region)                                       # bad
+bad40 <- sales %>% split(.$region) %>% purrr::map(~ .x %>% filter(amuont > 1)) %>% bind_rows()                       # bad
+bad41 <- sales %>% split(.$regoin) %>% purrr::map(~ .x) %>% bind_rows()                                              # bad
+bad42 <- sales %>% group_by(region) %>% group_split() %>% purrr::map_dfr(~ .x %>% select(region, amount)) %>% select(yeer)   # bad
+bad43 <- lapply(split(sales, sales$region), function(d) d %>% select(region)) %>% bind_rows() %>% select(amount)     # bad
+req2 <- c("region", "amuont")
+bad44 <- sales %>% select(all_of(req2))                                                                              # bad
+bad45 <- sales %>% split(.$region) %>% purrr::imap(~ .x %>% mutate(grp = .y)) %>% bind_rows() %>% select(grp, regoin)   # bad

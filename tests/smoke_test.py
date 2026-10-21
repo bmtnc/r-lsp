@@ -467,6 +467,8 @@ def scenario_colcheck(s):
                             capture_output=True, text=True, timeout=120).stdout
     tricky_findings = [l for l in tricky.splitlines() if "is not a column" in l or "no argument" in l]
     check(not tricky_findings, f"r-colcheck flagged correct tricky code:\n{tricky}")
+    check("'s5' is known up to purrr::map(~.x %>% select(all_of(unknown_cols)))" in tricky and "inside its lambda at select(all_of(unknown_cols))" in tricky
+          and "'s7' is known up to" not in tricky, f"lambda notes unexpected:\n{tricky}")
     check("'b4' is known up to bind_rows(sales, unknown_frame)" in tricky and "one of the frames it binds is unknown" in tricky
           and "'b5' is known up to" not in tricky, f"row-binding notes unexpected:\n{tricky}")
     check("'k' is known up to" not in tricky
@@ -496,6 +498,9 @@ def scenario_colcheck(s):
     check(a1 and "the columns require_columns() requires on line" in a1[0], f"assertion-backed finding lacks its source:\n{out}")
     steps = subprocess.run([tool, "--steps", "--root", root, funcs], capture_output=True, text=True, timeout=120).stdout
     check("=> at least region, amount, amt2" in steps, f"open column set not shown in --steps:\n{steps}")
+    tsteps = subprocess.run([tool, "--steps", "--root", root, os.path.join(root, "R", "tricky_ok.R")], capture_output=True, text=True, timeout=120).stdout
+    check("split(.$region) => each: region, year, amount, customer" in tsteps and "purrr::map_dfr(~.x %>% summarise(total = sum(amount))) => total" in tsteps,
+          f"list-of-frames steps not shown:\n{tsteps}")
     ws_note = [l for l in out.splitlines() if "'ws' is known up to widen_src(sales)" in l]
     check(ws_note and "inside widen_src() at its pivot_wider(" in ws_note[0] and "(R/helpers_src.R:" not in ws_note[0],
           f"a one-expression helper in another file must get the note without a made-up line:\n{out}")
@@ -608,6 +613,18 @@ def scenario_colcheck_cache(s):
                 "z %>% dplyr::filter(zz == 1)\n")
     out = subprocess.run([tool, "--root", root, lam], capture_output=True, text=True, timeout=120).stdout
     check("'zz'" not in out, f"a literal inside a lambda matched a cache key:\n{out}")
+    # `# cols:` on a split/map statement survives the lambda walk, brace body with an assignment included
+    sp = os.path.join(root, "R", "split.R")
+    with open(sp, "w") as f:
+        f.write("library(magrittr)\n"
+                "x <- tibble::tibble(grp = \"a\", v = 1)\n"
+                "b <- x %>% split(.$grp) %>% purrr::map(~ .x %>% dplyr::select(dplyr::all_of(unknown_cols))) %>% dplyr::bind_rows()   # cols: holdings/latest\n"
+                "b %>% dplyr::filter(zz1 == 1)\n"
+                "b2 <- x %>% split(.$grp) %>% purrr::map(function(d) { out <- d %>% dplyr::select(dplyr::all_of(unknown_cols)); out }) %>% dplyr::bind_rows()   # cols: holdings/latest\n"
+                "b2 %>% dplyr::filter(zz2 == 1)\n")
+    out = subprocess.run([tool, "--root", root, sp], capture_output=True, text=True, timeout=120).stdout
+    check("'zz1' is not a column" in out and "'zz2' is not a column" in out and out.count('cached schema "holdings/latest"') == 2,
+          f"# cols: on a split/map statement did not survive the lambda walk:\n{out}")
     # --load-all: the package at the root is loaded, its imports resolve
     pkg = s.make_package("loadall")
     with open(os.path.join(pkg, "R", "make_table.R"), "w") as f:

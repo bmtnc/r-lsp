@@ -107,3 +107,20 @@ a5 <- sales |> asserted_select() |> filter(amount > 1)
 require_columns(sales, c("region", "amuont"))                                         # bad
 stopifnot(all(c("region", "yeer") %in% names(sales)))                                 # bad
 stopifnot("needs its columns" = all(c("region", "amuont") %in% names(sales)))         # bad
+asserted_all_of <- function(df, cols) {
+  stopifnot(all(cols %in% names(df)))
+  df |> select(all_of(cols))
+}
+a6 <- asserted_all_of(unknown_input, c("region", "amount")) |> filter(amuont > 1)                  # bad
+a7 <- asserted_all_of(sales, c("region", "amount")) |> filter(amount > 1)
+# A positive guard: inside `if (all(cols %in% names(df)))` the frame has
+# those columns, whether it was known or not; outside it nothing changes.
+guarded_vec <- function(df) {
+  wanted <- c("ticker", "note")
+  if (all(wanted %in% names(df))) {
+    extra <- df |> select(all_of(wanted), region)
+  }
+  df |> filter(amount > 0)
+}
+g2 <- guarded_vec(sales) |> filter(amount > 1)
+g3 <- guarded_vec(sales) |> filter(ticker == "A")                                        # bad
