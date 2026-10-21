@@ -35,4 +35,26 @@ Column names inside `mutate()`, `filter()`, `summarise()`, `select()`, `aes()` l
 - a targets object: `Rscript -e 'names(targets::tar_read(x))'`
 - an object in a running session: `names(df)` or `str(df)`
 
-After editing a pipeline, `r-colcheck path/to/file.R` checks every bare column name against the data files the code reads (headers only, nothing loaded) and tracks names through the verbs. It is also run for you after each edit of an `.R` file; it stays silent when a source cannot be resolved or a step makes the column set unknowable (`across()`, `pivot_wider()`, joins to unknown frames). A cheap runtime check for anything it cannot see: run the pipeline on `head(df, 5)`.
+After editing a pipeline, `r-colcheck path/to/file.R` checks every bare column name against the data files the code reads (headers only, nothing loaded) and tracks names through the verbs. It is also run for you after each edit of an `.R` file; it stays silent when a step makes the column set unknowable (`across()`, `pivot_wider()`, joins to unknown frames, a frame passed through a user function). A cheap runtime check for anything it cannot see: run the pipeline on `head(df, 5)`.
+
+### Data the checker cannot open: the schema cache
+
+Data read from S3, a database or a project loader (`returns <- s3_read("returns/monthly")`) has no local file to open. For those, the checker uses `.colcheck/schemas.json`, a cache of observed column names keyed by the string the code passes to its loader (the S3 key, URI or dataset name). It matches any string literal in the loader call, or a `# cols: KEY` comment on the assignment line when the call carries no key.
+
+When a frame comes from a source that is not cached and the code then pipes it into verbs, the post-edit note says so and nothing downstream of it is checked:
+
+```
+R/report.R:17: 'holdings' comes from a source the checker cannot open (s3_read("holdings/latest")); no cached schema for key "holdings/latest" ... Learn it once: r-colcheck learn "holdings/latest" 's3_read("holdings/latest")'
+```
+
+Act on it when you are about to write or change code against that frame:
+
+```
+r-colcheck learn "holdings/latest" 's3_read("holdings/latest")' --source R/loaders.R
+```
+
+`learn` runs the expression once in the project (renv active, the shell's AWS credentials, no `--vanilla`) and records the names and types; arrow datasets give their schema without downloading rows, anything else is materialized once. `--source FILE.R` loads the file that defines the loader; pass files of function definitions only, never a script that runs a pipeline or writes data. Run it from anywhere in the project. `r-colcheck schemas` lists what is cached and how old each entry is; `r-colcheck forget KEY` drops one.
+
+Refresh an entry only on evidence: the check reports a column you are sure exists (the cache is stale, re-run `learn` for that key; when the entry is more than 90 days old the note says so next to the findings), or the user says the data changed. Never run `learn` from a hook or in a loop; it reaches the network.
+
+The cache is local by default: `.colcheck/` is created with its own `.gitignore`. Deleting `.colcheck/.gitignore` commits it so teammates share the entries.

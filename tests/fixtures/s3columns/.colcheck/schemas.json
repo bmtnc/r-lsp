@@ -1,0 +1,12 @@
+{
+  "returns/monthly": {
+    "expr": "s3_read(\"returns/monthly\")",
+    "observed_at": "2025-01-15T10:00:00Z",
+    "method": "data_frame",
+    "columns": [
+      {"name": "date", "type": "Date"},
+      {"name": "fund_id", "type": "character"},
+      {"name": "ret", "type": "numeric"}
+    ]
+  }
+}

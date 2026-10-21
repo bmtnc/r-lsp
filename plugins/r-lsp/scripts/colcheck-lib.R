@@ -13,11 +13,19 @@
 # when smaller than 20 MB. The moment a step makes the column set unknowable
 # (across(), tidyselect helpers, pivot_wider(), clean_names(), joins to
 # unknown frames, user functions, ...) the frame is marked unknown and nothing
-# downstream is checked. Nothing is reported when the source cannot be
-# resolved. Rmd/qmd files are skipped.
+# downstream is checked. Rmd/qmd files are skipped.
 #
-# Entry points: colcheck_files(files, root) -> list of findings;
-#               colcheck_format(findings, root) -> character lines.
+# Data the checker cannot open (S3 objects, databases, project loaders) is
+# covered by the schema cache, <root>/.colcheck/schemas.json, written by
+# `r-colcheck learn KEY 'EXPR'`. A source call is matched to a cache entry by
+# any string literal in the call (the S3 key, URI or dataset name the code
+# passes to its loader), or by a `# cols: KEY` comment on the assignment line.
+# A frame whose source stays unresolved and is then piped into verbs is
+# reported as a note, so the cache can be filled; nothing is reported for
+# unresolved frames that are never used that way.
+#
+# Entry points: colcheck_files(files, root) -> list of findings (kind "column"
+#               or "note"); colcheck_format(findings, root) -> character lines.
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 quiet <- function(expr, default = NULL) {
@@ -33,6 +41,101 @@ colcheck_root <- function(path) {
     d <- dirname(d)
   }
   dir
+}
+
+# --- schema cache: .colcheck/schemas.json -----------------------------------
+# Column names observed from data the checker cannot open itself. Keyed by the
+# string the code passes to its loader. Written by colcheck-learn.R.
+
+schemas_path <- function(root) file.path(root, ".colcheck", "schemas.json")
+
+load_schemas <- function(root) {
+  p <- schemas_path(root)
+  if (!file.exists(p)) return(list())
+  s <- quiet(jsonlite::fromJSON(p, simplifyVector = FALSE))
+  if (!is.list(s) || is.null(names(s))) return(list())
+  s
+}
+
+schema_columns <- function(key, ctx) {
+  entry <- ctx$schemas[[key]]
+  if (is.null(entry) || !is.list(entry$columns)) return(NULL)
+  cols <- vapply(entry$columns, function(cl) {
+    if (is.list(cl)) as.character(cl$name %||% "") else as.character(cl)
+  }, "")
+  cols <- cols[nzchar(cols)]
+  if (!length(cols)) return(NULL)
+  observed <- substr(as.character(entry$observed_at %||% ""), 1L, 10L)
+  attr(cols, "source") <- sprintf("cached schema \"%s\"%s", key,
+                                  if (nzchar(observed)) paste0(", observed ", observed) else "")
+  age <- quiet(as.integer(Sys.Date() - as.Date(observed)))
+  if (!is.null(age) && !is.na(age) && age > 90L && is.null(ctx$stale[[key]])) {
+    ctx$stale[[key]] <- list(line = ctx$line, days = age, observed = observed)
+  }
+  cols
+}
+
+string_literals <- function(e) {
+  if (is.character(e)) return(e)
+  if (!is.call(e)) return(character())
+  unlist(lapply(as.list(e)[-1L], string_literals))
+}
+
+# Column set for a source call the checker could not open: a cache entry for
+# any string literal in the call, else the `# cols: KEY` annotation of the
+# assignment being walked (consumed by the first unresolved source, which is
+# the head of the pipeline).
+cached_columns <- function(e, ctx) {
+  if (length(ctx$schemas)) {
+    for (s in unique(string_literals(e))) {
+      cols <- schema_columns(s, ctx)
+      if (!is.null(cols)) return(cols)
+    }
+  }
+  key <- ctx$annotation
+  if (!is.null(key)) {
+    ctx$annotation <- NULL
+    return(schema_columns(key, ctx))
+  }
+  NULL
+}
+
+line_annotation <- function(ctx) {
+  if (is.na(ctx$line) || ctx$line > length(ctx$src_lines)) return(NULL)
+  m <- regmatches(ctx$src_lines[[ctx$line]],
+                  regexec("#\\s*(?:cols?|colcheck|schema)\\s*:\\s*(\"[^\"]+\"|'[^']+'|\\S+)", ctx$src_lines[[ctx$line]], perl = TRUE))[[1L]]
+  if (length(m) < 2L) return(NULL)
+  gsub("^[\"']|[\"']$", "", m[[2L]])
+}
+
+# The expression a pipeline starts from: strip pipes and verbs from the left.
+pipeline_head <- function(e) {
+  while (is.call(e)) {
+    fn <- call_name(e)
+    if (is.na(fn) || !(fn %in% c("%>%", "%<>%", "%T>%", verb_names)) || length(e) < 2L) break
+    e <- e[[2L]]
+  }
+  e
+}
+
+# Remember that `target` came from a source the checker could not resolve,
+# when the source looks like a data loader (a reader, or a call carrying a
+# string literal such as an S3 key) or the line names a key that is not cached.
+note_unresolved <- function(target, rhs, key, ctx) {
+  head <- pipeline_head(rhs)
+  if (!is.call(head)) return(invisible())
+  fn <- call_name(head)
+  literals <- unique(string_literals(head))
+  if (is.null(key) && !(fn %in% readers) && !length(literals)) return(invisible())
+  ctx$unresolved[[target]] <- list(
+    line = ctx$line, keys = unique(c(key, literals)), expr = paste(deparse(head), collapse = " "),
+    used = !identical(head, rhs))
+  invisible()
+}
+
+mark_used <- function(nm, ctx) {
+  if (!is.null(ctx$unresolved[[nm]])) ctx$unresolved[[nm]]$used <- TRUE
+  invisible()
 }
 
 # --- reading column names without loading rows ------------------------------
@@ -146,22 +249,28 @@ keep_source <- function(cols, template) {
 }
 
 # Column set of an expression that produces a data frame, or NULL (unknown).
-frame_columns <- function(e, ctx) {
+# `used`: the caller applies a column-using verb to the result, so an
+# unresolved frame here is worth a note.
+frame_columns <- function(e, ctx, used = FALSE) {
   if (is.symbol(e)) {
     nm <- as.character(e)
     if (!is.null(ctx$frames[[nm]])) return(ctx$frames[[nm]])
-    if (nm %in% ctx$unknown_frames || nm %in% ctx$variables) return(NULL)
+    if (nm %in% ctx$unknown_frames) {
+      if (used) mark_used(nm, ctx)
+      return(NULL)
+    }
+    if (nm %in% ctx$variables) return(NULL)
     return(builtin_dataset(nm, ctx))
   }
   if (!is.call(e)) return(NULL)
   fn <- call_name(e)
   if (is.na(fn)) return(NULL)
   if (fn %in% c("%>%", "%<>%", "%T>%")) {
-    lhs <- frame_columns(e[[2L]], ctx)
-    if (is.null(lhs)) return(NULL)
     rhs <- e[[3L]]
     if (is.symbol(rhs)) rhs <- as.call(list(rhs))
     if (!is.call(rhs)) return(NULL)
+    lhs <- frame_columns(e[[2L]], ctx, used = used || call_name(rhs) %in% verb_names)
+    if (is.null(lhs)) return(NULL)
     return(apply_verb(rhs, lhs, ctx, piped = TRUE))
   }
   if (fn %in% readers) {
@@ -171,7 +280,7 @@ frame_columns <- function(e, ctx) {
       for (k in c("file", "path", "input", "sources")) if (k %in% nms) path_arg <- e[[k]]
     }
     path <- resolve_path(path_arg, ctx)
-    if (is.null(path)) return(NULL)
+    if (is.null(path)) return(cached_columns(e, ctx))
     cols <- columns_of_file(path, fn)
     if (!is.null(cols)) attr(cols, "source") <- basename(path)
     return(cols)
@@ -192,8 +301,12 @@ frame_columns <- function(e, ctx) {
   }
   # native pipe is parsed into nested calls: verb(frame_expr, ...)
   if (length(e) >= 2L) {
-    inner <- frame_columns(e[[2L]], ctx)
+    inner <- frame_columns(e[[2L]], ctx, used = used || fn %in% verb_names)
     if (!is.null(inner)) return(apply_verb(e, inner, ctx, piped = FALSE))
+  }
+  # anything else is a loader the checker cannot open: try the schema cache
+  if (!(fn %in% verb_names) && !(fn %in% c("function", "{", "(", "if", "for", "while", "repeat", "$", "@", "[", "[["))) {
+    return(cached_columns(e, ctx))
   }
   NULL
 }
@@ -239,7 +352,7 @@ selection_names <- function(args) {
 report <- function(ctx, name, cols) {
   src <- attr(cols, "source") %||% "the data"
   ctx$findings[[length(ctx$findings) + 1L]] <- list(
-    file = ctx$file, line = ctx$line, name = name, source = src,
+    kind = "column", file = ctx$file, line = ctx$line, name = name, source = src,
     columns = as.character(cols),
     message = sprintf("'%s' is not a column at this point (columns: %s; data from %s)", name,
                       paste(head(cols, 12), collapse = ", "), src))
@@ -344,7 +457,7 @@ apply_verb <- function(call, cols, ctx, piped) {
       if (!is.null(lhs_names)) check_symbols(lhs_names, cols, ctx)
     }
     if (fn %in% c("semi_join", "anti_join")) return(with_groups(cols))
-    other <- frame_columns(if (length(pos)) pos[[1L]] else args[["y"]], ctx)
+    other <- frame_columns(if (length(pos)) pos[[1L]] else args[["y"]], ctx, used = TRUE)
     if (is.null(other)) return(NULL)
     return(with_groups(unique(c(cols, other))))
   }
@@ -368,7 +481,7 @@ check_ggplot <- function(e, ctx) {
   base <- e[[2L]]
   while (is.call(base) && identical(call_name(base), "+")) base <- base[[2L]]
   if (!is.call(base) || !identical(call_name(base), "ggplot") || length(base) < 2L) return(invisible())
-  cols <- frame_columns(base[[2L]], ctx)
+  cols <- frame_columns(base[[2L]], ctx, used = TRUE)
   if (is.null(cols)) return(invisible())
   layers <- list()
   node <- e
@@ -383,21 +496,36 @@ check_ggplot <- function(e, ctx) {
   invisible()
 }
 
+# Verb calls the walker checks when they appear on their own.
 verbs <- c("mutate", "filter", "summarise", "summarize", "select", "arrange", "group_by", "rename",
            "transmute", "distinct", "count", "pivot_longer", "pivot_wider", "ggplot", "slice", "reframe",
            "left_join", "inner_join", "right_join", "full_join", "semi_join", "anti_join")
+
+# Everything apply_verb() understands: a call to one of these is a pipeline
+# step, never a data source.
+verb_names <- unique(c(verbs, "slice_head", "slice_tail", "slice_min", "slice_max", "slice_sample",
+                       "drop_na", "fill", "relocate", "ungroup", "rowwise", "glimpse", "print", "head",
+                       "tail", "collect", "compute", "as_tibble", "as.data.frame", "tally", "add_count"))
 
 walk_expr <- function(e, ctx) {
   if (!is.call(e)) return(invisible())
   fn <- call_name(e)
   if (!is.na(fn) && fn %in% c("<-", "=", "<<-") && length(e) == 3L && is.symbol(e[[2L]])) {
     target <- as.character(e[[2L]])
+    key <- line_annotation(ctx)
+    ctx$annotation <- key
     cols <- frame_columns(e[[3L]], ctx)
+    # an annotation no source consumed (the right-hand side is a symbol or a
+    # user function) still names the columns of the result
+    if (is.null(cols) && !is.null(ctx$annotation)) cols <- schema_columns(ctx$annotation, ctx)
+    ctx$annotation <- NULL
     if (!is.null(cols)) {
       ctx$frames[[target]] <- cols
+      ctx$unresolved[[target]] <- NULL
     } else {
       ctx$frames[[target]] <- NULL
       ctx$unknown_frames <- union(ctx$unknown_frames, target)
+      note_unresolved(target, e[[3L]], key, ctx)
     }
     ctx$variables <- union(ctx$variables, target)
     check_ggplot(e[[3L]], ctx)
@@ -442,6 +570,11 @@ colcheck_file <- function(file, root = NULL) {
   ctx$variables <- character()
   ctx$packages <- character()
   ctx$findings <- list()
+  ctx$schemas <- load_schemas(ctx$root)
+  ctx$unresolved <- list()
+  ctx$stale <- list()
+  ctx$annotation <- NULL
+  ctx$src_lines <- quiet(readLines(file, warn = FALSE), character())
   ctx$known_names <- c("TRUE", "FALSE", "NA", "NULL", "T", "F", "Inf", "NaN", ".", ".x", ".y", ".data", ".env",
                        "desc", "n", "everything", "where", "across", "pi", "letters", "LETTERS",
                        "month.name", "month.abb", "self", "private")
@@ -458,7 +591,37 @@ colcheck_file <- function(file, root = NULL) {
     ctx$line <- if (!is.null(src)) as.integer(src[[i]][[1L]]) else NA_integer_
     quiet(walk_expr(exprs[[i]], ctx))
   }
-  ctx$findings
+  c(ctx$findings, source_notes(ctx))
+}
+
+# Notes about data sources: frames the checker could not resolve that are
+# then piped into verbs, and cache entries older than 90 days.
+source_notes <- function(ctx) {
+  notes <- list()
+  note <- function(line, name, message) {
+    notes[[length(notes) + 1L]] <<- list(kind = "note", file = ctx$file, line = line, name = name,
+                                          source = NA_character_, columns = character(), message = message)
+  }
+  for (nm in names(ctx$unresolved)) {
+    u <- ctx$unresolved[[nm]]
+    if (!isTRUE(u$used)) next
+    keys <- u$keys[!(u$keys %in% names(ctx$schemas))]
+    key <- if (length(keys)) keys[[1L]] else if (length(u$keys)) u$keys[[1L]] else nm
+    note(u$line, nm, sprintf(
+      "'%s' comes from a source the checker cannot open (%s); no cached schema for key \"%s\", so column names downstream are not checked. Learn it once: r-colcheck learn \"%s\" '%s'",
+      nm, u$expr, key, key, gsub("'", "'\\\\''", u$expr)))
+  }
+  # Age is only worth mentioning when it could explain a finding: a column
+  # reported against an old entry may be a column the data has since gained.
+  cited <- unique(vapply(ctx$findings, function(f) f$source %||% "", ""))
+  for (key in names(ctx$stale)) {
+    s <- ctx$stale[[key]]
+    if (!any(startsWith(cited, sprintf("cached schema \"%s\"", key)))) next
+    note(s$line, key, sprintf(
+      "the findings above for \"%s\" rely on a cached schema %d days old (observed %s); if the data gained those columns, refresh it: r-colcheck learn \"%s\" '<expr>'",
+      key, s$days, s$observed, key))
+  }
+  notes
 }
 
 colcheck_files <- function(files, root = NULL) {

@@ -60,7 +60,7 @@ If a step fails, see [Troubleshooting](#troubleshooting).
 
 Nothing to do: the skill tells Claude when to use the LSP tool and what each answer covers, the hooks add context on their own, and the two shell tools are on Claude's `PATH`. The pieces you can ask for by name:
 
-- `r-colcheck path/to/file.R` — column names in tidyverse code vs the data the file reads (also runs after every `.R` edit).
+- `r-colcheck path/to/file.R` — column names in tidyverse code vs the data the file reads (also runs after every `.R` edit). `r-colcheck learn KEY 'EXPR'` caches the column names of data the checker cannot open (S3, databases) so those pipelines are checked too.
 - `r-lsp-status` — recent index events for this project.
 
 Environment variables, set in the shell that starts Claude Code: `R_LSP_AGENT_LINTERS=false` to use lintr's default rules instead of the plugin's profile; `R_LSP_INDEX_WAIT=<seconds>` to change how long cross-file answers wait for indexing (default 30); `R_LSP_STATUS_FILE=<path>` to move the status log.
@@ -81,7 +81,7 @@ r-lsp/
 │       ├── bin/
 │       │   ├── r-lsp-wrapper   # Starts the server (environment, lint profile)
 │       │   ├── r-lsp-server.R  # The server with the plugin's patches
-│       │   ├── r-colcheck      # Column names vs the data a script reads
+│       │   ├── r-colcheck      # Column names vs the data a script reads; `learn` fills the schema cache
 │       │   └── r-lsp-status    # Recent index events for this project
 │       ├── hooks/              # SessionStart context + pre-warm, post-edit and post-LSP notes
 │       ├── monitors/           # Streams index events to Claude
@@ -137,7 +137,21 @@ Column names inside `mutate()`, `filter()`, `summarise()`, `select()` and `aes()
 R/analysis.R:20: 'regoin' is not a column at this point (columns: region, year, amount, customer; data from sales.csv)
 ```
 
-It stays silent whenever it cannot be sure: an unresolvable source (database, function argument, API), or a step that makes the set unknowable (`across()`, tidyselect helpers, `pivot_wider()`, `clean_names()`, joins to unknown frames, user functions). On a fixture of 9 planted column bugs and 35 correct lines using `{{ }}`, `.data`, `across()`, `glue`, `case_when()`, joins and pivots, it reports the 9 and nothing else; on dplyr's own 191 source files it reports nothing. The post-edit hook runs it after every `.R` edit (about 1 s). For data the code does not read from a file, the skill tells Claude how to get real names from a running session or a targets store.
+It stays silent whenever it cannot be sure: a function argument, or a step that makes the set unknowable (`across()`, tidyselect helpers, `pivot_wider()`, `clean_names()`, joins to unknown frames, user functions). On a fixture of 9 planted column bugs and 35 correct lines using `{{ }}`, `.data`, `across()`, `glue`, `case_when()`, joins and pivots, it reports the 9 and nothing else; on dplyr's own 191 source files it reports no column findings. The post-edit hook runs it after every `.R` edit (about 1 s).
+
+### Data that is not a local file: the schema cache
+
+Most real data is not a CSV next to the script: it comes from S3, a database or a project's own loader (`returns <- s3_read("returns/monthly")`), through functions the checker cannot know. For those it uses a schema cache, `.colcheck/schemas.json`, a snapshot of observed column names keyed by the string the code passes to its loader (an S3 key, a URI, a dataset name). The checker is reader-agnostic: it matches any string literal in the loader call against the cache, whatever the function is called, or a `# cols: KEY` comment on the assignment line when the call carries no key. Matching by variable name is deliberately not done, so a frame called `df` never picks up a cache entry by accident.
+
+The cache is filled on demand, never from a hook. When a frame comes from a source that is not cached and the code pipes it into verbs, the post-edit note names it and nothing downstream of it is checked; frames that are never used that way are not mentioned:
+
+```
+R/report.R:17: 'holdings' comes from a source the checker cannot open (s3_read("holdings/latest")); no cached schema for key "holdings/latest", so column names downstream are not checked. Learn it once: r-colcheck learn "holdings/latest" 's3_read("holdings/latest")'
+```
+
+`r-colcheck learn KEY 'EXPR' [--source FILE.R ...]` evaluates the loader expression once in the project, with renv active and the shell's credentials (it is the one r-colcheck command that does not run with `--vanilla`), and records names and types: arrow datasets give their schema without reading rows, data frames and lazy database tables give their names. `--source` loads the files that define the loader. Each entry keeps the expression, an observation timestamp and the method, which is what a later refresh needs. `r-colcheck schemas` lists the entries with their age; when findings rest on an entry older than 90 days, the note says so, since a column the data gained since then would look like a bug; `r-colcheck forget KEY` removes one. The skill tells Claude to learn a schema when it is about to write code against an unresolved frame, and to refresh one only on evidence: a reported column that certainly exists, or the user saying the data changed. Nothing refreshes on a timer.
+
+`learn` creates `.colcheck/` with its own `.gitignore` (`*`), so the cache stays local by default; delete that file to commit the cache and share it with the team.
 
 ## What this gives Claude Code
 

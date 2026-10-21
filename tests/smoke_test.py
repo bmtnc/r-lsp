@@ -321,7 +321,6 @@ def scenario_other_repository(s):
 
 def scenario_colcheck(s):
     """Column names in tidyverse code are checked against the data the code reads."""
-    require_packages("tidyverse")
     root = os.path.join(s.scratch, "columns")
     shutil.copytree(os.path.join(FIXTURES, "columns"), root)
     rscript('saveRDS(data.frame(id = 1:3, score = c(1, 2, 3)), "data/scores.rds")', cwd=root)
@@ -343,6 +342,73 @@ def scenario_colcheck(s):
     check("'amt'" in ctx and "regoin" in ctx, f"post-edit hook context missing findings:\n{ctx[:400]}")
     silent = run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": "/tmp/x.py"}})
     check(not silent.strip(), "post-edit hook spoke for a non-R file")
+
+
+def scenario_colcheck_cache(s):
+    """Data the checker cannot open (an S3-style loader) is checked through the
+    schema cache; unresolved frames are noted; `learn` fills the cache."""
+    root = os.path.join(s.scratch, "s3columns")
+    shutil.copytree(os.path.join(FIXTURES, "s3columns"), root)
+    tool = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-colcheck")
+    report = os.path.join(root, "R", "report.R")
+    with open(report) as f:
+        src = f.read().splitlines()
+    marked = lambda tag: {i for i, line in enumerate(src, 1) if line.rstrip().endswith(tag)}  # noqa: E731
+    bad, later, noted = marked("# bad"), marked("# bad-after-learn"), marked("# note")
+
+    def run_check():
+        out = subprocess.run([tool, "--root", root, report], capture_output=True, text=True, timeout=120).stdout
+        lines = [l for l in out.splitlines() if l.startswith("R/report.R:")]
+        columns = {int(l.split(":")[1]) for l in lines if "is not a column" in l}
+        notes = {int(l.split(":")[1]) for l in lines if "cannot open" in l}
+        return out, columns, notes
+
+    out, columns, notes = run_check()
+    check(bad <= columns, f"cache-backed check missed lines {sorted(bad - columns)}:\n{out}")
+    check(columns <= bad, f"cache-backed check flagged correct lines {sorted(columns - bad)}:\n{out}")
+    check(notes == noted, f"unresolved-source notes expected on {sorted(noted)}, got {sorted(notes)}:\n{out}")
+    check("days old" in out, f"no staleness note for the old cache entry:\n{out}")
+
+    learned = subprocess.run([tool, "learn", "holdings/latest", 's3_read("holdings/latest")',
+                              "--source", "R/loaders.R", "--root", root],
+                             capture_output=True, text=True, timeout=120)
+    check(learned.returncode == 0 and 'learned "holdings/latest": 3 columns' in learned.stdout,
+          f"learn failed:\n{learned.stdout}\n{learned.stderr}")
+    with open(os.path.join(root, ".colcheck", "schemas.json")) as f:
+        cache = json.load(f)
+    check([c["name"] for c in cache["holdings/latest"]["columns"]] == ["fund_id", "security", "weight"],
+          f"cache entry wrong: {cache.get('holdings/latest')}")
+    check(list(cache) == sorted(cache), "cache keys are not sorted")
+    out, columns, notes = run_check()
+    check(columns == bad | later, f"after learn expected {sorted(bad | later)}, got {sorted(columns)}:\n{out}")
+    check(not notes, f"unresolved note persists after learn:\n{out}")
+    listing = subprocess.run([tool, "schemas", "--root", root], capture_output=True, text=True, timeout=120).stdout
+    check("holdings/latest  3 columns" in listing, f"schemas listing unexpected:\n{listing}")
+
+    hook = os.path.join(REPO, "plugins", "r-lsp", "hooks", "post-edit.sh")
+    ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": report}, "cwd": root},
+                                env={"CLAUDE_PROJECT_DIR": root}))
+    check("'wieght'" in ctx and "r-colcheck learn" in ctx, f"post-edit hook context missing cache findings:\n{ctx[:600]}")
+
+    fresh = s.make_project("s3fresh", {"R/loaders.R": os.path.join(FIXTURES, "s3columns", "R", "loaders.R")})
+    first = subprocess.run([tool, "learn", "meta/funds", 's3_read("meta/funds")', "--source", "R/loaders.R"],
+                           cwd=os.path.join(fresh, "R"), capture_output=True, text=True, timeout=120)
+    check(first.returncode == 0, f"learn from a subdirectory failed:\n{first.stderr}")
+    gitignore = os.path.join(fresh, ".colcheck", ".gitignore")
+    check(os.path.exists(gitignore) and open(gitignore).read().strip() == "*",
+          "a new .colcheck/ directory did not get its own .gitignore")
+    check(os.path.exists(os.path.join(fresh, ".colcheck", "schemas.json")),
+          "learn run from a subdirectory did not write the cache at the project root")
+
+    # In a renv project, learn must run inside the project's .Rprofile so the
+    # loader sees the renv library (the checker itself runs with --vanilla).
+    renv_root = s.make_renv_project("s3renv", {"R/renv_probe.R": os.path.join(FIXTURES, "s3columns", "R", "renv_probe.R")})
+    probe = subprocess.run([tool, "learn", "probe", "probe()", "--source", "R/renv_probe.R", "--root", renv_root],
+                           capture_output=True, text=True, timeout=120)
+    check(probe.returncode == 0, f"learn in a renv project failed:\n{probe.stderr}")
+    with open(os.path.join(renv_root, ".colcheck", "schemas.json")) as f:
+        probe_cols = [c["name"] for c in json.load(f)["probe"]["columns"]]
+    check(probe_cols == ["renv_on"], f"learn ran without renv active: columns {probe_cols}")
 
 
 def scenario_hooks(s):
@@ -379,7 +445,7 @@ def scenario_hooks(s):
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,
              scenario_renv_old_lintr, scenario_renv_old_purrr,
              scenario_complete_answers, scenario_other_repository,
-             scenario_colcheck, scenario_hooks]
+             scenario_colcheck, scenario_colcheck_cache, scenario_hooks]
 
 
 def main():

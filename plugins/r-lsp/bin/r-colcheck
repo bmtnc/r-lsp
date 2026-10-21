@@ -1,6 +1,43 @@
 #!/bin/bash
 # r-colcheck [--json] [--root DIR] FILE.R ...
-# Check bare column names in tidyverse code against the real columns of the
-# data the code reads. See scripts/colcheck-lib.R for what is resolved.
+#   Check bare column names in tidyverse code against the real columns of the
+#   data the code reads. See scripts/colcheck-lib.R for what is resolved.
+#
+# r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--root DIR]
+# r-colcheck schemas [--root DIR]
+# r-colcheck forget KEY [--root DIR]
+#   The schema cache (.colcheck/schemas.json) for data the checker cannot
+#   open: S3 objects, databases, project loaders. `learn` evaluates EXPR in
+#   the project (renv active, no --vanilla) and records the column names.
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+
+case "${1:-}" in
+  learn|schemas|forget)
+    cmd="$1"; shift
+    root=""
+    rest=()
+    while [ $# -gt 0 ]; do
+      if [ "$1" = "--root" ] && [ $# -ge 2 ]; then root="$2"; shift 2; continue; fi
+      rest+=("$1"); shift
+    done
+    if [ -z "$root" ]; then
+      # the project root: where .Rprofile (renv) and relative paths in EXPR live
+      root="${CLAUDE_PROJECT_DIR:-$PWD}"
+      d="$PWD"
+      while [ "$d" != "/" ]; do
+        if [ -e "$d/renv.lock" ] || [ -e "$d/DESCRIPTION" ] || [ -e "$d/.git" ] || [ -e "$d/.here" ] \
+           || [ -e "$d/_targets.R" ] || ls "$d"/*.Rproj >/dev/null 2>&1; then root="$d"; break; fi
+        d="$(dirname "$d")"
+      done
+    fi
+    cd "$root" || exit 1
+    # renv replaces the library path with the project library; the global
+    # libraries are appended afterwards so the plugin's own dependency
+    # (jsonlite) stays visible, as the server wrapper does.
+    R_LSP_GLOBAL_LIBS="$(Rscript --vanilla -e 'cat(.libPaths(), sep = ":")' 2>/dev/null)"
+    export R_LSP_GLOBAL_LIBS
+    exec Rscript "$here/../scripts/colcheck-learn.R" "$cmd" "${rest[@]}"
+    ;;
+esac
+
 exec Rscript --vanilla "$here/../scripts/r-colcheck.R" "$@"

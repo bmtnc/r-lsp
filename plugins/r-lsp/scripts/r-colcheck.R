@@ -12,9 +12,13 @@ if (length(args) >= 2L && args[[1L]] == "--root") {
 }
 if (!length(args)) {
   cat("usage: r-colcheck [--json] [--root DIR] FILE.R ...\n",
+      "       r-colcheck learn KEY 'EXPR' [--source FILE.R ...]\n",
+      "       r-colcheck schemas | forget KEY\n",
       "Reports bare column names in tidyverse pipelines that cannot exist, checked against the\n",
-      "columns of the data files the code reads (headers only). Silent when the data source\n",
-      "cannot be resolved statically.\n", sep = "")
+      "columns of the data files the code reads (headers only) or, for data it cannot open\n",
+      "(S3, databases, project loaders), against the schema cache .colcheck/schemas.json.\n",
+      "Frames from sources it cannot resolve are noted when they are piped into verbs; `learn`\n",
+      "evaluates the loader expression once, in the project, and caches the column names.\n", sep = "")
   quit(save = "no", status = 0)
 }
 findings <- colcheck_files(args, root)
