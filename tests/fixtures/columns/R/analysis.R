@@ -52,3 +52,9 @@ bad30 <- sales %>% mutate(across(c(amount), list(m = mean, s = sd))) %>% select(
 bad31 <- sales %>% transmute(across(c(region, amount), identity)) %>% select(year)                    # bad
 bad32 <- sales %>% summarise(across(c(amount, year), mean), .by = region) %>% mutate(zz = amuont)     # bad
 bad33 <- sales %>% mutate(pick(region, amount)) %>% select(regoin)                                    # bad
+bad34 <- bind_rows(sales, scores) %>% select(regoin)                                                  # bad
+bad35 <- sales %>% bind_rows(scores) %>% select(score, amount, idd)                                   # bad
+bad36 <- list(sales, scores) %>% bind_rows() %>% select(scoree)                                       # bad
+bad37 <- bind_rows(sales, scores, .id = "src") %>% select(srcc)                                       # bad
+bad38 <- rbind(sales, sales) %>% filter(amuont > 1)                                                   # bad
+bad39 <- sales %>% mutate(.src = "a") %>% select(.srcc, region)                                       # bad

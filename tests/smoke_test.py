@@ -467,6 +467,8 @@ def scenario_colcheck(s):
                             capture_output=True, text=True, timeout=120).stdout
     tricky_findings = [l for l in tricky.splitlines() if "is not a column" in l or "no argument" in l]
     check(not tricky_findings, f"r-colcheck flagged correct tricky code:\n{tricky}")
+    check("'b4' is known up to bind_rows(sales, unknown_frame)" in tricky and "one of the frames it binds is unknown" in tricky
+          and "'b5' is known up to" not in tricky, f"row-binding notes unexpected:\n{tricky}")
     check("'k' is known up to" not in tricky
           and "'k24' is known up to summarise(across(where(is.numeric), mean), .by = region)" in tricky
           and "cannot be worked out statically" in tricky, f"stop notes for summarise(across()) unexpected:\n{tricky}")

@@ -322,6 +322,64 @@ note_unresolved <- function(target, rhs, key, ctx) {
 }
 
 # Calls that combine or wrap frames rather than load them.
+# Row binding: the result has the union of its inputs' columns, in order of
+# first appearance, with the first input's grouping and source. bind_rows()
+# and rbind() take frames; list_rbind() and rbindlist() a list, which is
+# followed when it is a literal `list(a, b)` (a list held in a variable is
+# not a frame and stays unknown). An unknown input makes the result unknown,
+# since it may carry columns the others lack. bind_cols()/cbind() are not
+# here: they concatenate columns and rename duplicates.
+combining_calls <- c("bind_rows", "rbind", "list_rbind", "rbindlist")
+
+# Control arguments of the dplyr/tidyr verbs, which never name a column.
+control_args <- c(".by", ".keep", ".before", ".after", ".groups", ".add", ".drop", ".preserve", ".unpack",
+                  ".locale", ".by_group", ".keep_all", ".name_repair", ".id", ".default", ".fn", ".cols",
+                  ".names", ".fns", ".ptype", ".transform", ".remove", ".simplify", ".strict", ".sep",
+                  ".direction", ".data", ".env", ".order", ".method", ".fill", ".value", ".seed", ".weight",
+                  ".col", ".key", ".names_sep", ".names_repair", ".fill_value", ".funs", ".vars", ".predicate")
+id_args <- c(bind_rows = ".id", list_rbind = "names_to", rbindlist = "idcol")
+
+bound_rows <- function(call, first, ctx) {
+  fn <- call_name(call)
+  args <- call_args(call)
+  nms <- names(args) %||% rep("", length(args))
+  id_arg <- id_args[fn]
+  id <- NULL
+  if (!is.na(id_arg) && id_arg %in% nms) {
+    v <- args[[id_arg]]
+    id <- if (is.character(v) && length(v) == 1L) v else if (isTRUE(v) && fn == "rbindlist") ".id" else NULL
+    if (is.null(id)) return(NULL)   # a computed id column name
+  }
+  inputs <- args[!(nms %in% id_args)]
+  parts <- if (is.null(first)) list() else list(first)
+  for (a in inputs) {
+    cols <- input_frame(a, ctx)
+    if (is.null(cols)) return(NULL)
+    parts <- c(parts, list(cols))
+  }
+  if (!length(parts)) return(NULL)
+  out <- unique(c(id, unlist(lapply(parts, as.character))))
+  out <- keep_source(out, parts[[1L]])
+  attr(out, "groups") <- attr(parts[[1L]], "groups") %||% character()
+  if (any(vapply(parts, is_open, TRUE))) attr(out, "open") <- TRUE
+  out
+}
+
+# One input of a row binding: a frame expression, or a literal list of them.
+input_frame <- function(a, ctx) {
+  if (is.call(a) && identical(call_name(a), "list")) {
+    els <- call_args(a)
+    if (!length(els)) return(NULL)
+    parts <- lapply(els, function(el) as_frame(frame_columns(el, ctx, used = TRUE)))
+    if (any(vapply(parts, is.null, TRUE))) return(NULL)
+    out <- keep_source(unique(unlist(lapply(parts, as.character))), parts[[1L]])
+    attr(out, "groups") <- attr(parts[[1L]], "groups") %||% character()
+    if (any(vapply(parts, is_open, TRUE))) attr(out, "open") <- TRUE
+    return(out)
+  }
+  as_frame(frame_columns(a, ctx, used = TRUE))
+}
+
 not_loaders <- c("bind_rows", "bind_cols", "rbind", "cbind", "merge", "rbindlist", "tryCatch", "try",
                  "withCallingHandlers", "suppressWarnings", "suppressMessages", "switch", "if", "ifelse",
                  "c", "list", "paste", "paste0", "sprintf", "format", "as.Date", "as.numeric",
@@ -785,7 +843,14 @@ frame_columns <- function(e, ctx, used = FALSE) {
     rhs_def <- lookup_function(rhs, rhs_fn, ctx)
     # a cache entry for a piped helper, `df %>% clean()`, beats following its
     # code, as it does for the direct call `clean(df)`; verbs never match
-    cached <- if (!is.na(rhs_fn) && !(rhs_fn %in% verb_names)) cached_columns(rhs, ctx) else NULL
+    cached <- if (!is.na(rhs_fn) && !(rhs_fn %in% c(verb_names, combining_calls))) cached_columns(rhs, ctx) else NULL
+    if (!is.na(rhs_fn) && rhs_fn %in% combining_calls && is.null(rhs_def)) {
+      first <- input_frame(e[[2L]], ctx)
+      result <- if (is.null(first)) NULL else bound_rows(rhs, first, ctx)
+      record_step(ctx, rhs, result)
+      if (!is.null(first) && is.null(result)) note_stop(ctx, rhs, rhs_fn, NULL, reason = "one of the frames it binds is unknown, or its id column is computed")
+      return(result)
+    }
     lhs <- frame_columns(e[[2L]], ctx, used = used || rhs_fn %in% column_verbs || !is.null(rhs_def) || !is.null(cached))
     if (!is.null(cached)) return(cached)
     if (is.null(lhs)) {
@@ -855,6 +920,20 @@ frame_columns <- function(e, ctx, used = FALSE) {
   }
   if (fn %in% c("{", "(")) return(if (length(e) >= 2L) frame_columns(e[[length(e)]], ctx, used = used) else NULL)
   if (fn %in% c("function", "if", "for", "while", "repeat", "$", "@", "[", "[[")) return(NULL)
+  if (fn %in% combining_calls && is.null(lookup_function(e, fn, ctx))) {
+    args <- call_args(e)
+    nms <- names(args) %||% rep("", length(args))
+    inputs <- args[!(nms %in% id_args)]
+    if (!length(inputs)) return(NULL)
+    first <- input_frame(inputs[[1L]], ctx)
+    if (is.null(first)) return(NULL)
+    rest <- e
+    rest[[1L + which(!(nms %in% id_args))[[1L]]]] <- NULL   # the first input is resolved already
+    result <- bound_rows(rest, first, ctx)
+    record_step(ctx, e, result)
+    if (is.null(result)) note_stop(ctx, e, fn, NULL, reason = "one of the frames it binds is unknown, or its id column is computed")
+    return(result)
+  }
   # any other call: a cache entry matching one of its literals, or the line's
   # `# cols:`, is the user's own statement of what comes out and beats reading
   # the function (a loader's columns depend on its arguments, not its code)
@@ -1267,7 +1346,9 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
   args <- call_args(call)
   if (!piped && length(args)) args <- args[-1L]
   nms <- names(args) %||% rep("", length(args))
-  dot_args <- startsWith(nms, ".")
+  # the verbs' own control arguments; any other dotted name is a column
+  # (`mutate(.src = "a")` adds .src)
+  dot_args <- nms %in% control_args
   pos <- args[!nzchar(nms)]
   named <- args[nzchar(nms) & !dot_args]
   group_cols <- attr(cols, "groups") %||% character()
