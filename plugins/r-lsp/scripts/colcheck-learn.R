@@ -2,13 +2,17 @@
 # root WITHOUT --vanilla, so the project's .Rprofile (renv) applies and the
 # expression runs with the project's packages and the shell's AWS credentials.
 #
-#   r-colcheck learn KEY 'EXPR' [--source FILE.R ...]   evaluate EXPR, record its column names under KEY
+#   r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--load-all]
+#                                                        evaluate EXPR, record its column names under KEY
 #   r-colcheck schemas                                   list cached keys
 #   r-colcheck forget KEY                                drop one entry
 #
 # --source files are sourced for their definitions (loader helpers) before
 # EXPR is evaluated; pass files of function definitions, not scripts that run
-# a pipeline. The cache is <root>/.colcheck/schemas.json; the directory is
+# a pipeline. --load-all loads the package at the root with pkgload (as
+# devtools::load_all() does: its .onLoad runs, compiled code is built) and
+# evaluates EXPR inside its namespace, so the package's own functions and
+# its imports (`%>%` among them) resolve with no --source and no library(). The cache is <root>/.colcheck/schemas.json; the directory is
 # created with a .gitignore so the cache stays local unless that file is
 # deleted.
 
@@ -100,16 +104,28 @@ describe <- function(obj) {
 if (cmd == "learn") {
   sources <- character()
   positional <- character()
+  load_all <- FALSE
   i <- 1L
   while (i <= length(args)) {
     if (args[[i]] == "--source" && i < length(args)) { sources <- c(sources, args[[i + 1L]]); i <- i + 2L; next }
+    if (args[[i]] == "--load-all") { load_all <- TRUE; i <- i + 1L; next }
     positional <- c(positional, args[[i]])
     i <- i + 1L
   }
-  if (length(positional) != 2L) die("usage: r-colcheck learn KEY 'EXPR' [--source FILE.R ...]")
+  if (length(positional) != 2L) die("usage: r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--load-all]")
   key <- positional[[1L]]
   expr <- positional[[2L]]
   env <- new.env(parent = globalenv())
+  loaded <- NULL
+  if (load_all) {
+    if (!file.exists(file.path(root, "DESCRIPTION"))) die("--load-all needs a package: no DESCRIPTION at ", root)
+    if (!requireNamespace("pkgload", quietly = TRUE)) die("--load-all needs the pkgload package (install.packages(\"pkgload\"))")
+    loaded <- tryCatch(unname(read.dcf(file.path(root, "DESCRIPTION"), fields = "Package")[1L, 1L]),
+                       error = function(e) die("cannot read DESCRIPTION: ", conditionMessage(e)))
+    tryCatch(suppressMessages(pkgload::load_all(root, quiet = TRUE, export_all = TRUE)),
+             error = function(e) die("pkgload::load_all(\"", root, "\") failed: ", conditionMessage(e)))
+    env <- new.env(parent = asNamespace(loaded))
+  }
   for (f in sources) {
     if (!file.exists(f)) die("--source file not found: ", f)
     tryCatch(sys.source(f, envir = env), error = function(e) die("sourcing ", f, " failed: ", conditionMessage(e)))
@@ -127,6 +143,7 @@ if (cmd == "learn") {
   nested <- nested[!is.na(nested)]
   cat(sprintf("learned \"%s\": %d columns via %s -> %s", key, length(d$columns), d$method, rel_path),
       if (length(nested)) sprintf(" (inner columns recorded for list-column %s)", paste(nested, collapse = ", ")) else "",
+      if (!is.null(loaded)) sprintf(" (package %s loaded with pkgload)", loaded) else "",
       if (created) "\n.colcheck/ is gitignored (its own .gitignore); delete .colcheck/.gitignore to commit the cache." else "",
       "\n", sep = "")
   quit(save = "no", status = 0)

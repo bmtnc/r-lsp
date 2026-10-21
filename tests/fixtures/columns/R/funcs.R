@@ -72,3 +72,38 @@ op <- sales %>% opaque_fn()
 op |> filter(zz > 1)
 ws <- widen_src(sales)
 ws |> filter(zz > 1)
+
+# Column assertions. A helper that stops unless its input has certain
+# columns (a function named in .colcheck.json, stopifnot(), if-stop,
+# checkmate) states what the frame has from that line on: on a known frame
+# the names are checked; on an unknown one they are the frame's columns, an
+# open set (at least these) that closes at the first select()/transmute()/
+# summarise(), or the exact set when the assertion says so.
+require_columns <- function(df, column_names, exact = FALSE) invisible(df)
+cols_for <- function(kind) switch(kind, base = c("region", "amount"), full = c("region", "amount", "year"))
+asserted_select <- function(df) {
+  require_columns(df, c("region", "amount"))
+  df |> select(region, amount)
+}
+asserted_mutate <- function(df) {
+  req <- cols_for("base")
+  stopifnot(all(req %in% names(df)))
+  df |> mutate(amt2 = amount * 2)
+}
+asserted_exact <- function(df) {
+  if (!all(c("region", "amount") %in% names(df))) stop("missing columns")
+  require_columns(df, c("region", "amount"), exact = TRUE)
+  df |> filter(amount > 0)
+}
+asserted_checkmate <- function(df) {
+  checkmate::assert_names(names(df), must.include = cols_for("full"))
+  df |> transmute(region, year)
+}
+a1 <- asserted_select(unknown_input) |> filter(amuont > 1)                            # bad
+a2 <- asserted_mutate(unknown_input) |> filter(amt2 > 1, whatever > 1)
+a3 <- asserted_exact(unknown_input) |> filter(amuont > 1)                             # bad
+a4 <- asserted_checkmate(unknown_input) |> select(yeer)                               # bad
+a5 <- sales |> asserted_select() |> filter(amount > 1)
+require_columns(sales, c("region", "amuont"))                                         # bad
+stopifnot(all(c("region", "yeer") %in% names(sales)))                                 # bad
+stopifnot("needs its columns" = all(c("region", "amuont") %in% names(sales)))         # bad

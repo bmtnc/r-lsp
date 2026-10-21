@@ -13,7 +13,7 @@ if (length(args) >= 2L && args[[1L]] == "--root") {
 }
 if (!length(args)) {
   cat("usage: r-colcheck [--json] [--steps] [--root DIR] FILE.R ...\n",
-      "       r-colcheck learn KEY 'EXPR' [--source FILE.R ...]\n",
+      "       r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--load-all]\n",
       "       r-colcheck schemas | forget KEY\n",
       "Reports bare column names in tidyverse pipelines that cannot exist, checked against the\n",
       "columns of the data files the code reads (headers only) or, for data it cannot open\n",

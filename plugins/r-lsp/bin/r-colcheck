@@ -3,7 +3,7 @@
 #   Check bare column names in tidyverse code against the real columns of the
 #   data the code reads. See scripts/colcheck-lib.R for what is resolved.
 #
-# r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--root DIR]
+# r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--load-all] [--root DIR]
 # r-colcheck schemas [--root DIR]
 # r-colcheck forget KEY [--root DIR]
 #   The schema cache (.colcheck/schemas.json) for data the checker cannot

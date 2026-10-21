@@ -477,7 +477,8 @@ def scenario_colcheck(s):
     reported = {int(line.split(":")[1]) for line in out.splitlines()
                 if line.startswith("R/funcs.R:") and ("is not a column" in line or "no argument" in line)}
     with open(funcs) as f:
-        bad = {i for i, line in enumerate(f.read().splitlines(), 1) if line.rstrip().endswith("# bad")}
+        fsrc = f.read().splitlines()
+    bad = {i for i, line in enumerate(fsrc, 1) if line.rstrip().endswith("# bad")}
     check(bad <= reported, f"function tracking missed lines {sorted(bad - reported)}:\n{out}")
     check(reported <= bad, f"function tracking flagged correct lines {sorted(reported - bad)}:\n{out}")
     check("helpers_src.R" not in [l.split(":")[0] for l in out.splitlines()], f"findings attributed to the sourced helper file:\n{out}")
@@ -488,6 +489,11 @@ def scenario_colcheck(s):
           f"stop inside a followed function not reported at the call site:\n{out}")
     check("'op' is known up to opaque_fn()" in out and "following its code gave no column set" in out,
           f"direct call of an opaque project function got no note:\n{out}")
+    srcs = {int(l.split(":")[1]): l for l in out.splitlines() if l.startswith("R/funcs.R:") and "is not a column" in l}
+    a1 = [l for n, l in srcs.items() if "asserted_select(unknown_input)" in fsrc[n - 1]]
+    check(a1 and "the columns require_columns() requires on line" in a1[0], f"assertion-backed finding lacks its source:\n{out}")
+    steps = subprocess.run([tool, "--steps", "--root", root, funcs], capture_output=True, text=True, timeout=120).stdout
+    check("=> at least region, amount, amt2" in steps, f"open column set not shown in --steps:\n{steps}")
     ws_note = [l for l in out.splitlines() if "'ws' is known up to widen_src(sales)" in l]
     check(ws_note and "inside widen_src() at its pivot_wider(" in ws_note[0] and "(R/helpers_src.R:" not in ws_note[0],
           f"a one-expression helper in another file must get the note without a made-up line:\n{out}")
@@ -589,6 +595,33 @@ def scenario_colcheck_cache(s):
           f"cache entry lacks inner columns: {entry_cols}")
     listing = subprocess.run([tool, "schemas", "--root", root], capture_output=True, text=True, timeout=120).stdout
     check("holdings/latest  3 columns" in listing, f"schemas listing unexpected:\n{listing}")
+    # a literal inside a lambda is not a cache key
+    lam = os.path.join(root, "R", "lambda.R")
+    with open(lam, "w") as f:
+        f.write("library(magrittr)\n"
+                "x <- tibble::tibble(status = \"a\", r2 = 1)\n"
+                "y <- x %>% purrr::map_dfr(~ .x %>% dplyr::filter(status == \"holdings/latest\"))\n"
+                "y %>% dplyr::filter(zz == 1)\n"
+                "z <- x %>% unknown_helper(function(d) d %>% dplyr::filter(status == \"holdings/latest\"))\n"
+                "z %>% dplyr::filter(zz == 1)\n")
+    out = subprocess.run([tool, "--root", root, lam], capture_output=True, text=True, timeout=120).stdout
+    check("'zz'" not in out, f"a literal inside a lambda matched a cache key:\n{out}")
+    # --load-all: the package at the root is loaded, its imports resolve
+    pkg = s.make_package("loadall")
+    with open(os.path.join(pkg, "R", "make_table.R"), "w") as f:
+        f.write("make_table <- function() data.frame(a = 1, b = 2) %>% transform(c = a + b)\n")
+    with open(os.path.join(pkg, "NAMESPACE"), "a") as f:
+        f.write("importFrom(magrittr, \"%>%\")\n")
+    with open(os.path.join(pkg, "DESCRIPTION")) as f:
+        desc = f.read()
+    with open(os.path.join(pkg, "DESCRIPTION"), "w") as f:
+        f.write(desc.rstrip("\n") + "\nImports: magrittr\n")
+    la = subprocess.run([tool, "learn", "tbl", "make_table()", "--load-all", "--root", pkg],
+                        capture_output=True, text=True, timeout=180)
+    check(la.returncode == 0 and 'learned "tbl": 3 columns' in la.stdout and "loaded with pkgload" in la.stdout,
+          f"learn --load-all failed:\n{la.stdout}\n{la.stderr}")
+    bare = subprocess.run([tool, "learn", "tbl2", "make_table()", "--root", pkg], capture_output=True, text=True, timeout=180)
+    check(bare.returncode != 0, "learn without --load-all found the package function (test premise broken)")
 
     hook = os.path.join(REPO, "plugins", "r-lsp", "hooks", "post-edit.sh")
     ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": report}, "cwd": root},

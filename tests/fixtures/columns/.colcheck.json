@@ -1,0 +1,1 @@
+{"assertions": [{"fn": "require_columns", "frame": 1, "columns": 2, "exact": "exact"}]}
