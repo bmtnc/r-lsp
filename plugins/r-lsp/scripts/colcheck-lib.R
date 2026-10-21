@@ -177,6 +177,19 @@ pipeline_head <- function(e) {
   e
 }
 
+# The step at which a known frame became unknown: the first one in the
+# statement, with why. The note for the statement names this step instead of
+# walking back to the pipeline head and blaming a source that resolved.
+nesting_verbs <- c("unnest", "unnest_wider", "unnest_longer", "hoist")
+note_stop <- function(ctx, call, fn, def) {
+  if (!is.null(ctx$stopped) || !is.null(ctx$pkg_scope)) return(invisible())
+  reason <- if (!is.null(def) && !is.null(def$pkg)) "its code could not be read"
+    else if (fn %in% nesting_verbs) "the columns inside the list-column it expands are not known"
+    else "its output column names cannot be worked out statically"
+  ctx$stopped <- list(fn = fn, expr = paste(deparse(call), collapse = " "), line = ctx$line, reason = reason)
+  invisible()
+}
+
 # Remember that `target` came from a source the checker could not resolve,
 # when the source looks like a data loader (a reader, or a call carrying a
 # string literal such as an S3 key) or the line names a key that is not cached.
@@ -186,6 +199,15 @@ note_unresolved <- function(target, rhs, key, ctx) {
   if (isTRUE(ctx$in_function)) return(invisible())
   # tests build their data in place; nothing there is learnable
   if (grepl("(^|/)tests?/", relative_path(ctx$file, ctx$root))) return(invisible())
+  # the source resolved and a later step lost the columns: say which step
+  if (!is.null(ctx$stopped)) {
+    # used already when the pipeline went on past the stop in this statement
+    last_step <- if (is.call(rhs) && call_name(rhs) %in% c("%>%", "%<>%", "%T>%")) rhs[[3L]] else rhs
+    if (is.symbol(last_step)) last_step <- as.call(list(last_step))
+    went_on <- !identical(paste(deparse(last_step), collapse = " "), ctx$stopped$expr)
+    ctx$unresolved[[target]] <- list(line = ctx$line, keys = character(), stopped = ctx$stopped, used = went_on)
+    return(invisible())
+  }
   head <- pipeline_head(rhs)
   if (!is.call(head)) return(invisible())
   fn <- call_name(head)
@@ -414,8 +436,10 @@ call_user_function <- function(e, name, ctx, def = lookup_function(e, name, ctx)
   if (isTRUE(ctx$in_negative_test)) return(NULL)
   saved <- list(frames = ctx$frames, variables = ctx$variables, unknown = ctx$unknown_frames,
                 line = ctx$line, line_end = ctx$line_end, file = ctx$file, call_stack = ctx$call_stack,
-                call_sites = ctx$call_sites, in_function = ctx$in_function, pkg_scope = ctx$pkg_scope)
+                call_sites = ctx$call_sites, in_function = ctx$in_function, pkg_scope = ctx$pkg_scope,
+                stopped = ctx$stopped)
   result <- guarded(ctx, def$file, follow_function(e, def, ctx))
+  ctx$stopped <- saved$stopped
   ctx$frames <- saved$frames
   ctx$variables <- saved$variables
   ctx$unknown_frames <- saved$unknown
@@ -664,11 +688,12 @@ frame_columns <- function(e, ctx, used = FALSE) {
       return(NULL)
     }
     if (is_not_frame(lhs)) return(lhs)
-    if (!is.null(rhs_def)) {
+    result <- if (!is.null(rhs_def)) {
       ctx$frames[[".colcheck_lhs"]] <- lhs
-      return(call_user_function(pipe_into(rhs, as.name(".colcheck_lhs")), rhs_fn, ctx, def = rhs_def))
-    }
-    return(apply_verb(rhs, lhs, ctx, piped = TRUE))
+      call_user_function(pipe_into(rhs, as.name(".colcheck_lhs")), rhs_fn, ctx, def = rhs_def)
+    } else apply_verb(rhs, lhs, ctx, piped = TRUE)
+    if (is.null(result)) note_stop(ctx, rhs, rhs_fn, rhs_def)
+    return(result)
   }
   if (fn %in% readers) {
     path_arg <- if (length(e) >= 2L) e[[2L]] else NULL
@@ -702,7 +727,11 @@ frame_columns <- function(e, ctx, used = FALSE) {
     if (length(e) < 2L) return(NULL)
     inner <- frame_columns(e[[2L]], ctx, used = used || fn %in% column_verbs)
     if (is_not_frame(inner)) return(inner)
-    if (!is.null(inner)) return(apply_verb(e, inner, ctx, piped = FALSE))
+    if (!is.null(inner)) {
+      result <- apply_verb(e, inner, ctx, piped = FALSE)
+      if (is.null(result)) note_stop(ctx, e, fn, NULL)
+      return(result)
+    }
     count_step(ctx, "skipped", fn)
     return(NULL)
   }
@@ -1144,6 +1173,7 @@ walk_expr <- function(e, ctx) {
     key <- line_annotation(ctx)
     ctx$annotation <- key
     ctx$annotation_head <- pipeline_head(e[[3L]])
+    ctx$stopped <- NULL
     cols <- frame_columns(e[[3L]], ctx)
     # an annotation no source consumed (the right-hand side is a symbol or a
     # user function) still names the columns of the result
@@ -1288,6 +1318,13 @@ source_notes <- function(ctx) {
   for (nm in names(ctx$unresolved)) {
     u <- ctx$unresolved[[nm]]
     if (!isTRUE(u$used)) next
+    if (!is.null(u$stopped)) {
+      s <- u$stopped
+      note(u$line, nm, sprintf(
+        "'%s' is known up to %s on line %d, whose output columns the checker cannot work out (%s), so column names downstream are not checked. A `# cols: KEY` comment on this line covers it: learn KEY from an expression that returns the finished table.",
+        nm, s$expr, s$line, s$reason))
+      next
+    }
     if (!is.null(u$package_fn)) {
       learn_expr <- if (isTRUE(u$self_contained)) gsub("'", "'\\\\''", u$expr) else "<an expression that returns its table>"
       note(u$line, nm, sprintf(
