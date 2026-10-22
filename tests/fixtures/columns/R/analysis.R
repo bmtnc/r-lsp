@@ -65,3 +65,11 @@ bad43 <- lapply(split(sales, sales$region), function(d) d %>% select(region)) %>
 req2 <- c("region", "amuont")
 bad44 <- sales %>% select(all_of(req2))                                                                              # bad
 bad45 <- sales %>% split(.$region) %>% purrr::imap(~ .x %>% mutate(grp = .y)) %>% bind_rows() %>% select(grp, regoin)   # bad
+bad46 <- sales %>% select(starts_with("am")) %>% mutate(z = region)                                                  # bad
+bad47 <- sales %>% select(-contains("ount")) %>% mutate(z = amount)                                                  # bad
+bad48 <- sales %>% filter(sd > 0)                                                                                    # bad
+bad49 <- sales %>% summarise(across(starts_with("am"), mean), .by = region) %>% mutate(z = yeer)                    # bad
+bad50 <- bind_rows(sales, unknown_frame) %>% select(region) %>% mutate(z = regoin)                                   # bad
+bad51 <- sales %>% select(last_col()) %>% mutate(z = region)                                                         # bad
+bad52 <- sales %>% mutate(v = purrr::map_dbl(amuont, sd))                                                            # bad
+bad53 <- sales %>% mutate(z = sd)                                                                                    # bad

@@ -469,8 +469,24 @@ def scenario_colcheck(s):
     check(not tricky_findings, f"r-colcheck flagged correct tricky code:\n{tricky}")
     check("'s5' is known up to purrr::map(~.x %>% select(all_of(unknown_cols)))" in tricky and "inside its lambda at select(all_of(unknown_cols))" in tricky
           and "'s7' is known up to" not in tricky, f"lambda notes unexpected:\n{tricky}")
-    check("'b4' is known up to bind_rows(sales, unknown_frame)" in tricky and "one of the frames it binds is unknown" in tricky
-          and "'b5' is known up to" not in tricky, f"row-binding notes unexpected:\n{tricky}")
+    # one unknown input leaves the binding partly known; all unknown was never known: no note either way
+    check("'b4' is known up to" not in tricky and "'b5' is known up to" not in tricky
+          and "'b9' is known up to" not in tricky, f"row-binding notes unexpected:\n{tricky}")
+    tsteps = subprocess.run([tool, "--steps", "--root", root, os.path.join(root, "R", "tricky_ok.R")],
+                            capture_output=True, text=True, timeout=120)
+    check('select(starts_with("am"), region) => amount, region' in tsteps.stdout
+          and 'select(-contains("OUNT")) => region, year, customer' in tsteps.stdout
+          and 'select(matches("^(reg|cust)")) => region, customer' in tsteps.stdout
+          and 'bind_rows(sales, unknown_frame) => at least region, year, amount, customer' in tsteps.stdout,
+          f"tidyselect helpers or partial binding not expanded in --steps:\n{tsteps.stdout}")
+    check(" of " in tsteps.stderr and "on partly known columns" in tsteps.stderr, f"summary line lacks coverage:\n{tsteps.stderr}")
+    # usage, not an empty check, for --help, an unknown flag and a subcommand that does not exist
+    hp = subprocess.run([tool, "--help"], capture_output=True, text=True, timeout=60)
+    check(hp.returncode == 0 and hp.stdout.startswith("usage:") and "refresh" in hp.stdout, f"--help unexpected:\n{hp.stdout}{hp.stderr}")
+    for bad_args in (["list"], ["--nope", os.path.join(root, "R", "tricky_ok.R")]):
+        ua = subprocess.run([tool] + bad_args, capture_output=True, text=True, timeout=60)
+        check(ua.returncode == 2 and "usage:" in ua.stderr and ("no such file" in ua.stderr or "unknown option" in ua.stderr),
+              f"bad arguments {bad_args} did not print usage:\n{ua.stdout}{ua.stderr}")
     check("'k' is known up to" not in tricky
           and "'k24' is known up to summarise(across(where(is.numeric), mean), .by = region)" in tricky
           and "cannot be worked out statically" in tricky, f"stop notes for summarise(across()) unexpected:\n{tricky}")
@@ -527,7 +543,7 @@ def scenario_colcheck(s):
           any(l.startswith("R/calls.R:6:") and "takes 2 argument(s)" in l for l in lines) and len(lines) == 3,
           f"argument check unexpected:\n{run.stdout}")
     check(run.returncode == 1, f"r-colcheck exit code with findings was {run.returncode}")
-    check("1 pipeline step(s) checked" in run.stderr and "3 finding(s)" in run.stderr, f"summary line unexpected:\n{run.stderr}")
+    check("r-colcheck: 1 of " in run.stderr and "3 finding(s)" in run.stderr, f"summary line unexpected:\n{run.stderr}")
     clean = subprocess.run([tool, "--root", pkg, os.path.join(pkg, "R", "load.R")], capture_output=True, text=True, timeout=120)
     check(clean.returncode == 0 and not clean.stdout.strip() and "r-colcheck:" in clean.stderr,
           f"clean file: exit {clean.returncode}, stdout {clean.stdout!r}, stderr {clean.stderr!r}")
@@ -641,6 +657,34 @@ def scenario_colcheck_cache(s):
           f"learn --load-all failed:\n{la.stdout}\n{la.stderr}")
     bare = subprocess.run([tool, "learn", "tbl2", "make_table()", "--root", pkg], capture_output=True, text=True, timeout=180)
     check(bare.returncode != 0, "learn without --load-all found the package function (test premise broken)")
+    # refresh re-runs the stored expressions with the flags they were learned with
+    with open(os.path.join(pkg, ".colcheck", "schemas.json")) as f:
+        stored = json.load(f)
+    check(stored["tbl"].get("load_all") is True, f"learn did not record --load-all on the entry:\n{stored['tbl']}")
+    rf = subprocess.run([tool, "refresh", "--root", pkg], capture_output=True, text=True, timeout=180)
+    check(rf.returncode == 0 and 'unchanged "tbl": 3 columns' in rf.stdout and "refreshed 1 of 1" in rf.stdout,
+          f"refresh unexpected:\n{rf.stdout}{rf.stderr}")
+    st = subprocess.run([tool, "refresh", "--stale", "--root", pkg], capture_output=True, text=True, timeout=180)
+    check(st.returncode == 0 and "nothing to refresh" in st.stdout, f"refresh --stale on fresh entries unexpected:\n{st.stdout}{st.stderr}")
+    with open(os.path.join(pkg, "R", "make_table.R"), "w") as f:
+        f.write("make_table <- function() data.frame(a = 1, b = 2) %>% transform(c = a + b, d = 4)\n")
+    stored["broken"] = {"expr": "stop('boom')", "observed_at": "2020-01-01T00:00:00Z", "method": "data_frame",
+                        "columns": [{"name": "x", "type": "numeric"}]}
+    with open(os.path.join(pkg, ".colcheck", "schemas.json"), "w") as f:
+        json.dump(stored, f)
+    rf2 = subprocess.run([tool, "refresh", "--root", pkg], capture_output=True, text=True, timeout=180)
+    check(rf2.returncode == 1 and 'changed   "tbl": 4 columns, added d' in rf2.stdout
+          and 'failed    "broken": evaluating the expression failed: boom' in rf2.stdout
+          and "learn it again with its --load-all or --source flags" in rf2.stdout
+          and "refreshed 1 of 2: 1 changed, 0 unchanged, 1 failed" in rf2.stdout,
+          f"refresh with a change and a failure unexpected:\n{rf2.stdout}{rf2.stderr}")
+    with open(os.path.join(pkg, ".colcheck", "schemas.json")) as f:
+        after = json.load(f)
+    check([c["name"] for c in after["tbl"]["columns"]] == ["a", "b", "c", "d"] and after["tbl"].get("load_all") is True
+          and after["broken"]["observed_at"] == "2020-01-01T00:00:00Z",
+          f"refresh wrote the cache wrong:\n{after}")
+    one = subprocess.run([tool, "refresh", "nope", "--root", pkg], capture_output=True, text=True, timeout=180)
+    check(one.returncode == 1 and 'no cached schema for "nope"' in one.stderr, f"refresh of a missing key unexpected:\n{one.stderr}")
 
     hook = os.path.join(REPO, "plugins", "r-lsp", "hooks", "post-edit.sh")
     ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": report}, "cwd": root},
@@ -765,12 +809,12 @@ def scenario_colcheck_packages(s):
     # A self-contained package loader with a literal key keeps the learn suggestion.
     check("r-colcheck learn \"returns\" 'teamdata::fetch_table(Sys.Date(), \"returns\")'" in notes[12],
           f"uncached loader note lost its learn command:\n{notes[12]}")
-    check("23 pipeline step(s) checked" in out.stderr and "4 step(s) skipped" in out.stderr
+    check("23 of 27 pipeline step(s) checked" in out.stderr and "4 on unknown" in out.stderr
           and "checker error" not in out.stderr, f"summary unexpected:\n{out.stderr}")
     # Switched off, the package function is opaque and nothing after it is checked.
     off = subprocess.run([tool, "--json", "script/run.R"], cwd=root, capture_output=True, text=True, timeout=300,
                          env=dict(os.environ, R_LSP_COLCHECK_PACKAGES="false"))
-    check(off.returncode == 1 and "15 pipeline step(s) checked" in off.stderr,
+    check(off.returncode == 1 and "r-colcheck: 15 of " in off.stderr,
           f"R_LSP_COLCHECK_PACKAGES=false still followed the package function:\n{off.stderr}")
     off_cols = {(f["line"], f["name"]) for f in json.loads(off.stdout) if f["kind"] == "column"}
     check(off_cols == {(15, "regionn"), (21, "categry"), (23, "labell"), (28, "idd"), (32, "rr"), (33, "qq"), (34, "serie"), (36, "categry"), (38, "categry")},

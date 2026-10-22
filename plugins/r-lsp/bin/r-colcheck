@@ -4,15 +4,21 @@
 #   data the code reads. See scripts/colcheck-lib.R for what is resolved.
 #
 # r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--load-all] [--root DIR]
+# r-colcheck refresh [--stale] [KEY ...] [--root DIR]
 # r-colcheck schemas [--root DIR]
 # r-colcheck forget KEY [--root DIR]
 #   The schema cache (.colcheck/schemas.json) for data the checker cannot
 #   open: S3 objects, databases, project loaders. `learn` evaluates EXPR in
-#   the project (renv active, no --vanilla) and records the column names.
+#   the project (renv active, no --vanilla) and records the column names;
+#   `refresh` re-runs the cached expressions with the flags they were
+#   learned with.
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
 
 case "${1:-}" in
-  learn|schemas|forget)
+  help|--help|-h)
+    exec Rscript --vanilla "$here/../scripts/r-colcheck.R" --help
+    ;;
+  learn|refresh|schemas|forget)
     cmd="$1"; shift
     root=""
     rest=()

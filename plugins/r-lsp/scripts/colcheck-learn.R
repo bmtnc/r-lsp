@@ -4,6 +4,9 @@
 #
 #   r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--load-all]
 #                                                        evaluate EXPR, record its column names under KEY
+#   r-colcheck refresh [--stale] [KEY ...]               re-run the cached expressions (all, the stale
+#                                                        ones, or the keys given) with the flags they
+#                                                        were learned with; one failure does not stop the rest
 #   r-colcheck schemas                                   list cached keys
 #   r-colcheck forget KEY                                drop one entry
 #
@@ -52,10 +55,13 @@ write_cache <- function(s) {
   entries <- vapply(names(s), function(key) {
     e <- s[[key]]
     cols <- vapply(e$columns, function(cl) str(cl), "")
+    srcs <- as.character(unlist(e$sources))
     paste0("  ", str(key), ": {\n",
            "    \"expr\": ", str(e$expr), ",\n",
            "    \"observed_at\": ", str(e$observed_at), ",\n",
            "    \"method\": ", str(e$method), ",\n",
+           if (isTRUE(e$load_all)) "    \"load_all\": true,\n" else "",
+           if (length(srcs)) paste0("    \"sources\": ", str(I(srcs)), ",\n") else "",
            "    \"columns\": [\n      ", paste(cols, collapse = ",\n      "), "\n    ]\n  }")
   }, "")
   writeLines(paste0("{\n", paste(entries, collapse = ",\n"), "\n}"), path)
@@ -97,9 +103,42 @@ describe <- function(obj) {
   }
   nm <- quiet(colnames(obj))
   if (is.character(nm) && length(nm)) return(cols(nm, rep(NA_character_, length(nm)), "colnames"))
-  die("the expression returned ", paste(class(obj), collapse = "/"),
-      ", not a data frame, arrow dataset or lazy table")
+  stop("the expression returned ", paste(class(obj), collapse = "/"),
+       ", not a data frame, arrow dataset or lazy table")
 }
+
+# The package at the root, loaded with pkgload once per process; its name.
+loaded_package <- NULL
+load_package <- function() {
+  if (!is.null(loaded_package)) return(loaded_package)
+  if (!file.exists(file.path(root, "DESCRIPTION"))) stop("--load-all needs a package: no DESCRIPTION at ", root)
+  if (!requireNamespace("pkgload", quietly = TRUE)) stop("--load-all needs the pkgload package (install.packages(\"pkgload\"))")
+  pkg <- tryCatch(unname(read.dcf(file.path(root, "DESCRIPTION"), fields = "Package")[1L, 1L]),
+                  error = function(e) stop("cannot read DESCRIPTION: ", conditionMessage(e)))
+  tryCatch(suppressMessages(pkgload::load_all(root, quiet = TRUE, export_all = TRUE)),
+           error = function(e) stop("pkgload::load_all(\"", root, "\") failed: ", conditionMessage(e)))
+  loaded_package <<- pkg
+  pkg
+}
+
+# Evaluate one loader expression as `learn` does: in a fresh environment
+# under the package namespace (--load-all) or the global one, with the
+# --source files sourced first. Errors carry the stage that failed.
+observe <- function(expr, sources = character(), load_all = FALSE) {
+  env <- if (load_all) new.env(parent = asNamespace(load_package())) else new.env(parent = globalenv())
+  for (f in sources) {
+    if (!file.exists(f)) stop("--source file not found: ", f)
+    tryCatch(sys.source(f, envir = env), error = function(e) stop("sourcing ", f, " failed: ", conditionMessage(e)))
+  }
+  parsed <- tryCatch(parse(text = expr, keep.source = FALSE), error = function(e) stop("cannot parse expression: ", conditionMessage(e)))
+  if (!length(parsed)) stop("empty expression")
+  obj <- tryCatch(eval(parsed[[length(parsed)]], envir = env),
+                  error = function(e) stop("evaluating the expression failed: ", conditionMessage(e)))
+  describe(obj)
+}
+
+now <- function() format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+column_names <- function(cols) vapply(cols, function(cl) if (is.list(cl)) as.character(cl$name %||% "") else as.character(cl), "")
 
 if (cmd == "learn") {
   sources <- character()
@@ -115,29 +154,12 @@ if (cmd == "learn") {
   if (length(positional) != 2L) die("usage: r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--load-all]")
   key <- positional[[1L]]
   expr <- positional[[2L]]
-  env <- new.env(parent = globalenv())
-  loaded <- NULL
-  if (load_all) {
-    if (!file.exists(file.path(root, "DESCRIPTION"))) die("--load-all needs a package: no DESCRIPTION at ", root)
-    if (!requireNamespace("pkgload", quietly = TRUE)) die("--load-all needs the pkgload package (install.packages(\"pkgload\"))")
-    loaded <- tryCatch(unname(read.dcf(file.path(root, "DESCRIPTION"), fields = "Package")[1L, 1L]),
-                       error = function(e) die("cannot read DESCRIPTION: ", conditionMessage(e)))
-    tryCatch(suppressMessages(pkgload::load_all(root, quiet = TRUE, export_all = TRUE)),
-             error = function(e) die("pkgload::load_all(\"", root, "\") failed: ", conditionMessage(e)))
-    env <- new.env(parent = asNamespace(loaded))
-  }
-  for (f in sources) {
-    if (!file.exists(f)) die("--source file not found: ", f)
-    tryCatch(sys.source(f, envir = env), error = function(e) die("sourcing ", f, " failed: ", conditionMessage(e)))
-  }
-  parsed <- tryCatch(parse(text = expr, keep.source = FALSE), error = function(e) die("cannot parse expression: ", conditionMessage(e)))
-  if (!length(parsed)) die("empty expression")
-  obj <- tryCatch(eval(parsed[[length(parsed)]], envir = env),
-                  error = function(e) die("evaluating the expression failed: ", conditionMessage(e)))
-  d <- describe(obj)
+  d <- tryCatch(observe(expr, sources, load_all), error = function(e) die(conditionMessage(e)))
+  loaded <- loaded_package
   s <- read_cache()
-  s[[key]] <- list(expr = expr, observed_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
-                   method = d$method, columns = unname(d$columns))
+  # the flags travel with the entry, so `refresh` can run it the same way
+  s[[key]] <- c(list(expr = expr, observed_at = now(), method = d$method, columns = unname(d$columns)),
+                if (load_all) list(load_all = TRUE), if (length(sources)) list(sources = sources))
   created <- write_cache(s)
   nested <- vapply(d$columns, function(cl) if (!is.null(cl$inner)) cl$name else NA_character_, "")
   nested <- nested[!is.na(nested)]
@@ -147,6 +169,57 @@ if (cmd == "learn") {
       if (created) "\n.colcheck/ is gitignored (its own .gitignore); delete .colcheck/.gitignore to commit the cache." else "",
       "\n", sep = "")
   quit(save = "no", status = 0)
+}
+
+if (cmd == "refresh") {
+  stale_only <- "--stale" %in% args
+  keys <- setdiff(args, "--stale")
+  if (any(startsWith(keys, "-"))) die("usage: r-colcheck refresh [--stale] [KEY ...]")
+  s <- read_cache()
+  if (!length(s)) die("no cached schemas (", rel_path, " not found or empty)")
+  if (length(keys)) {
+    missing <- keys[!(keys %in% names(s))]
+    if (length(missing)) die("no cached schema for ", paste0("\"", missing, "\"", collapse = ", "))
+  } else keys <- names(s)
+  if (stale_only) {
+    age <- vapply(keys, function(k) {
+      a <- quiet(as.integer(Sys.Date() - as.Date(substr(as.character(s[[k]]$observed_at %||% ""), 1L, 10L))))
+      if (is.null(a) || is.na(a)) 91L else a
+    }, 1L)
+    keys <- keys[age > 90L]
+  }
+  if (!length(keys)) { cat("nothing to refresh\n"); quit(save = "no", status = 0) }
+  failed <- 0L
+  changed <- 0L
+  for (key in keys) {
+    e <- s[[key]]
+    srcs <- as.character(unlist(e$sources))
+    d <- tryCatch(observe(e$expr, srcs, isTRUE(e$load_all)), error = function(err) err)
+    if (inherits(d, "error")) {
+      failed <- failed + 1L
+      cat(sprintf("failed    \"%s\": %s%s\n", key, conditionMessage(d),
+                  if (is.null(e$load_all) && is.null(e$sources))
+                    " (learned before the flags were recorded? learn it again with its --load-all or --source flags)" else ""))
+      next
+    }
+    old <- column_names(e$columns)
+    new <- column_names(d$columns)
+    added <- setdiff(new, old)
+    dropped <- setdiff(old, new)
+    s[[key]] <- c(list(expr = e$expr, observed_at = now(), method = d$method, columns = unname(d$columns)),
+                  if (isTRUE(e$load_all)) list(load_all = TRUE), if (length(srcs)) list(sources = srcs))
+    if (length(added) || length(dropped)) {
+      changed <- changed + 1L
+      cat(sprintf("changed   \"%s\": %d columns%s%s\n", key, length(new),
+                  if (length(added)) paste0(", added ", paste(added, collapse = ", ")) else "",
+                  if (length(dropped)) paste0(", dropped ", paste(dropped, collapse = ", ")) else ""))
+    } else cat(sprintf("unchanged \"%s\": %d columns\n", key, length(new)))
+  }
+  write_cache(s)
+  cat(sprintf("refreshed %d of %d: %d changed, %d unchanged, %d failed -> %s%s\n", length(keys) - failed, length(keys),
+              changed, length(keys) - failed - changed, failed, rel_path,
+              if (!is.null(loaded_package)) sprintf(" (package %s loaded with pkgload)", loaded_package) else ""))
+  quit(save = "no", status = if (failed) 1L else 0L)
 }
 
 if (cmd == "schemas") {
