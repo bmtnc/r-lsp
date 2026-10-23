@@ -784,7 +784,7 @@ def scenario_colmap(s):
     fates_root = os.path.join(FIXTURES, "colmap")
     fates = run(cwd=fates_root)
     head = fates.splitlines()[0]
-    check("r-colmap: 6 data sources read by 7 files" in head and "function parameters used as frames" in head
+    check("r-colmap: 10 data sources read by 9 files" in head and "function parameters used as frames" in head
           and "\"no use seen\" means none in the steps followed" in fates.splitlines()[1], f"colmap fates header unexpected:\n{fates[:600]}")
     # created in a callee, read in a caller the checker followed: a use, across files
     check("  rolling_12m_value_add at R/panel.R:3 (dplyr::mutate); used 1 time" in fates, f"cross-function use missing:\n{fates}")
@@ -816,6 +816,11 @@ def scenario_colmap(s):
           and "  amount               never named by the code; returned by join_users() at R/literal_join.R:10" in fates
           and "  joined from tribble() literal at R/literal_join.R:6 at R/literal_join.R:10 (dplyr::left_join):\n  user_name            used 1 time" in fates,
           f"literal sources unexpected:\n{fates}")
+    # (issue 3) a column made on the y side before a join is carried, not dead; a test's literal is named by the test's line
+    check("  score                at R/yside.R:2 (dplyr::mutate); carried into tribble() literal at R/yside.R:4 at R/yside.R:5 (dplyr::left_join)" in fates
+          and "tribble() literal at tests/testthat/test-rename_join.R:1   first used at R/rename_join.R:2   2 columns: user_id, name" in fates
+          and "  user_name            at R/rename_join.R:2 (dplyr::rename); carried into tribble() literal at tests/testthat/test-rename_join.R:9 at R/rename_join.R:4 (dplyr::left_join)" in fates
+          and "tribble() literal at R/rename_join.R" not in fates, f"y-side and test-literal handling unexpected:\n{fates}")
     one = run("userLastName", cwd=fates_root)
     check("carried into another frame at R/panel.R:13" in one and "then returned by with_users() at R/panel.R:13" in one,
           f"column lookup with fates unexpected:\n{one}")

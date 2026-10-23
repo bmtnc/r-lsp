@@ -54,10 +54,12 @@ colmap_build <- function(root, files = NULL) {
     # one literal is one source: tibble() at R/a.R:3 and tibble() at R/b.R:9 differ
     if (!is.null(line) && !is.na(line) && grepl(" literal$", key)) sprintf("%s at %s:%d", key, relative_path(file, root), line) else key
   }
+  # the file the literal is in: not the step's file when a test's frame was followed into R/
+  literal_file <- function(file, step_file) if (!is.null(file) && !is.na(file)) file else step_file
   for (s in attr(findings, "steps")) {
     src <- s$source
     if (is.null(src) || is.na(src) || !nzchar(src)) next
-    key <- literal_key(source_key(src), s$file, s$source_line)
+    key <- literal_key(source_key(src), literal_file(s$source_file, s$file), s$source_line)
     loc <- sprintf("%s:%d", relative_path(s$file, root), s$line)
     entry <- entry_for(key, loc, s$file)
     # the loader's columns: the input of the first step that has one (a
@@ -101,7 +103,7 @@ colmap_build <- function(root, files = NULL) {
       }
     }
     if (length(brought)) {
-      from <- if (!is.null(s$joined$source)) literal_key(source_key(s$joined$source), s$file, s$joined$source_line) else NULL
+      from <- if (!is.null(s$joined$source)) literal_key(source_key(s$joined$source), literal_file(s$joined$source_file, s$file), s$joined$source_line) else NULL
       for (cn in brought) add(cn, "joined", from = from %||% "another frame")
       if (!is.null(from)) {
         # the other frame's own entry: its keys were read here, its other
@@ -182,6 +184,10 @@ column_fates <- function(src, cn) Filter(function(f) cn %in% f$columns, src$fate
 use_verdict <- function(src, cn, sites, unused = "no use seen in the steps followed") {
   read <- Filter(function(x) x$kind == "used", sites)
   if (length(read)) return(sprintf("; used %d %s", length(read), if (length(read) == 1L) "time" else "times"))
+  # a column made on the y side and carried into the join's result: its uses are under that result
+  carried <- Filter(function(x) x$kind == "carried", sites)
+  if (length(carried)) return(sprintf("; carried into %s at %s", paste(unique(vapply(carried, `[[`, "", "into")), collapse = " and "),
+                                      paste(head(unique(vapply(carried, site_short, "")), 3L), collapse = ", ")))
   fates <- column_fates(src, cn)
   paste0("; ", unused, "; ",
          if (length(fates)) paste(vapply(head(fates, 3L), fate_short, ""), collapse = ", ")

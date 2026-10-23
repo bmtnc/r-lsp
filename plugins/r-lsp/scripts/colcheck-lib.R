@@ -1414,7 +1414,8 @@ builtin_dataset <- function(nm, ctx) {
 
 keep_source <- function(cols, template) {
   attr(cols, "source") <- attr(template, "source")
-  attr(cols, "source_line") <- attr(template, "source_line")   # a literal is named by its line in the data map
+  attr(cols, "source_line") <- attr(template, "source_line")   # a literal is named by its file and line in the data map
+  attr(cols, "source_file") <- attr(template, "source_file")
   attr(cols, "inner") <- attr(template, "inner")
   attr(cols, "open") <- attr(template, "open")
   cols
@@ -1557,6 +1558,7 @@ frame_columns <- function(e, ctx, used = FALSE) {
     cols <- nms
     attr(cols, "source") <- paste0(fn, "() literal")
     attr(cols, "source_line") <- ctx$line
+    attr(cols, "source_file") <- ctx$file   # a literal in a test, followed into R/, is still named by the test's line
     # data = list(tibble(d = 1, r = 2)): the inner columns of a list-column
     inner <- list()
     for (i in seq_along(nms)) {
@@ -1578,6 +1580,7 @@ frame_columns <- function(e, ctx, used = FALSE) {
     if (!length(cols)) return(NULL)
     attr(cols, "source") <- "tribble() literal"
     attr(cols, "source_line") <- ctx$line
+    attr(cols, "source_file") <- ctx$file   # a literal in a test, followed into R/, is still named by the test's line
     return(cols)
   }
   # native pipe is parsed into nested calls: verb(frame_expr, ...); a ggplot
@@ -2236,7 +2239,8 @@ record_step <- function(ctx, call, cols, before = NULL, used = character(), fate
     listed = is_listed(cols),
     groups = if (anyNA(groups)) NULL else as.character(groups),
     source = attr(cols, "source") %||% attr(before, "source") %||% NA_character_,
-    source_line = attr(cols, "source_line") %||% attr(before, "source_line") %||% NA_integer_)
+    source_line = attr(cols, "source_line") %||% attr(before, "source_line") %||% NA_integer_,
+    source_file = attr(cols, "source_file") %||% attr(before, "source_file") %||% NA_character_)
   invisible()
 }
 
@@ -2643,6 +2647,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     sfx <- if (!is.null(args[["suffix"]])) string_vector(args[["suffix"]], ctx) else c(".x", ".y")
     x_suffixed <- if (!is.null(keys) && length(sfx) == 2L) paste0(setdiff(as.character(cols), keys$x), sfx[[1L]]) else character()
     ctx$joined_now <- list(source = attr(other, "source"), source_line = attr(other, "source_line"),
+                           source_file = attr(other, "source_file"),
                            columns = as.character(other), keys = keys$y %||% character(),
                            brought = setdiff(setdiff(as.character(joined), as.character(cols)), x_suffixed))
     return(joined)

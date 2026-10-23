@@ -2,6 +2,12 @@
 
 One entry per release, newest first. The version is the one in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`; each release is a commit whose subject starts with the version, tagged `vX.Y.Z` by the maintainer (a cloud session cannot push tags). The commit message carries the full account; this file carries the headline.
 
+## 1.9.2 (2026-10-23)
+
+Two r-colmap fixes (issue #3): a column created on the y side before a join read "no later step carries it", and a literal passed from a test into a package function was labelled with the callee's file.
+- A column a join carries out of its frame says "carried into <result> at FILE:LINE (left_join)" under its own source, whether it came with the data or the code made it there; its uses are under the result's "joined from" block.
+- A literal is named by the file it is in as well as its line, so a `tribble()` in `tests/testthat/test-f.R` followed into `R/f.R` reads `tests/testthat/test-f.R:9`, not `R/f.R:9`.
+
 ## 1.9.1 (2026-10-23)
 
 Two r-colmap fixes from the first reports on 1.9.0 (issues #1 and #2): a join of two parameters where y went through a verb first crashed the whole map, and a literal lost its line after the first verb, so later uses, writes and returns landed in a location-less "tribble() literal" source that merged unrelated frames.
