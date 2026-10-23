@@ -1,0 +1,13 @@
+---
+title: "Using pkgscope"
+---
+
+The prose mentions flag_missing() and that is not a call.
+
+```{r setup}
+library(pkgscope)
+```
+
+```{r}
+flagged <- flag_missing(c(1, NA))
+```

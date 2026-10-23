@@ -341,11 +341,14 @@ def scenario_shared_scope(s):
         incoming = []
         for _ in range(15):
             incoming = lsp.request("callHierarchy/incomingCalls", {"item": items[0]}).get("result") or [] if items else []
-            if len({i["from"]["uri"].rsplit("/", 1)[-1] for i in incoming}) >= 2:
+            if len({i["from"]["uri"].rsplit("/", 1)[-1] for i in incoming}) >= 3:
                 break
             time.sleep(1)
         outgoing = lsp.request("callHierarchy/outgoingCalls", {"item": items[0]}).get("result") or [] if items else []
-        refs = references(lsp, "R/flags.R", 3, 1)
+        ref_locs = lsp.request("textDocument/references", {
+            "textDocument": {"uri": lsp.uri("R/flags.R")}, "position": {"line": 3, "character": 1},
+            "context": {"includeDeclaration": True}}).get("result") or []
+        refs = [loc["uri"] for loc in ref_locs]
         # Hover and definition from the script into R/.
         lsp.open("scripts/run.R")
         hover = ""
@@ -360,17 +363,22 @@ def scenario_shared_scope(s):
     finally:
         lsp.close()
     callers = {i["from"]["uri"].rsplit("/", 1)[-1] for i in incoming}
-    check({"run.R", "test-flags.R"} <= callers,
-          f"incomingCalls missed callers in scripts/ or tests/ that nothing had opened: {sorted(callers)}")
+    check({"run.R", "test-flags.R", "usage.Rmd"} <= callers,
+          f"incomingCalls missed callers in scripts/, tests/ or vignettes/ that nothing had opened: {sorted(callers)}")
     ref_files = {u.rsplit("/", 1)[-1] for u in refs}
-    check({"run.R", "test-flags.R"} <= ref_files, f"references missed scripts/ or tests/: {sorted(ref_files)}")
+    check({"run.R", "test-flags.R", "usage.Rmd"} <= ref_files, f"references missed scripts/, tests/ or vignettes/: {sorted(ref_files)}")
+    # the vignette's chunk is referenced at its own line; its prose is not
+    rmd_lines = {loc["range"]["start"]["line"] + 1 for loc in ref_locs if loc["uri"].endswith("usage.Rmd")}
+    check(rmd_lines == {line_of(os.path.join(root, "vignettes", "usage.Rmd"), "flagged <- flag_missing")},
+          f"references in the vignette are not the chunk line only: {sorted(rmd_lines)}")
     called = {o["to"]["name"] for o in outgoing}
     check({"is.na", "sum", "as.character"} <= called,
           f"outgoingCalls dropped calls inside `!`, unary minus or a subscript: {sorted(called)}")
     check("flag_missing" in hover, f"hover from a script into R/ is empty (document scope not shared): {hover[:80]!r}")
     check(bool(defn) and "flags.R" in json.dumps(defn), f"definition from a script did not reach R/flags.R: {defn}")
     with open(status_file) as f:
-        check("test/script files as documents" in f.read(), "status log has no 'loaded ... test/script files' event")
+        check("loaded 2 test/script files as documents, plus 1 Rmd/qmd" in f.read(),
+              "status log has no 'loaded ... test/script files ..., plus 1 Rmd/qmd' event")
 
 
 def scenario_other_repository(s):
@@ -554,6 +562,26 @@ def scenario_colcheck(s):
     ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(pkg, "R", "calls.R")},
                                        "cwd": pkg}, env={"CLAUDE_PROJECT_DIR": pkg}))
     check("argument names do not match" in ctx and "no argument 'rows'" in ctx, f"post-edit hook missed argument findings:\n{ctx[:600]}")
+    # An R Markdown file: its chunks are checked at the file's own line
+    # numbers, prose and other engines are not, a broken chunk costs itself.
+    report = os.path.join(root, "report.Rmd")
+    with open(report, "w") as f:
+        f.write("---\ntitle: report\n---\n\nProse: sales %>% select(nonsense) is not code.\n\n"
+                "```{r setup}\nlibrary(tidyverse)\nsales <- read_csv(\"data/sales.csv\")\n```\n\n"
+                "```{python}\nsales.select(amt)\n```\n\n"
+                "```{r broken}\nsales %>% filter(\n```\n\n"
+                "```{r}\nsales %>% filter(amt > 0) # bad\nsales %>% select(region)\n```\n")
+    out = subprocess.run([tool, "--root", root, report], capture_output=True, text=True, timeout=120)
+    got = {int(l.split(":")[1]) for l in out.stdout.splitlines() if l.startswith("report.Rmd:") and "is not a column" in l}
+    chunk = line_of(report, "sales %>% filter(")
+    check(out.returncode == 1 and got == {line_of(report, "# bad")} and "nonsense" not in out.stdout,
+          f"Rmd chunks not checked at their own lines:\n{out.stdout}{out.stderr}")
+    check(f"report.Rmd:{chunk + 1}: the R chunk starting at line {chunk} does not parse ({chunk + 1}:0: unexpected end of input), so nothing in that chunk was checked" in out.stdout
+          and "did not parse" not in out.stderr, f"broken chunk not reported on its own:\n{out.stdout}{out.stderr}")
+    ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": report}, "cwd": root},
+                                env={"CLAUDE_PROJECT_DIR": root}))
+    check("'amt'" in ctx and "the R chunk starting at line" in ctx and "fix this first" in ctx,
+          f"post-edit hook context for an Rmd unexpected:\n{ctx[:600]}")
     # A file that does not parse is said so, by the CLI and by the hook.
     broken = os.path.join(root, "R", "broken.R")
     with open(broken, "w") as f:
@@ -894,7 +922,13 @@ def scenario_callmap(s):
                       "orphan <- function() {\n  \"nobody calls me\"\n}\n"),
         "tests/testthat/test-a.R": "test_that(\"outer_step works\", {\n  expect_equal(outer_step(1), 5)\n})\n",
         "scripts/run.R": "source(\"R/apply.R\")\nres <- run_all(list(1, 2))\nprint(res)\n",
-        "vignettes/intro.Rmd": "---\ntitle: x\n---\n\n```{r}\nouter_step(1)\n```\n",
+        # Chunks are read as knitr runs them: prose and a python chunk are not
+        # calls, a chunk that does not parse is skipped on its own, a function
+        # defined in a chunk belongs to the vignette.
+        "vignettes/intro.Rmd": ("---\ntitle: x\n---\n\nProse that mentions middle_step() and `inner_step(2)` is not a call.\n\n"
+                                "```{r setup, include=FALSE}\nlibrary(callmapfix)\n```\n\n```{python}\nouter_step(0)\n```\n\n"
+                                "```{r}\nouter_step(1)\n```\n\n```{r broken}\nmiddle_step(\n```\n\n"
+                                "```{r helpers}\nvig_helper <- function(x) inner_step(x)\nvig_helper(2)\n```\n"),
     }
     for rel, text in files.items():
         dest = os.path.join(root, rel)
@@ -911,8 +945,13 @@ def scenario_callmap(s):
     # From a subdirectory with no --root: the wrapper finds the package root.
     full = run(cwd=os.path.join(root, "R"))
     lines = full.splitlines()
-    check("static call map of" in lines[0] and "1 Rmd/qmd not parsed" in lines[0] and "11 functions in 5 files" in lines[0],
+    check("static call map of" in lines[0] and "12 functions in 6 files, 1 of them Rmd/qmd" in lines[0],
           f"header unexpected:\n{full[:600]}")
+    rmd = os.path.join(root, "vignettes", "intro.Rmd")
+    broken_chunk = line_of(rmd, "```{r broken}") + 1
+    check(any(l == f"Skipped: vignettes/intro.Rmd: the R chunk starting at line {broken_chunk} does not parse: "
+              f"{broken_chunk + 1}:0: unexpected end of input" for l in lines),
+          f"the broken chunk is not named as skipped:\n{full[:800]}")
 
     def def_line(rel, sig):
         loc = f"{rel}:{line_of(os.path.join(root, rel), sig.split('(')[0] + ' <- function')}"
@@ -928,11 +967,16 @@ def scenario_callmap(s):
     by_string = def_line("R/apply.R", "by_string(parts)")
     wrap = def_line("R/apply.R", "wrap(x, inner_step)")
     method = def_line("R/print.R", "print.myclass(x, ...)")
-    check("calls: middle_step" in outer and "[exported]" in outer and "called by: tests/testthat/test-a.R" in outer,
+    vig = def_line("vignettes/intro.Rmd", "vig_helper(x)")
+    check("calls: middle_step" in outer and "[exported]" in outer and "called by: tests/testthat/test-a.R, vignettes/intro.Rmd" in outer,
           f"outer_step line unexpected:\n{outer}")
-    check("calls: inner_step" in middle and "called by: outer_step" in middle and "[exported]" not in middle,
-          f"middle_step line unexpected:\n{middle}")
-    check("called by: middle_step" in inner and "wrap" not in inner, f"inner_step line unexpected (a parameter is not the function):\n{inner}")
+    check("calls: inner_step" in middle and "called by: outer_step" in middle and "[exported]" not in middle
+          and "intro.Rmd" not in middle, f"middle_step line unexpected (prose and a python chunk are not calls):\n{middle}")
+    check("called by: middle_step, vig_helper" in inner and "wrap" not in inner,
+          f"inner_step line unexpected (a parameter is not the function):\n{inner}")
+    check("calls: inner_step" in vig and "called by: vignettes/intro.Rmd" in vig, f"vignette-defined function unexpected:\n{vig}")
+    check(any(l.startswith("vignettes/intro.Rmd") and "top-level code calls: outer_step, vig_helper" in l for l in lines),
+          f"vignette heading unexpected:\n{full}")
     check("helper (as value)" in run_all and "by_string (by string)" in run_all and "[exported]" in run_all
           and "called by: scripts/run.R" in run_all, f"run_all line unexpected:\n{run_all}")
     check("run_all (as value)" in helper and "describe.myclass" in helper, f"helper line unexpected:\n{helper}")
@@ -944,10 +988,10 @@ def scenario_callmap(s):
           f"script heading unexpected:\n{full}")
     entry = full.split("Entry points (not called by any project function):")[1].split("Unreferenced")[0]
     unref = full.split("Unreferenced (no callers anywhere):")[1].split("\n\n")[0]
-    check("outer_step [exported]" in entry and "run_all [exported]" in entry and "middle_step" not in entry,
-          f"entry points unexpected:\n{entry}")
-    check("orphan" in unref and "wrap" in unref and "print.myclass" not in unref and "outer_step" not in unref,
-          f"unreferenced unexpected:\n{unref}")
+    check("outer_step [exported]" in entry and "run_all [exported]" in entry and "middle_step" not in entry
+          and "vig_helper" in entry, f"entry points unexpected:\n{entry}")
+    check("orphan" in unref and "wrap" in unref and "print.myclass" not in unref and "outer_step" not in unref
+          and "vig_helper" not in unref, f"unreferenced unexpected:\n{unref}")
     check("Recursion/cycles" not in full, f"cycles reported for an acyclic fixture:\n{full}")
 
     # Neighbourhood: callers two levels up, with call sites, and nothing unrelated.
@@ -960,20 +1004,25 @@ def scenario_callmap(s):
     check(f"    middle_step   R/chain.R:{mid_def}   (call at R/chain.R:{mid_call})" in body and
           f"      outer_step   R/chain.R:{top_def}   (call at R/chain.R:{top_call})" in body,
           f"neighbourhood callers unexpected:\n{near}")
-    for unrelated in ("helper", "run_all", "orphan", "wrap", "describe"):
+    for unrelated in ("run_all", "orphan", "wrap", "describe", " helper"):
         check(unrelated not in body, f"neighbourhood of inner_step mentions {unrelated}:\n{near}")
+    check(f"    vig_helper   vignettes/intro.Rmd:{line_of(rmd, 'vig_helper <- function')}   (call at vignettes/intro.Rmd:{line_of(rmd, 'vig_helper <- function')})" in body
+          and f"      vignettes/intro.Rmd:{line_of(rmd, 'vig_helper(2)')}   (top level)" in body,
+          f"neighbourhood callers in the vignette unexpected:\n{near}")
     missing = run("innr_step")
     check("not defined in the project" in missing and "inner_step" in missing, f"unknown name output unexpected:\n{missing}")
 
     data = json.loads(run("--json"))
     by_name = {d["name"]: d for d in data}
-    check(len(data) == 11 and by_name["outer_step"]["exported"] is True and by_name["print.myclass"]["kind"] == "s3_method",
+    check(len(data) == 12 and by_name["outer_step"]["exported"] is True and by_name["print.myclass"]["kind"] == "s3_method",
           f"JSON map unexpected:\n{json.dumps(data)[:800]}")
+    check({"by": "vignettes/intro.Rmd", "kind": "direct", "file": "vignettes/intro.Rmd", "line": line_of(rmd, "outer_step(1)")}
+          in by_name["outer_step"]["called_by"], f"JSON vignette call site unexpected:\n{json.dumps(by_name['outer_step'])}")
     check({"name": "helper", "kind": "value", "line": 2} in by_name["run_all"]["calls"] and
           any(c["by"] == "scripts/run.R" and c["line"] == 2 for c in by_name["run_all"]["called_by"]),
           f"JSON edges unexpected:\n{json.dumps(by_name['run_all'])}")
     sub = json.loads(run("--json", "inner_step"))
-    check(sorted(d["name"] for d in sub) == ["inner_step", "middle_step", "outer_step"], f"JSON neighbourhood unexpected:\n{sub}")
+    check(sorted(d["name"] for d in sub) == ["inner_step", "middle_step", "outer_step", "vig_helper"], f"JSON neighbourhood unexpected:\n{sub}")
 
 
 def scenario_hooks(s):

@@ -22,8 +22,9 @@
 #      (0.3.19 scoped each document to its package root or source() closure).
 #   6. Complete outgoing calls: skip the shallow-index shortcut that drops
 #      calls inside `!`, subscripts and `if` conditions (0.3.19+).
-#   7. Tests and scripts are loaded as documents at startup, like R/, so
-#      callers there are found without anything opening the file first.
+#   7. Tests, scripts and R Markdown/Quarto files are loaded as documents at
+#      startup, like R/, so callers there are found without anything opening
+#      the file first.
 #
 # Every patch is wrapped so that a languageserver release that renames an
 # internal disables that patch instead of stopping the server.
@@ -361,12 +362,16 @@ tryCatch({
   assignInNamespace("indexed_outgoing_calls", function(workspace, item) NULL, ns = "languageserver")
 }, error = function(e) message("r-lsp: full outgoing-calls patch disabled: ", conditionMessage(e)))
 
-# --- 7. tests and scripts are loaded, not only R/ ----------------------------
+# --- 7. tests, scripts and Rmd/qmd are loaded, not only R/ -------------------
 # The server fully parses a package's R/ files at startup and everything else
 # only when opened, so a caller in tests/ or scripts/ is invisible to
 # references and call hierarchy until something opens that file. Load every
 # other R file the index discovered (git-ignored ones excepted) as a document
-# too, up to R_LSP_LOAD_MAX files.
+# too, up to R_LSP_LOAD_MAX files. R Markdown and Quarto files are outside
+# the index altogether (it discovers **/*.R), so a vignette's calls were
+# invisible until something opened it: they are found here and loaded the
+# same way. Document reads the R chunks of a literate file itself, so
+# references and call hierarchy reach them as they reach a script.
 
 load_extra_max <- suppressWarnings(as.integer(Sys.getenv("R_LSP_LOAD_MAX", "600")))
 if (is.na(load_extra_max)) load_extra_max <- 600L
@@ -377,6 +382,23 @@ git_ignored <- function(root, paths) {
                                            input = paths, stdout = TRUE, stderr = FALSE)),
                   error = function(e) character())
   paths %in% as.character(out)
+}
+literate_files <- function(root) {
+  files <- list.files(root, pattern = "[.](Rmd|rmd|Rmarkdown|qmd)$", recursive = TRUE, full.names = TRUE)
+  files <- files[!grepl("/(renv|packrat|[.]git|[.]svn|[.]hg|[.]Rproj[.]user|[.]cache|node_modules|build|dist)/", files)]
+  files[!is.na(file.size(files)) & file.size(files) <= 2 * 1024^2]
+}
+# As load_index_document, without the index bookkeeping (the file is not in
+# the index); the parse task reads the chunks because the uri says .Rmd/.qmd.
+load_literate_document <- function(self, workspace, uri) {
+  if (!is.null(workspace$documents$get(uri, NULL))) return(invisible(NULL))
+  path <- ns$path_from_uri(uri)
+  content <- tryCatch(stringi::stri_read_lines(path), error = function(e) NULL)
+  if (is.null(content)) return(invisible(NULL))
+  doc <- ns$Document$new(uri, language = "rmd", version = NULL, content = content)
+  workspace$documents$set(uri, doc)
+  self$text_sync(uri, document = doc, parse = TRUE)
+  invisible(doc)
 }
 
 tryCatch({
@@ -392,18 +414,26 @@ tryCatch({
       idx <- workspace$index
       if (is.null(idx) || !isTRUE(idx$enabled)) return(invisible(NULL))
       uris <- setdiff(idx$files$keys(), idx$package_source_uris())
-      if (!length(uris)) return(invisible(NULL))
       paths <- vapply(uris, ns$path_from_uri, "")
       uris <- uris[!git_ignored(workspace$root, paths)]
-      total <- length(uris)
-      if (total > load_extra_max) uris <- head(uris, load_extra_max)
+      lit <- literate_files(workspace$root)
+      lit <- lit[!git_ignored(workspace$root, lit)]
+      lit_uris <- vapply(lit, ns$path_to_uri, "", USE.NAMES = FALSE)
+      total <- length(uris) + length(lit_uris)
+      if (!total) return(invisible(NULL))
+      # one budget for both, R files first
+      kept <- head(c(uris, lit_uris), load_extra_max)
+      uris <- uris[uris %in% kept]
+      lit_uris <- lit_uris[lit_uris %in% kept]
       for (uri in uris) {
         if (!idx$summaries$has(uri)) idx$update_path(ns$path_from_uri(uri))
         self$load_index_document(workspace, uri)
       }
-      assign(workspace$root %||% "", vapply(uris, ns$index_canonical_uri, ""), envir = extra_loaded)
-      status(sprintf("loaded %d test/script files as documents%s", length(uris),
-                     if (total > length(uris)) sprintf(" (of %d; raise R_LSP_LOAD_MAX for the rest)", total) else ""))
+      for (uri in lit_uris) load_literate_document(self, workspace, uri)
+      assign(workspace$root %||% "", vapply(c(uris, lit_uris), ns$index_canonical_uri, ""), envir = extra_loaded)
+      status(sprintf("loaded %d test/script files as documents%s%s", length(uris),
+                     if (length(lit_uris)) sprintf(", plus %d Rmd/qmd", length(lit_uris)) else "",
+                     if (total > length(kept)) sprintf(" (of %d; raise R_LSP_LOAD_MAX for the rest)", total) else ""))
     }, error = function(e) message("r-lsp: loading tests/scripts failed: ", conditionMessage(e)))
   }, overwrite = TRUE)
 

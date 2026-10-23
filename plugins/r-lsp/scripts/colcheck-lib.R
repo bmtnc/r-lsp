@@ -13,7 +13,8 @@
 # when smaller than 20 MB. The moment a step makes the column set unknowable
 # (across(), tidyselect helpers, pivot_wider(), clean_names(), joins to
 # unknown frames, user functions, ...) the frame is marked unknown and nothing
-# downstream is checked. Rmd/qmd files are skipped.
+# downstream is checked. R Markdown, Quarto and Sweave files are checked
+# chunk by chunk (parse_r_source()).
 #
 # Data the checker cannot open (S3 objects, databases, project loaders) is
 # covered by the schema cache, <root>/.colcheck/schemas.json, written by
@@ -67,6 +68,73 @@ error_findings <- function(ctx) {
     columns = character(),
     message = sprintf("r-colcheck hit an error %sand gave up on this statement (%s); nothing downstream of it is checked. This is a checker bug worth reporting; R_LSP_COLCHECK_DEBUG=1 shows where it happened.",
                       if (is.null(er$where)) "" else sprintf("while following %s() ", er$where), er$message)))
+}
+
+# --- literate files -----------------------------------------------------------
+# R Markdown, Quarto and Sweave: the R code lives in chunks. knitr runs each
+# chunk on its own, so each is parsed on its own, padded with blank lines so
+# that every srcref carries the file's own line numbers; one chunk that does
+# not parse costs that chunk, not the file.
+is_literate_file <- function(path) grepl("[.](Rmd|rmd|Rmarkdown|qmd|Rnw|rnw)$", path)
+
+# Body lines (1-based, inclusive) of every R chunk, as knitr delimits them:
+# a fence of three or more backticks (or tildes) with {r ...} up to a fence
+# of at least as many backticks on a line of its own, or, in Sweave, <<...>>=
+# up to @. Leading blanks and `>` are allowed on fences as knitr allows them,
+# and knitr strips that prefix from the chunk's lines (a chunk inside a block
+# quote), so `prefix` says what to strip. A chunk of another engine
+# ({python}, {sql}) is left out.
+literate_r_chunks <- function(lines) {
+  chunks <- list()
+  i <- 1L
+  n <- length(lines)
+  while (i <= n) {
+    m <- regmatches(lines[[i]], regexec("^[\t >]*(`{3,}|~{3,})[ \t]*\\{[ \t]*([A-Za-z0-9_]+)(?:[ \t,].*)?\\}[ \t]*$",
+                                        lines[[i]], perl = TRUE))[[1L]]
+    sweave <- !length(m) && grepl("^[ \t]*<<.*>>=", lines[[i]], perl = TRUE)
+    if (!length(m) && !sweave) { i <- i + 1L; next }
+    end_pat <- if (sweave) "^[ \t]*@[ \t]*(%.*)?$" else
+      sprintf("^[\t >]*%s{%d,}[ \t]*$", substr(m[[2L]], 1L, 1L), nchar(m[[2L]]))
+    j <- i + 1L
+    while (j <= n && !grepl(end_pat, lines[[j]], perl = TRUE)) j <- j + 1L
+    if (sweave || tolower(m[[3L]]) == "r") {
+      chunks[[length(chunks) + 1L]] <- list(start = i + 1L, end = j - 1L, prefix = if (sweave) "" else "^[\t >]*")
+    }
+    i <- j + 1L
+  }
+  chunks
+}
+
+# parse() for a project file: an .R file as is; a literate file chunk by
+# chunk. Returns list(exprs, lines, errors): exprs is an expression vector
+# whose "srcref" attribute gives each top-level expression's lines in the
+# file, lines the file's lines, errors a list of list(line, cond) for the
+# chunks that do not parse (line is the chunk's first body line). An .R file
+# that does not parse raises, as parse() does.
+parse_r_source <- function(path) {
+  if (!is_literate_file(path)) {
+    ex <- parse(path, keep.source = TRUE, encoding = "UTF-8")
+    return(list(exprs = ex, lines = attr(ex, "srcfile")$lines %||% readLines(path, warn = FALSE), errors = list()))
+  }
+  lines <- readLines(path, warn = FALSE, encoding = "UTF-8")
+  exprs <- list()
+  srcrefs <- list()
+  errors <- list()
+  for (ch in literate_r_chunks(lines)) {
+    if (ch$end < ch$start) next
+    text <- rep("", ch$end)
+    text[ch$start:ch$end] <- sub(ch$prefix, "", lines[ch$start:ch$end], perl = TRUE)
+    ex <- tryCatch(parse(text = text, keep.source = TRUE, encoding = "UTF-8"), error = function(e) e)
+    if (inherits(ex, "error")) {
+      errors[[length(errors) + 1L]] <- list(line = ch$start, cond = ex)
+      next
+    }
+    exprs <- c(exprs, as.list(ex))
+    srcrefs <- c(srcrefs, attr(ex, "srcref"))
+  }
+  out <- as.expression(exprs)
+  attr(out, "srcref") <- srcrefs
+  list(exprs = out, lines = lines, errors = errors)
 }
 
 colcheck_root <- function(path) {
@@ -2084,9 +2152,13 @@ colcheck_file <- function(file, root = NULL) {
   ctx$known_names <- c("TRUE", "FALSE", "NA", "NULL", "T", "F", "Inf", "NaN", ".", ".x", ".y", ".data", ".env",
                        "desc", "n", "everything", "where", "across", "pi", "letters", "LETTERS",
                        "month.name", "month.abb", "self", "private")
-  exprs <- tryCatch(suppressWarnings(parse(file, keep.source = TRUE)), error = function(err) err)
-  if (inherits(exprs, "error")) return(syntax_finding(file, exprs))
+  parsed <- tryCatch(suppressWarnings(parse_r_source(file)), error = function(err) err)
+  if (inherits(parsed, "error")) return(syntax_finding(file, parsed))
+  exprs <- parsed$exprs
   src <- attr(exprs, "srcref")
+  # A chunk of a literate file that does not parse: said in its own finding;
+  # the other chunks are checked.
+  for (e in parsed$errors) ctx$findings[[length(ctx$findings) + 1L]] <- syntax_finding(file, e$cond, chunk = e$line)[[1L]]
   ctx$functions <- project_functions(file, exprs, ctx)
   ctx$call_stack <- character()
   # Names assigned anywhere in the file count as variables: data masking falls back to the environment.
@@ -2112,15 +2184,17 @@ colcheck_file <- function(file, root = NULL) {
 # names, so that an agent that has just broken the file does not read the
 # checker's silence as "clean". The parser's message already carries
 # file:line:col, the offending line and a caret.
-syntax_finding <- function(file, err) {
+syntax_finding <- function(file, err, chunk = NULL) {
   msg <- conditionMessage(err)
   m <- regmatches(msg, regexec("^(?:.*?):(\\d+):(\\d+): *([^\n]*)", msg, perl = TRUE))[[1L]]
-  line <- if (length(m) >= 2L) as.integer(m[[2L]]) else 1L
+  line <- if (length(m) >= 2L) as.integer(m[[2L]]) else chunk %||% 1L
   what <- if (length(m) >= 4L) sprintf("%s:%s: %s", m[[2L]], m[[3L]], m[[4L]]) else strsplit(msg, "\n")[[1L]][[1L]]
   rest <- strsplit(msg, "\n")[[1L]][-1L]
   structure(list(list(
     kind = "syntax", file = file, line = line, name = NA_character_, source = NA_character_, columns = character(),
-    message = sprintf("this file does not parse (%s), so nothing in it was checked%s", what,
+    message = sprintf("%s does not parse (%s), so nothing in %s was checked%s",
+                      if (is.null(chunk)) "this file" else sprintf("the R chunk starting at line %d", chunk), what,
+                      if (is.null(chunk)) "it" else "that chunk",
                       if (length(rest)) paste0(":\n", paste(rest, collapse = "\n")) else ""))),
     stats = list(checked = 0L, partial = 0L, skipped = 0L, unparsed = 1L))
 }
@@ -2181,7 +2255,7 @@ colcheck_files <- function(files, root = NULL) {
   steps <- list()
   stats <- list(checked = 0L, partial = 0L, skipped = 0L, files = 0L, errors = 0L, unparsed = 0L)
   for (f in files) {
-    if (!file.exists(f) || grepl("[.](Rmd|rmd|qmd)$", f)) next
+    if (!file.exists(f)) next
     res <- tryCatch(colcheck_file(f, root), error = function(err) list(list(
       kind = "error", file = f, line = 1L, name = NA_character_, source = NA_character_, columns = character(),
       message = sprintf("r-colcheck could not check this file at all (%s). This is a checker bug worth reporting.",

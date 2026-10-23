@@ -11,7 +11,7 @@ have_callmap <- tryCatch({
 }, error = function(e) FALSE)
 found <- if (have_callmap) callmap_files(root) else {
   r <- list.files(root, pattern = "[.][Rr]$", recursive = TRUE, full.names = TRUE)
-  m <- list.files(root, pattern = "[.](Rmd|rmd|qmd)$", recursive = TRUE, full.names = TRUE)
+  m <- list.files(root, pattern = "[.](Rmd|rmd|Rmarkdown|qmd|Rnw|rnw)$", recursive = TRUE, full.names = TRUE)
   skip <- "/(renv|packrat|[.]git|node_modules)/"
   list(r = r[!grepl(skip, r)], rmd = m[!grepl(skip, m)])
 }
@@ -30,11 +30,11 @@ cache <- tryCatch(file.path(tools::R_user_dir("languageserver", "cache"), "works
 cat(sprintf("R LSP plugin: %s, %d R files (%d under tests/), %d Rmd/qmd%s. Index cache %s.\n",
   kind, length(rfiles), length(tests), length(rmd), if (renv) ", renv project" else "",
   if (nzchar(cache) && file.exists(cache)) "warm" else "cold (building in the background)"))
-cat("The R language server starts on the first LSP call or .R edit. Answers that need the index (findReferences,",
+cat("The R language server starts on the first LSP call or .R/.Rmd edit. Answers that need the index (findReferences,",
     "goToDefinition, hover, documentSymbol, workspaceSymbol, call hierarchy) wait for it, up to ~30 s once, then are complete",
-    "for every .R file in the project (R/, tests, scripts; git-ignored files excepted) and the files they",
+    "for every .R, .Rmd and .qmd file in the project (R/, tests, scripts, vignettes; git-ignored files excepted) and the files they",
     "source(); a note after each LSP result lists any mentions grep finds that the answer did not",
-    "(Rmd/qmd, roxygen links; for the call hierarchy also functions passed as values). Files from other",
+    "(roxygen links, Rmd/qmd prose; for the call hierarchy also functions passed as values). Files from other",
     "repositories are indexed on",
     "first open. Column-name and argument mistakes are checked after each edit (r-colcheck).\n")
 # Diagnostics: which lintr config the server will use. A project or home
@@ -59,9 +59,9 @@ if (!is.null(note)) cat(note, "\n")
 # files the sentence goes without the count to keep the hook fast.
 n_defs <- if (have_callmap && length(rfiles) <= 500L) tryCatch({
   defs <- new_defs()
-  for (f in rfiles) scan_file(f, "", defs)
+  for (f in c(rfiles, rmd)) scan_file(f, "", defs)
   sum(vapply(defs$rows, function(d) d$kind != "target", TRUE))
 }, error = function(e) NA_integer_) else NA_integer_
-cat(sprintf(paste("`r-callmap` prints a static call map of%s (what calls what, tests and scripts included);",
+cat(sprintf(paste("`r-callmap` prints a static call map of%s (what calls what, tests, scripts and Rmd/qmd chunks included);",
                   "run it, or `r-callmap NAME`, before a refactor and open only the files it names.\n"),
             if (is.na(n_defs)) " the project's functions" else sprintf(" all %d functions", n_defs)))

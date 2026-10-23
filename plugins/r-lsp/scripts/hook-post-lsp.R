@@ -123,7 +123,7 @@ rel <- function(p) {
 
 # R files of the project; what git ignores is left out when the project is a repository.
 project_files <- function() {
-  pat <- "[.](R|r|Rmd|rmd|qmd)$"
+  pat <- "[.](R|r|Rmd|rmd|Rmarkdown|qmd|Rnw|rnw)$"
   tracked <- tryCatch(suppressWarnings(system2("git", c("-C", shQuote(root), "ls-files", "--cached", "--others",
                                                            "--exclude-standard"), stdout = TRUE, stderr = FALSE)),
                       error = function(e) NULL)
@@ -278,8 +278,8 @@ if (!is.null(sym) && nzchar(sym$name) && op %in% c("findReferences", "incomingCa
         if (length(call_hits)) {
           notes <- c(notes, paste0(
             if (null_answer) "The server's 'no incoming calls' is incomplete. " else "The server's caller list is incomplete. ",
-            "grep finds ", length(call_hits), " call(s) of `", name, "` it did not return (Rmd files and calls through",
-            " purrr/apply or do.call are outside the server's call hierarchy). Treat these as callers:\n  ",
+            "grep finds ", length(call_hits), " call(s) of `", name, "` it did not return (calls through",
+            " purrr/apply or do.call, and files the server has not loaded, are outside its call hierarchy). Treat these as callers:\n  ",
             listed(call_hits, hint = "rg -nw '%s\\(' ")))
         }
         if (length(doc_hits)) {
@@ -308,7 +308,7 @@ if (!is.null(sym) && nzchar(sym$name) && op %in% c("findReferences", "incomingCa
       } else {
         notes <- c(notes, paste0("grep finds ", length(hits), " mention(s) of `", name, "` in ", length(files_of(hits)),
           " file(s) that the server's answer does not list. The server resolves references by scope and",
-          " skips roxygen `[", name, "()]` links, comments, strings and Rmd files.",
+          " skips roxygen `[", name, "()]` links, comments, strings and the prose of Rmd/qmd files.",
           " Check these before a rename or signature change:\n  ", listed(hits)))
       }
     }

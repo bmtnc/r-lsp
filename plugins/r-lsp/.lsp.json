@@ -5,6 +5,7 @@
     "extensionToLanguage": {
       ".R": "r",
       ".Rmd": "rmd",
+      ".Rmarkdown": "rmd",
       ".qmd": "rmd"
     },
     "startupTimeout": 60000,

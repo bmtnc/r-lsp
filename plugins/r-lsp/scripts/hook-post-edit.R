@@ -6,7 +6,7 @@ script_dir <- dirname(normalizePath(sub("^--file=", "", grep("^--file=", command
 input <- tryCatch(jsonlite::fromJSON(readLines(file("stdin"), warn = FALSE), simplifyVector = FALSE),
                   error = function(e) NULL)
 file <- input$tool_input$file_path
-if (is.null(file) || !is.character(file) || !grepl("[.][Rr]$", file) || !file.exists(file)) quit(save = "no", status = 0)
+if (is.null(file) || !is.character(file) || !grepl("[.](R|r|Rmd|rmd|Rmarkdown|qmd|Rnw|rnw)$", file) || !file.exists(file)) quit(save = "no", status = 0)
 root <- Sys.getenv("CLAUDE_PROJECT_DIR", input$cwd %||% getwd())
 source(file.path(script_dir, "colcheck-lib.R"), local = TRUE)
 # A failure of the checker itself is reported, never swallowed: silence must
@@ -62,7 +62,7 @@ clip <- function(lines, n = 15) {
 }
 parts <- if (length(findings)) sprintf("r-colcheck (this plugin) on %s:", basename(file)) else character()
 if (length(syntax)) {
-  parts <- c(parts, "The file does not parse (R will refuse to run or source it); fix this first:",
+  parts <- c(parts, "The file, or a chunk of it, does not parse (R will refuse to run, source or knit it); fix this first:",
              clip(colcheck_format(syntax, root), 3))
 }
 if (length(columns)) {

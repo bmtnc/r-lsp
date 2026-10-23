@@ -5,7 +5,7 @@
 root="${CLAUDE_PROJECT_DIR:-$PWD}"
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
 command -v Rscript >/dev/null 2>&1 || exit 0
-if ! find "$root" -maxdepth 3 \( -name '*.R' -o -name '*.r' -o -name '*.Rmd' -o -name '*.qmd' \) \
+if ! find "$root" -maxdepth 3 \( -name '*.R' -o -name '*.r' -o -name '*.Rmd' -o -name '*.qmd' -o -name '*.Rmarkdown' -o -name '*.Rnw' \) \
      -not -path '*/renv/*' -not -path '*/.git/*' -print -quit 2>/dev/null | grep -q .; then
   exit 0
 fi

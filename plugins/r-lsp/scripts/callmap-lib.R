@@ -15,7 +15,10 @@
 # match.fun()/get() and the apply family, plus Recall(). Only edges to
 # functions defined in the project are kept: calls into packages are noise in
 # a dependency map. Code outside any function (tests, scripts, top-level
-# statements) is attributed to its file.
+# statements) is attributed to its file. R Markdown, Quarto and Sweave files
+# are read chunk by chunk (parse_r_source() in colcheck-lib.R) and treated
+# as scripts: knitr runs them top to bottom, so a function defined in a
+# chunk is private to its document.
 #
 # Entry points: callmap_build(root) -> map; callmap_format(map),
 #               callmap_neighbourhood(map, names, depth), callmap_json(map, ids).
@@ -28,7 +31,7 @@ callmap_skip_dirs <- "/(renv|packrat|[.]git|node_modules)/"
 callmap_files <- function(root) {
   rfiles <- list.files(root, pattern = "[.][Rr]$", recursive = TRUE, full.names = TRUE)
   rfiles <- rfiles[!grepl(callmap_skip_dirs, rfiles)]
-  rmd <- list.files(root, pattern = "[.](Rmd|rmd|qmd)$", recursive = TRUE, full.names = TRUE)
+  rmd <- list.files(root, pattern = "[.](Rmd|rmd|Rmarkdown|qmd|Rnw|rnw)$", recursive = TRUE, full.names = TRUE)
   rmd <- rmd[!grepl(callmap_skip_dirs, rmd)]
   list(r = rfiles, rmd = rmd)
 }
@@ -151,15 +154,22 @@ add_def <- function(defs, name, label, file, line, args, kind, fn = NULL, class 
 }
 
 scan_file <- function(path, rel, defs) {
-  ex <- tryCatch(parse(path, keep.source = TRUE, encoding = "UTF-8"), error = function(e) e)
-  if (inherits(ex, "error")) {
-    msg <- strsplit(conditionMessage(ex), "\n", fixed = TRUE)[[1L]]
+  parsed <- tryCatch(parse_r_source(path), error = function(e) e)
+  if (inherits(parsed, "error")) {
+    msg <- strsplit(conditionMessage(parsed), "\n", fixed = TRUE)[[1L]]
     return(list(rel = rel, error = paste("does not parse:", sub(paste0("^", path, ":"), "", msg[nzchar(msg)][1L] %||% "parse error"))))
   }
+  ex <- parsed$exprs
   srcrefs <- attr(ex, "srcref")
-  lines <- attr(ex, "srcfile")$lines %||% readLines(path, warn = FALSE)
+  lines <- parsed$lines
+  # A chunk that does not parse is named like a file that does not; the
+  # other chunks are read.
+  chunk_errors <- vapply(parsed$errors, function(e) {
+    msg <- strsplit(conditionMessage(e$cond), "\n", fixed = TRUE)[[1L]]
+    sprintf("the R chunk starting at line %d does not parse: %s", e$line, sub("^<text>:", "", msg[nzchar(msg)][1L] %||% "parse error"))
+  }, "")
   units <- vector("list", length(ex))
-  script <- FALSE
+  script <- is_literate_file(path)
   locals <- character()
   for (i in seq_along(ex)) {
     line <- srcrefs[[i]][[1L]]
@@ -185,7 +195,7 @@ scan_file <- function(path, rel, defs) {
   # source("x.R") with a literal path: an edge from this file to that file.
   sources <- unique(unlist(lapply(ex, source_calls)))
   list(rel = rel, path = path, exprs = ex, srcrefs = srcrefs, lines = lines, units = units, sources = sources,
-       script = script, locals = unique(locals))
+       script = script, locals = unique(locals), chunk_errors = chunk_errors)
 }
 
 resolve_source <- function(s, file_rel, root) {
@@ -359,14 +369,16 @@ callmap_build <- function(root) {
   collate <- if (!is.null(dcf) && !is.na(dcf[1L, "Collate"])) scan(text = dcf[1L, "Collate"], what = "", quiet = TRUE) else character()
   ns <- if (is_pkg) namespace_info(root) else list(exports = character(), patterns = character(), s3 = list())
 
-  rel <- vapply(found$r, relative_path, "", root = root, USE.NAMES = FALSE)
+  paths <- c(found$r, found$rmd)
+  rel <- vapply(paths, relative_path, "", root = root, USE.NAMES = FALSE)
   ord <- callmap_order(rel, collate)
   defs <- new_defs()
   files <- list()
   skipped <- list()
   for (k in ord) {
-    f <- scan_file(found$r[[k]], rel[[k]], defs)
+    f <- scan_file(paths[[k]], rel[[k]], defs)
     if (!is.null(f$error)) skipped[[length(skipped) + 1L]] <- f else files[[length(files) + 1L]] <- f
+    for (ce in f$chunk_errors) skipped[[length(skipped) + 1L]] <- list(rel = rel[[k]], error = ce)
   }
 
   w <- new.env()
@@ -381,7 +393,7 @@ callmap_build <- function(root) {
 
   map <- list(root = root, pkg = pkg, is_pkg = is_pkg, files = files, skipped = skipped,
               rmd = vapply(found$rmd, relative_path, "", root = root, USE.NAMES = FALSE),
-              n_files = length(found$r))
+              n_files = length(paths))
   map$defs <- finish_defs(defs$rows, ns)
   map$edges <- resolve_edges(w$edges, map$defs, files, root)
   map
@@ -465,16 +477,17 @@ resolve_edges <- function(edges, defs, files, root) {
 
 callmap_limits <- paste(
   "Static: misses calls built from strings at runtime (eval(parse()), names pasted together),",
-  "S4 dispatch, R6 calls outside their class (obj$method()), calls inside Rmd/qmd, and calls",
-  "into packages (only project functions are listed).")
+  "S4 dispatch, R6 calls outside their class (obj$method()), inline `r` code in Rmd/qmd prose",
+  "(chunks are read), and calls into packages (only project functions are listed).")
 
 callmap_header <- function(map, what = NULL) {
   d <- map$defs
   nfun <- sum(d$kind != "target")
   ntar <- sum(d$kind == "target")
-  lines <- sprintf("r-callmap: static call map of %s (%d functions%s in %d files; %d Rmd/qmd not parsed)%s.",
+  lines <- sprintf("r-callmap: static call map of %s (%d functions%s in %d files%s)%s.",
                    map$root, nfun, if (ntar) sprintf(" and %d targets", ntar) else "", map$n_files,
-                   length(map$rmd), if (is.null(what)) "" else paste0(", ", what))
+                   if (length(map$rmd)) sprintf(", %d of them Rmd/qmd", length(map$rmd)) else "",
+                   if (is.null(what)) "" else paste0(", ", what))
   lines <- c(lines, callmap_limits)
   for (s in map$skipped) lines <- c(lines, sprintf("Skipped: %s: %s", s$rel, s$error))
   lines
