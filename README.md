@@ -431,4 +431,13 @@ python3 tests/smoke_test.py -k renv    # scenarios whose name contains "renv"
 
 CI runs it on every push and weekly, because a new `languageserver` release can break the wrapper's patches without any change here. Set `R_LSP_WRAPPER` to test a different wrapper script.
 
-A release bumps the version in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (the suite checks they agree), adds its entry to `CHANGELOG.md`, and is a commit whose subject starts with the version; the maintainer tags it `vX.Y.Z` (`git tag -a v1.8.1 <commit> && git push origin --tags`; the cloud session's credentials push branches, not tags).
+### Releasing
+
+A release bumps the version in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (the suite checks they agree), adds its entry to `CHANGELOG.md`, and is a commit whose subject starts with the version. The maintainer then tags that commit `vX.Y.Z`, with the commit subject as the tag message, and pushes the tag (the cloud session's credentials push branches, not tags):
+
+```bash
+git tag -a v1.8.1 <commit> -m "$(git log -1 --format=%s <commit>)"
+git push origin v1.8.1
+```
+
+Every release since 1.5.1 is tagged this way, so `git describe --tags` names the release a checkout is on.
