@@ -1,7 +1,7 @@
 {
   "name": "r-lsp",
-  "version": "1.7.19",
-  "description": "R language server for Claude Code with renv support, tidyverse-aware diagnostics, a column-name check and a static call map.",
+  "version": "1.8.0",
+  "description": "R language server for Claude Code with renv support, tidyverse-aware diagnostics, a column-name check with a schema cache for S3 data, a static call map with diff impact and test reach, a data map, and hooks that check every change to an R file, made through Edit, Write, Bash or a subagent.",
   "author": {
     "name": "Barry Matanic",
     "url": "https://github.com/bmtnc"

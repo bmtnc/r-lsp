@@ -1,6 +1,12 @@
 # SessionStart hook: a few lines of context about the R project for Claude.
 # Printed to stdout, which Claude Code adds to Claude's context.
 root <- normalizePath(commandArgs(TRUE)[1], mustWork = FALSE)
+# "subagent": the same context for a subagent, which starts from nothing, as
+# JSON additionalContext (SubagentStart does not read plain stdout), with the
+# lines that differ for it.
+subagent <- identical(commandArgs(TRUE)[2], "subagent")
+out <- character()
+cat <- function(..., sep = " ") out <<- c(out, paste(..., sep = sep))
 script_dir <- dirname(normalizePath(sub("^--file=", "", grep("^--file=", commandArgs(), value = TRUE)[1])))
 # The same discovery r-callmap uses, so the counts agree. stderr is discarded
 # by the hook, so a broken library must not cost the lines below.
@@ -36,7 +42,16 @@ cat("The R language server starts on the first LSP call or .R/.Rmd edit. Answers
     "source(); a note after each LSP result lists any mentions grep finds that the answer did not",
     "(roxygen links, Rmd/qmd prose; for the call hierarchy also functions passed as values). Files from other",
     "repositories are indexed on",
-    "first open. Column-name and argument mistakes are checked after each edit (r-colcheck).\n")
+    "first open. Column-name and argument mistakes are checked after each change to an R file, through Edit, Write or a",
+    "Bash command (r-colcheck); r-callmap --diff lists what a change touches and the tests to run, r-colmap the data sources",
+    "and their columns.\n")
+if (subagent) {
+  cat("You are a subagent: the language server's diagnostics stay in the main conversation. Your check is the plugin's note",
+      "after each Edit, Write or Bash command that changes an R file (r-colcheck column and argument findings, parse errors,",
+      "and the plugin's bug linters: undefined functions, non-exported pkg::fun, deprecated or superseded calls). Silence",
+      "there means checked and clean. Prefer Edit/Write for R files; a change made through Bash is checked after the",
+      "command, up to 10 files, and the server does not see it.\n")
+}
 # Diagnostics: which lintr config the server will use. A project or home
 # .lintr replaces the plugin's profile; say so, or a missing diagnostic reads
 # as a clean file.
@@ -65,3 +80,8 @@ n_defs <- if (have_callmap && length(rfiles) <= 500L) tryCatch({
 cat(sprintf(paste("`r-callmap` prints a static call map of%s (what calls what, tests, scripts and Rmd/qmd chunks included);",
                   "run it, or `r-callmap NAME`, before a refactor and open only the files it names.\n"),
             if (is.na(n_defs)) " the project's functions" else sprintf(" all %d functions", n_defs)))
+text <- paste(out, collapse = "")
+if (subagent) {
+  base::cat(jsonlite::toJSON(list(hookSpecificOutput = list(hookEventName = "SubagentStart", additionalContext = sub("\n$", "", text))),
+                             auto_unbox = TRUE), "\n")
+} else base::cat(text)

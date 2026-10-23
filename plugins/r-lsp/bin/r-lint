@@ -1,0 +1,7 @@
+#!/bin/bash
+# r-lint [--json] [--root DIR] FILE.R ...
+#   The plugin's bug linters on the files given: the profile the language
+#   server reports in the main conversation, for a subagent, a file changed
+#   through Bash, or a CI step. Exits 1 with findings. See scripts/r-lint.R.
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+exec Rscript --vanilla "$here/../scripts/r-lint.R" "$@"

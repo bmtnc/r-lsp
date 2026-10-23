@@ -4,6 +4,10 @@
 #
 #   r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--load-all]
 #                                                        evaluate EXPR, record its column names under KEY
+#   r-colcheck discover                                  every source in the project the checker cannot
+#                                                        open, where it is used, and its learn command
+#   r-colcheck learn --all [--dry-run]                   learn every source `discover` lists, each with
+#                                                        the expression and flags its note gives
 #   r-colcheck refresh [--stale] [KEY ...]               re-run the cached expressions (all, the stale
 #                                                        ones, or the keys given) with the flags they
 #                                                        were learned with; one failure does not stop the rest
@@ -87,12 +91,16 @@ describe <- function(obj) {
     unname(Map(function(n, t) list(name = n, type = t), names(el[[1L]]), vapply(el[[1L]], function(v) class(v)[[1L]], "")))
   }
   if (inherits(obj, "ArrowObject") || inherits(obj, "arrow_dplyr_query")) {
-    sch <- quiet(obj$schema)
-    if (is.null(sch)) sch <- quiet(obj$.data$schema)
-    if (!is.null(sch)) {
+    # the schema of what the object yields, computed without reading rows:
+    # for a dplyr query over a dataset that is the query's output (its
+    # select(), mutate(), rename() applied), where obj$.data$schema would be
+    # the dataset it reads. A Schema itself is recorded as is.
+    sch <- if (inherits(obj, "Schema")) obj else quiet(arrow::infer_schema(obj)) %||% quiet(obj$schema)
+    if (!is.null(sch) && !is.null(quiet(sch$fields))) {
       return(cols(names(sch), vapply(sch$fields, function(f) f$type$ToString(), ""), "arrow_schema"))
     }
-    return(cols(names(obj), rep(NA_character_, length(names(obj))), "arrow_names"))
+    if (inherits(obj, "arrow_dplyr_query")) return(cols(names(obj), rep(NA_character_, length(names(obj))), "arrow_names"))
+    # any other arrow object (an array, a type) is not a table: refused below
   }
   if (is.data.frame(obj)) {
     return(cols(names(obj), vapply(obj, function(x) class(x)[[1L]], ""), "data_frame", lapply(obj, inner_columns)))
@@ -140,6 +148,45 @@ observe <- function(expr, sources = character(), load_all = FALSE) {
 now <- function() format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 column_names <- function(cols) vapply(cols, function(cl) if (is.list(cl)) as.character(cl$name %||% "") else as.character(cl), "")
 
+if (cmd == "discover") {
+  if (length(args)) die("usage: r-colcheck discover")
+  cat(discover_format(colcheck_discover(root)), sep = "\n")
+  quit(save = "no", status = 0)
+}
+
+if (cmd == "learn" && "--all" %in% args) {
+  dry <- "--dry-run" %in% args
+  if (length(setdiff(args, c("--all", "--dry-run")))) die("usage: r-colcheck learn --all [--dry-run]")
+  d <- colcheck_discover(root)
+  if (!length(d$sources)) { cat("nothing to learn: no uncached source is used in the project\n"); quit(save = "no", status = 0) }
+  if (dry) {
+    for (src in d$sources) cat(src$command, "\n", sep = "")
+    cat(sprintf("%d source(s) would be learned\n", length(d$sources)))
+    quit(save = "no", status = 0)
+  }
+  s <- read_cache()
+  failed <- 0L
+  for (src in d$sources) {
+    a <- src$learn_args
+    srcs <- a[which(a == "--source") + 1L]
+    srcs <- srcs[!is.na(srcs)]
+    load_all <- "--load-all" %in% a
+    r <- tryCatch(observe(src$learn_expr, srcs, load_all), error = function(e) e)
+    if (inherits(r, "error")) {
+      failed <- failed + 1L
+      cat(sprintf("failed   \"%s\": %s\n", src$key, conditionMessage(r)))
+      next
+    }
+    s[[src$key]] <- c(list(expr = src$learn_expr, observed_at = now(), method = r$method, columns = unname(r$columns)),
+                      if (load_all) list(load_all = TRUE), if (length(srcs)) list(sources = srcs))
+    cat(sprintf("learned  \"%s\": %d columns via %s\n", src$key, length(r$columns), r$method))
+  }
+  created <- write_cache(s)
+  cat(sprintf("learned %d of %d source(s) -> %s%s\n", length(d$sources) - failed, length(d$sources), rel_path,
+              if (created) "\n.colcheck/ is gitignored (its own .gitignore); delete .colcheck/.gitignore to commit the cache." else ""))
+  quit(save = "no", status = if (failed) 1L else 0L)
+}
+
 if (cmd == "learn") {
   sources <- character()
   positional <- character()
@@ -182,11 +229,12 @@ if (cmd == "refresh") {
     if (length(missing)) die("no cached schema for ", paste0("\"", missing, "\"", collapse = ", "))
   } else keys <- names(s)
   if (stale_only) {
+    ttl <- ttl_days(load_config(root))
     age <- vapply(keys, function(k) {
       a <- quiet(as.integer(Sys.Date() - as.Date(substr(as.character(s[[k]]$observed_at %||% ""), 1L, 10L))))
-      if (is.null(a) || is.na(a)) 91L else a
+      if (is.null(a) || is.na(a)) ttl + 1L else a
     }, 1L)
-    keys <- keys[age > 90L]
+    keys <- keys[age > ttl]
   }
   if (!length(keys)) { cat("nothing to refresh\n"); quit(save = "no", status = 0) }
   failed <- 0L

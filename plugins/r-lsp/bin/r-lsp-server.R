@@ -25,27 +25,61 @@
 #   7. Tests, scripts and R Markdown/Quarto files are loaded as documents at
 #      startup, like R/, so callers there are found without anything opening
 #      the file first.
+#   8. Files changed outside Edit/Write (git checkout, styler, sed, a
+#      heredoc) are re-read before a cross-file request answers from them.
 #
 # Every patch is wrapped so that a languageserver release that renames an
-# internal disables that patch instead of stopping the server.
+# internal disables that patch instead of stopping the server, and says so
+# in the status file.
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
-ns <- asNamespace("languageserver")
 
 # --- status file -----------------------------------------------------------
 
 status_file <- Sys.getenv("R_LSP_STATUS_FILE",
   file.path(Sys.getenv("CLAUDE_PLUGIN_DATA", tempdir()), "status.log"))
 status_tag <- Sys.getenv("CLAUDE_PROJECT_DIR", getwd())
+# Every line names the server that wrote it: two sessions in one project (a
+# second terminal, `claude -p` from a script) share this file and their
+# lines interleave, so r-lsp-status and the post-LSP hook group by pid.
+status_pid <- Sys.getpid()
 status <- function(text) tryCatch({
   dir.create(dirname(status_file), showWarnings = FALSE, recursive = TRUE)
   con <- file(status_file, open = "a")
   on.exit(close(con))
-  writeLines(paste0(format(Sys.time(), "%H:%M:%S"), " [", status_tag, "] R LSP: ", text), con)
+  writeLines(paste0(format(Sys.time(), "%H:%M:%S"), " [", status_tag, "] [pid ", status_pid, "] R LSP: ", text), con)
 }, error = function(e) NULL)
+# A failure, said where `claude --debug` shows it and where r-lsp-status and
+# the post-LSP hook read it: one that reaches stderr alone looks like health
+# from outside.
+note <- function(...) {
+  text <- paste0(...)
+  message("r-lsp: ", text)
+  status(text)
+}
 
 status_state <- new.env()
 status_state$busy <- FALSE
+
+# The process that started this server (Claude Code's, or a shell it went
+# through) and the session, when Claude Code says which: a reader running
+# under the same process can then tell this server from another session's
+# in the same project.
+parent_pid <- tryCatch(trimws(system2("ps", c("-o", "ppid=", "-p", status_pid), stdout = TRUE, stderr = FALSE))[[1L]],
+                       error = function(e) "")
+if (!isTRUE(grepl("^[0-9]+$", parent_pid))) parent_pid <- "?"
+session_id <- Sys.getenv("CLAUDE_CODE_SESSION_ID", "")
+
+# Without languageserver there is no server: say so in the status file
+# instead of dying before the first line, which reads as "not started yet"
+# (the wrapper runs R --vanilla, so a copy that only a renv or user library
+# holds is not seen).
+ns <- tryCatch(asNamespace("languageserver"), error = function(e) NULL)
+if (is.null(ns)) {
+  note("languageserver is not installed in ", paste(.libPaths(), collapse = ":"),
+       ": install it with Rscript --vanilla -e 'install.packages(\"languageserver\")'")
+  quit(save = "no", status = 1)
+}
 
 # Patches 2 to 4 use internals that arrived in languageserver 0.3.18 (several
 # workspaces) and 0.3.19 (pending-work check, workspace index). On an older
@@ -55,13 +89,12 @@ ls_version <- utils::packageVersion("languageserver")
 # Marks where this server's events begin: r-lsp-status shows nothing from
 # before the last marker, so a previous server's "index ready" is never
 # mistaken for the current state after a reload.
-status(sprintf("server started (pid %d, languageserver %s)", Sys.getpid(), ls_version))
+status(sprintf("server started (pid %d, ppid %s, languageserver %s%s)", status_pid, parent_pid, ls_version,
+               if (nzchar(session_id)) paste0(", session ", session_id) else ""))
 if (ls_version < "0.3.19") {
-  old_note <- paste0("languageserver ", ls_version, " is older than 0.3.19: renv support works, but index status, ",
-                     "complete cross-file answers and other-repository support are off. Upgrade with ",
-                     "Rscript --vanilla -e 'install.packages(\"languageserver\")'")
-  message("r-lsp: ", old_note)
-  status(old_note)
+  note("languageserver ", ls_version, " is older than 0.3.19: renv support works, but index status, ",
+       "complete cross-file answers and other-repository support are off. Upgrade with ",
+       "Rscript --vanilla -e 'install.packages(\"languageserver\")'")
 }
 
 # Which lintr config wins (scripts/lint-config.R, shared with the hook and
@@ -93,9 +126,15 @@ index_busy <- function(self) {
   tryCatch({
     pm <- self$parse_task_manager
     if (is.function(pm$has_work) && isTRUE(pm$has_work())) return(TRUE)
+    # languageserver's git master (October 2026) discovers and parses in an
+    # index worker: its task manager, and the index's discovering and
+    # worker_running flags, are NULL in 0.3.20 and read as "not busy".
+    im <- self$index_task_manager
+    if (!is.null(im) && is.function(im$has_work) && isTRUE(im$has_work())) return(TRUE)
     for (ws in self$workspaces$values()) {
       idx <- ws$index
-      if (!is.null(idx) && isTRUE(idx$enabled) && length(idx$pending)) return(TRUE)
+      if (!is.null(idx) && isTRUE(idx$enabled) &&
+          (length(idx$pending) || isTRUE(idx$discovering) || isTRUE(idx$worker_running))) return(TRUE)
     }
     FALSE
   }, error = function(e) FALSE)
@@ -184,14 +223,24 @@ activate_renv <- function(self, root) {
   old_wd <- getwd()
   setwd(root)
   sink(stderr())
+  # renv reports a failed bootstrap as a warning, which R holds back until
+  # the server's main loop returns: caught here, so it is in the status
+  # file while the server runs.
   tryCatch(
-    suppressMessages(source(af, echo = FALSE, print.eval = FALSE)),
+    withCallingHandlers(
+      suppressMessages(source(af, echo = FALSE, print.eval = FALSE)),
+      warning = function(w) { note("renv activation warning: ", conditionMessage(w)); invokeRestart("muffleWarning") }),
     finally = { sink(); setwd(old_wd) }
   )
+  added <- setdiff(.libPaths(), gl)
   # Server packages first, then the project's renv library, then global.
   .libPaths(unique(c(srv, .libPaths(), gl)))
   if (!is.null(srv)) Sys.setenv(R_LSP_SERVER_LIB = srv)
   refresh_workers(self)
+  # The absence of an error is not success: verify that a library arrived.
+  if (length(added)) status(paste0("renv library ", added[[1L]]))
+  else note("renv activation added no library: packages the project pins read as not installed in diagnostics ",
+            "and hover until renv::restore() has run in the project")
   TRUE
 }
 
@@ -199,7 +248,7 @@ orig_initialized <- ns$on_initialized
 patched_initialized <- function(self, params) {
   if (!is.null(self$rootPath)) {
     tryCatch(activate_renv(self, self$rootPath),
-      error = function(e) message("r-lsp: renv activation failed: ", conditionMessage(e)))
+      error = function(e) note("renv activation failed: ", conditionMessage(e)))
   }
   orig_initialized(self, params)
   if (!is.null(self$rootPath)) note_lint_config(self$rootPath)
@@ -220,7 +269,7 @@ tryCatch({
     tryCatch({ if (index_busy(self)) note_busy(self, "workspace"); note_idle(self) },
              error = function(e) NULL)
   }, overwrite = TRUE)
-}, error = function(e) message("r-lsp: status patch disabled: ", conditionMessage(e)))
+}, error = function(e) note("status patch disabled: ", conditionMessage(e)))
 
 # --- 3. complete answers -----------------------------------------------------
 
@@ -236,15 +285,22 @@ drain_index <- function(self) {
     busy <- FALSE
     pm <- self$parse_task_manager
     if (!is.function(pm$has_work)) break   # before 0.3.19 there is nothing to wait for
+    im <- self$index_task_manager          # git master's index worker; NULL in 0.3.20
+    if (!is.null(im) && is.function(im$check_tasks)) im$check_tasks()
     pm$check_tasks()
     pm$run_tasks()
     if (pm$has_work()) busy <- TRUE
     for (ws in self$workspaces$values()) {
       idx <- ws$index
-      if (!is.null(idx) && isTRUE(idx$enabled) && length(idx$pending)) {
+      if (!is.null(idx) && isTRUE(idx$enabled) &&
+          (length(idx$pending) || isTRUE(idx$discovering) || isTRUE(idx$worker_running))) {
         idx$process_batch()
         busy <- TRUE
       }
+    }
+    if (!is.null(im) && is.function(im$run_tasks)) {
+      im$run_tasks()
+      if (isTRUE(im$has_work())) busy <- TRUE
     }
     if (!busy || (proc.time()[[3L]] - t0) > index_wait_secs) break
     Sys.sleep(0.005)
@@ -265,6 +321,9 @@ for (h in c("text_document_references", "text_document_definition", "workspace_s
     orig <- get0(h, envir = ns, inherits = FALSE)
     if (is.function(orig)) {
       patched <- function(self, id, params) {
+        # patch 8: files changed on disk are re-read first, so the parses
+        # it queues are among those the drain waits for
+        tryCatch(refresh_changed_documents(self), error = function(e) NULL)
         tryCatch(drain_index(self), error = function(e) NULL)
         orig(self, id, params)
       }
@@ -322,11 +381,11 @@ tryCatch({
           }
         }
       }
-    }, error = function(e) message("r-lsp: adding workspace failed: ", conditionMessage(e)))
+    }, error = function(e) note("adding workspace failed: ", conditionMessage(e)))
     orig_open(self, params)
   }
   assignInNamespace("text_document_did_open", patched_open, ns = "languageserver")
-}, error = function(e) message("r-lsp: multi-repo patch disabled: ", conditionMessage(e)))
+}, error = function(e) note("multi-repo patch disabled: ", conditionMessage(e)))
 
 # --- 5. scripts and tests see the package ------------------------------------
 # Since 0.3.19 a document is scoped to its package root (files under R/) or to
@@ -349,7 +408,7 @@ tryCatch({
   ws$set("public", "document_uris_for_references", function(definition_uri, context_uri = definition_uri) {
     self$document_uris_for_context(context_uri)
   }, overwrite = TRUE)
-}, error = function(e) message("r-lsp: shared-scope patch disabled: ", conditionMessage(e)))
+}, error = function(e) note("shared-scope patch disabled: ", conditionMessage(e)))
 
 # --- 6. complete outgoing calls ---------------------------------------------
 # Since 0.3.19 outgoingCalls is answered from a shallow reference index when
@@ -360,7 +419,7 @@ tryCatch({
 tryCatch({
   if (!is.function(ns$indexed_outgoing_calls)) stop("no indexed shortcut in this version (nothing to patch)")
   assignInNamespace("indexed_outgoing_calls", function(workspace, item) NULL, ns = "languageserver")
-}, error = function(e) message("r-lsp: full outgoing-calls patch disabled: ", conditionMessage(e)))
+}, error = function(e) note("full outgoing-calls patch disabled: ", conditionMessage(e)))
 
 # --- 7. tests, scripts and Rmd/qmd are loaded, not only R/ -------------------
 # The server fully parses a package's R/ files at startup and everything else
@@ -393,12 +452,56 @@ literate_files <- function(root) {
 load_literate_document <- function(self, workspace, uri) {
   if (!is.null(workspace$documents$get(uri, NULL))) return(invisible(NULL))
   path <- ns$path_from_uri(uri)
+  stat <- file_stat(path)   # before the read, never after (patch 8)
   content <- tryCatch(stringi::stri_read_lines(path), error = function(e) NULL)
   if (is.null(content)) return(invisible(NULL))
   doc <- ns$Document$new(uri, language = "rmd", version = NULL, content = content)
   workspace$documents$set(uri, doc)
   self$text_sync(uri, document = doc, parse = TRUE)
+  if (!is.null(stat)) doc_stat[[uri]] <- stat
   invisible(doc)
+}
+
+# The index's own walk, for a languageserver whose discover() returns before
+# the file list is filled (git master, October 2026, fills it later from a
+# helper process): the same rules as WorkspaceIndex$discover (include and
+# exclude globs, size and count limits, entries that resolve outside the
+# root), minus the package's R/ files, which the server loads itself. On
+# 0.3.20 discover() is synchronous and the list is never empty after it, so
+# this walk never runs there.
+walk_index_files <- function(idx, root) {
+  max_files <- idx$max_files()
+  max_bytes <- idx$max_file_bytes()
+  real_root <- normalizePath(root, winslash = "/", mustWork = FALSE)
+  queue <- root
+  visited <- character()
+  out <- character()
+  while (length(queue) && length(out) < max_files) {
+    directory <- queue[[1L]]
+    queue <- queue[-1L]
+    canonical <- normalizePath(directory, winslash = "/", mustWork = FALSE)
+    if (canonical %in% visited) next
+    visited <- c(visited, canonical)
+    entries <- tryCatch(list.files(directory, all.files = TRUE, no.. = TRUE, full.names = TRUE),
+                        error = function(e) character())
+    if (!length(entries)) next
+    entries <- sort(entries, method = "radix")
+    info <- file.info(entries)
+    for (i in seq_along(entries)) {
+      path <- ns$index_normalize_path(entries[[i]])
+      real_path <- normalizePath(path, winslash = "/", mustWork = FALSE)
+      if (!identical(real_path, real_root) && !ns$path_has_parent(real_path, real_root)) next
+      if (isTRUE(info$isdir[[i]])) {
+        if (idx$should_index(path, directory = TRUE)) queue <- c(queue, path)
+        next
+      }
+      if (!idx$should_index(path) || is.na(info$size[[i]]) || info$size[[i]] > max_bytes) next
+      if (!is.null(ns$index_package_root(path, root))) next
+      out <- c(out, path)
+      if (length(out) >= max_files) break
+    }
+  }
+  out
 }
 
 tryCatch({
@@ -413,7 +516,14 @@ tryCatch({
     tryCatch({
       idx <- workspace$index
       if (is.null(idx) || !isTRUE(idx$enabled)) return(invisible(NULL))
-      uris <- setdiff(idx$files$keys(), idx$package_source_uris())
+      if (!idx$files$size() || isTRUE(idx$discovering)) {
+        # the list is filled later by a worker (git master): walk it now
+        uris <- vapply(walk_index_files(idx, workspace$root), ns$path_to_uri, "", USE.NAMES = FALSE)
+        status(sprintf("index has no file list after discovery (filled later by a worker): walked %s for test/script files myself, %d found",
+                       workspace$root, length(uris)))
+      } else {
+        uris <- setdiff(idx$files$keys(), idx$package_source_uris())
+      }
       paths <- vapply(uris, ns$path_from_uri, "")
       uris <- uris[!git_ignored(workspace$root, paths)]
       lit <- literate_files(workspace$root)
@@ -426,7 +536,8 @@ tryCatch({
       uris <- uris[uris %in% kept]
       lit_uris <- lit_uris[lit_uris %in% kept]
       for (uri in uris) {
-        if (!idx$summaries$has(uri)) idx$update_path(ns$path_from_uri(uri))
+        # where an index worker exists (git master) it owns the summaries
+        if (is.null(idx$task_manager) && !idx$summaries$has(uri)) idx$update_path(ns$path_from_uri(uri))
         self$load_index_document(workspace, uri)
       }
       for (uri in lit_uris) load_literate_document(self, workspace, uri)
@@ -434,7 +545,7 @@ tryCatch({
       status(sprintf("loaded %d test/script files as documents%s%s", length(uris),
                      if (length(lit_uris)) sprintf(", plus %d Rmd/qmd", length(lit_uris)) else "",
                      if (total > length(kept)) sprintf(" (of %d; raise R_LSP_LOAD_MAX for the rest)", total) else ""))
-    }, error = function(e) message("r-lsp: loading tests/scripts failed: ", conditionMessage(e)))
+    }, error = function(e) note("loading tests/scripts failed: ", conditionMessage(e)))
   }, overwrite = TRUE)
 
   # On every open the server prunes loaded documents that are not package
@@ -469,6 +580,112 @@ tryCatch({
       invisible(NULL)
     }, overwrite = TRUE)
   }
-}, error = function(e) message("r-lsp: tests/scripts loading patch disabled: ", conditionMessage(e)))
+}, error = function(e) note("tests/scripts loading patch disabled: ", conditionMessage(e)))
+
+# --- 8. files changed outside Edit/Write are re-read -------------------------
+# A loaded document keeps the content of its last read: the server reads a
+# file once (R/ at startup, tests and scripts through patch 7) and reads it
+# again only on didOpen or didSave, or on a didChangeWatchedFiles that
+# Claude Code never sends (the server registers no watcher). After a git
+# checkout, styler, roxygenise, sed or a heredoc, references, definition and
+# hover answer from the old text, with no signal. So before every such
+# request, each document the server read from disk (not one the client
+# opened: its content is the client's, and Claude Code re-opens the file it
+# asks about) is compared with its file by size and mtime; the changed ones
+# are read and parsed again, the deleted ones dropped, and drain_index waits
+# for the parses. Bounded: past R_LSP_REFRESH_MAX changed files nothing is
+# re-read and the status file says so. New files are not found this way (a
+# tree walk per request costs too much); the post-LSP hook's grep lists
+# callers in them.
+
+doc_stat <- new.env()   # uri -> c(size, mtime) of the file when it was read
+file_stat <- function(path) {
+  info <- tryCatch(file.info(path, extra_cols = FALSE), error = function(e) NULL)
+  if (is.null(info) || is.na(info$size[[1L]]) || isTRUE(info$isdir[[1L]])) return(NULL)
+  c(as.numeric(info$size[[1L]]), as.numeric(info$mtime[[1L]]))
+}
+refresh_max <- suppressWarnings(as.integer(Sys.getenv("R_LSP_REFRESH_MAX", "200")))
+if (is.na(refresh_max) || refresh_max < 0L) refresh_max <- 200L
+refresh_state <- new.env()
+refresh_state$last <- -Inf
+refresh_state$skipped <- 0L
+
+refresh_changed_documents <- function(self) {
+  now <- proc.time()[[3L]]
+  if (now - refresh_state$last < 0.5) return(invisible())   # once per burst of requests
+  refresh_state$last <- now
+  changed <- list()
+  gone <- list()
+  for (ws in self$workspaces$values()) {
+    for (uri in ws$documents$keys()) {
+      doc <- ws$documents$get(uri)
+      if (isTRUE(doc$is_open)) next
+      path <- ns$path_from_uri(uri)
+      stat <- file_stat(path)
+      if (is.null(stat)) {
+        gone[[length(gone) + 1L]] <- list(ws = ws, uri = uri)
+      } else if (!identical(doc_stat[[uri]], stat)) {   # unknown counts as changed
+        changed[[length(changed) + 1L]] <- list(ws = ws, uri = uri, path = path, stat = stat)
+      }
+    }
+  }
+  n <- length(changed) + length(gone)
+  if (!n) return(invisible())
+  if (n > refresh_max) {
+    if (refresh_state$skipped != n) {
+      refresh_state$skipped <- n
+      note(n, " loaded files changed or vanished on disk, more than R_LSP_REFRESH_MAX (", refresh_max,
+           "): not re-read, so cross-file answers about them are stale until the server restarts")
+    }
+    return(invisible())
+  }
+  refresh_state$skipped <- 0L
+  for (x in changed) {
+    content <- tryCatch(stringi::stri_read_lines(x$path), error = function(e) NULL)
+    if (is.null(content)) next
+    doc <- x$ws$documents$get(x$uri)
+    doc$set_content(doc$version, content)
+    doc$call_scan_cache <- NULL
+    idx <- x$ws$index
+    # the shallow summary now, the full parse through the task queue
+    if (!is.null(idx) && isTRUE(idx$enabled)) tryCatch(idx$update_content(x$uri, content), error = function(e) NULL)
+    self$text_sync(x$uri, document = doc, parse = TRUE)
+    doc_stat[[x$uri]] <- x$stat
+  }
+  for (x in gone) {
+    ns$diagnostics_callback(self, x$uri, NULL, list())
+    x$ws$documents$remove(x$uri)
+    idx <- x$ws$index
+    if (!is.null(idx) && isTRUE(idx$enabled)) tryCatch(idx$remove(x$uri), error = function(e) NULL)
+    if (exists(x$uri, envir = doc_stat, inherits = FALSE)) rm(list = x$uri, envir = doc_stat)
+  }
+  for (ws in self$workspaces$values()) {
+    ws$diagnostics_globals_cache <- NULL
+    ws$type_hierarchy_cache$clear()
+    ws$update_loaded_packages()
+  }
+  status(sprintf("re-read %d file(s) changed on disk outside the session%s", length(changed),
+                 if (length(gone)) sprintf(", dropped %d deleted", length(gone)) else ""))
+}
+
+# The stat of every document the server reads is taken as it is loaded.
+# The original must be a top-level object: R6 encloses a method in the
+# object's environment, whose parent chain ends in the namespace and the
+# global environment, so a local() capture is invisible to it.
+tryCatch({
+  orig_lid <- ns$LanguageServer$public_methods$load_index_document
+  if (!is.function(orig_lid)) stop("no index-backed loader in this version")
+  ns$LanguageServer$set("public", "load_index_document", function(workspace, uri) {
+    f <- orig_lid
+    environment(f) <- environment()
+    stat <- file_stat(ns$path_from_uri(uri))
+    doc <- f(workspace, uri)
+    if (!is.null(doc) && !is.null(stat)) doc_stat[[uri]] <- stat
+    invisible(doc)
+  }, overwrite = TRUE)
+}, error = function(e) note("re-read patch disabled: ", conditionMessage(e)))
 
 languageserver::run()
+# A crash inside the main loop is logged to stderr and run() returns;
+# r-lsp-status tells a dead pid apart either way, this line completes the log.
+status("server exited")

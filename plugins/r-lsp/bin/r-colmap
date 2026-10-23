@@ -1,0 +1,19 @@
+#!/bin/bash
+# r-colmap [--json] [--root DIR] [--file PATH ...] [COLUMN ...]
+#   A map of the data the R project reads: every source with its columns,
+#   and where the code uses, creates or drops each column (file:line and
+#   verb). With COLUMN, every site that touches it. The data-side
+#   counterpart of r-callmap; see scripts/colmap-lib.R.
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+
+# The project root: the nearest directory up from here with a project marker.
+root="${CLAUDE_PROJECT_DIR:-$PWD}"
+d="$PWD"
+while [ "$d" != "/" ]; do
+  if [ -e "$d/renv.lock" ] || [ -e "$d/DESCRIPTION" ] || [ -e "$d/.git" ] || [ -e "$d/.here" ] \
+     || [ -e "$d/_targets.R" ] || ls "$d"/*.Rproj >/dev/null 2>&1; then root="$d"; break; fi
+  d="$(dirname "$d")"
+done
+
+# An explicit --root later in "$@" wins over this default.
+exec Rscript --vanilla "$here/../scripts/r-colmap.R" --root "$root" "$@"

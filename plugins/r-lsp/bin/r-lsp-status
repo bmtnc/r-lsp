@@ -1,29 +1,83 @@
 #!/bin/bash
 # r-lsp-status: print the R language server's recent index events for the
-# current project (server started / indexing / index ready / workspace added).
-# The server appends them to <plugin data dir>/status.log; the Bash tool does
-# not carry the plugin variables, so the data directory is searched for. Only
-# the events of the most recently started server for this project are shown,
-# and a server that has since exited is pointed out.
-project="${CLAUDE_PROJECT_DIR:-$PWD}"
+# current project (server started / indexing / index ready / workspace added /
+# failures). The server appends them to <plugin data dir>/status.log; the
+# Bash tool does not carry the plugin variables, so the data directory is
+# searched for. Every line names the server that wrote it (two sessions in
+# one project write to the same file): only live servers are shown, this
+# session's own when it can be told apart (the session id, or the server's
+# parent process being an ancestor of this shell), else every live one; a
+# project whose only server has exited is pointed out.
 shopt -s nullglob
 files=("${R_LSP_STATUS_FILE:-}")
 [ -n "${R_LSP_STATUS_FILE:-}" ] || files=("$HOME"/.claude/plugins/data/*/status.log)
+project="${CLAUDE_PROJECT_DIR:-}"
+if [ -z "$project" ]; then
+  # The Bash tool's cwd can be a subdirectory of the project after a cd:
+  # the nearest ancestor of $PWD with events is the project.
+  d="$PWD"
+  while :; do
+    if [ "${#files[@]}" -gt 0 ] && grep -qsF "[$d]" "${files[@]}"; then project="$d"; break; fi
+    [ "$d" != "/" ] && [ "$d" != "$(dirname "$d")" ] || break
+    d="$(dirname "$d")"
+  done
+  [ -n "$project" ] || project="$PWD"
+fi
+ancestors() {
+  local p=$$ pp i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    pp="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    case "$pp" in ''|0|1) break ;; esac
+    printf '%s\n' "$pp"
+    p="$pp"
+  done
+}
+# "pid<TAB>line": a line's own "[pid N]", else the pid of the last "server
+# started (pid N" before it, else none.
+attribute() {
+  awk '{ pid = "" }
+       match($0, /\[pid [0-9]+\]/) { pid = substr($0, RSTART + 5, RLENGTH - 6) }
+       /R LSP: server started/ { if (pid == "" && match($0, /\(pid [0-9]+/)) pid = substr($0, RSTART + 5, RLENGTH - 5); current = pid }
+       { if (pid == "") pid = current; print pid "\t" $0 }'
+}
 found=0
 for f in "${files[@]}"; do
   [ -f "$f" ] || continue
   lines="$(grep -F "[$project]" "$f")"
   [ -n "$lines" ] || continue
   found=1
-  last="$(printf '%s\n' "$lines" | grep -n 'R LSP: server started' | tail -n 1 | cut -d: -f1)"
-  if [ -n "$last" ]; then
-    lines="$(printf '%s\n' "$lines" | tail -n +"$last")"
-    pid="$(printf '%s\n' "$lines" | head -n 1 | sed -n 's/.*(pid \([0-9]*\).*/\1/p')"
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-      echo "The server that wrote these events (pid $pid) has exited. A new server starts on the next LSP call or .R edit; until its own 'index ready' appears here, cross-file answers are not complete."
+  tagged="$(printf '%s\n' "$lines" | attribute)"
+  live=(); dead=()
+  while IFS= read -r p; do
+    if [ -z "$p" ] || kill -0 "$p" 2>/dev/null; then live+=("$p"); else dead+=("$p"); fi
+  done < <(printf '%s\n' "$tagged" | cut -f1 | awk '!seen[$0]++')
+  show=()
+  if [ "${#live[@]}" -eq 0 ]; then
+    last="${dead[${#dead[@]}-1]}"
+    echo "The server that wrote these events (pid $last) has exited. A new server starts on the next LSP call or .R edit; until its own 'index ready' appears here, cross-file answers are not complete."
+    show=("$last")
+  else
+    own=()
+    for p in "${live[@]}"; do
+      [ -n "$p" ] || continue
+      start="$(printf '%s\n' "$tagged" | awk -F'\t' -v p="$p" '$1 == p && /R LSP: server started/' | tail -n 1)"
+      if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && [[ "$start" == *", session $CLAUDE_CODE_SESSION_ID"* ]]; then own+=("$p"); fi
+    done
+    if [ "${#own[@]}" -eq 0 ] && [ "${#live[@]}" -gt 1 ]; then
+      anc="$(ancestors)"
+      for p in "${live[@]}"; do
+        [ -n "$p" ] || continue
+        start="$(printf '%s\n' "$tagged" | awk -F'\t' -v p="$p" '$1 == p && /R LSP: server started/' | tail -n 1)"
+        pp="$(printf '%s' "$start" | sed -n 's/.*ppid \([0-9]*\).*/\1/p')"
+        [ -n "$pp" ] && printf '%s\n' "$anc" | grep -qx "$pp" && own+=("$p")
+      done
     fi
+    if [ "${#own[@]}" -gt 0 ]; then show=("${own[@]}"); else show=("${live[@]}"); fi
+    [ "${#show[@]}" -gt 1 ] && echo "${#show[@]} servers are running for this project (another session's, or a restart's); each one's events:"
   fi
-  printf '%s\n' "$lines" | tail -n "${1:-8}" | sed -e 's/ \[[^]]*\]//'
+  for p in "${show[@]}"; do
+    printf '%s\n' "$tagged" | awk -F'\t' -v p="$p" '$1 == p { sub(/^[^\t]*\t/, ""); print }' | tail -n "${1:-8}" | sed -e 's/ \[[^]]*\]//'
+  done
 done
 if [ "$found" = 0 ]; then
   echo "No R LSP status events for $project yet (the server starts on the first LSP call or .R edit)."

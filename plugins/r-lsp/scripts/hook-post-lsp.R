@@ -51,23 +51,72 @@ notes <- character()
 # --- index state ---------------------------------------------------------------
 status_file <- Sys.getenv("R_LSP_STATUS_FILE",
   file.path(Sys.getenv("CLAUDE_PLUGIN_DATA", ""), "status.log"))
+# The status file is shared by every server in this project: two sessions
+# in one directory write to it at once. Each line carries the pid of the
+# server that wrote it (an older line belongs to the last "server started
+# (pid N" before it, or to no server). A server whose pid is dead (a plugin
+# reload, an ended session) left lines that mean nothing now. This
+# session's own server is the one started for its session id, or whose
+# parent process is an ancestor of this hook (hooks and the server run under
+# the same Claude Code process); when neither tells, every live server
+# counts, and the note names the pid.
+ancestor_pids <- function() {
+  out <- character()
+  p <- Sys.getpid()
+  for (i in 1:12) {
+    pp <- tryCatch(trimws(system2("ps", c("-o", "ppid=", "-p", p), stdout = TRUE, stderr = FALSE))[[1L]],
+                   error = function(e) NA_character_)
+    if (!isTRUE(grepl("^[0-9]+$", pp)) || pp %in% c("0", "1")) break
+    out <- c(out, pp)
+    p <- pp
+  }
+  out
+}
+server_groups <- function(lines) {
+  pid <- ifelse(grepl("[pid ", lines, fixed = TRUE), sub("^.*\\[pid ([0-9]+)\\].*$", "\\1", lines), NA_character_)
+  current <- ""
+  for (i in seq_along(lines)) {
+    if (grepl("R LSP: server started", lines[[i]], fixed = TRUE)) {
+      current <- if (!is.na(pid[[i]])) pid[[i]] else sub("^.*\\(pid ([0-9]+).*$", "\\1", lines[[i]])
+      if (!grepl("^[0-9]+$", current)) current <- ""
+    }
+    if (is.na(pid[[i]])) pid[[i]] <- current
+  }
+  groups <- list()
+  for (p in unique(pid)) {
+    mine <- lines[pid == p]
+    alive <- !nzchar(p) || isTRUE(tools::pskill(as.integer(p), 0L))
+    start <- grep("R LSP: server started", mine, fixed = TRUE, value = TRUE)
+    start <- if (length(start)) tail(start, 1) else ""
+    groups[[length(groups) + 1L]] <- list(pid = p, lines = mine, alive = alive,
+      ppid = sub("^.*ppid ([0-9]+).*$", "\\1", start),
+      session = if (grepl(", session ", start, fixed = TRUE)) sub("^.*, session ([^,)]+).*$", "\\1", start) else "")
+  }
+  groups
+}
 still_indexing <- NULL
+other_server <- FALSE
+renv_broken <- NULL
 if (file.exists(status_file)) {
   lines <- tryCatch(readLines(status_file, warn = FALSE), error = function(e) character())
   mine <- grep(paste0("[", session_root, "]"), lines, fixed = TRUE, value = TRUE)
-  # only the most recently started server's events; a server that has
-  # exited (plugin reload) left "indexing" lines that mean nothing now
-  marker <- grep("R LSP: server started", mine, fixed = TRUE)
-  if (length(marker)) {
-    mine <- mine[tail(marker, 1):length(mine)]
-    pid <- sub("^.*\\(pid ([0-9]+).*$", "\\1", mine[[1L]])
-    if (grepl("^[0-9]+$", pid) && !isTRUE(tools::pskill(as.integer(pid), 0L))) mine <- character()
-  }
-  if (length(mine)) {
-    last <- tail(mine, 1)
-    if (grepl(": indexing ", last, fixed = TRUE) && !grepl("index ready", last, fixed = TRUE)) {
-      still_indexing <- sub("^.*R LSP: ", "", last)
+  groups <- Filter(function(g) g$alive, server_groups(mine))
+  if (length(groups) > 1L) {
+    sid <- input$session_id %||% Sys.getenv("CLAUDE_CODE_SESSION_ID", "")
+    own <- if (is.character(sid) && nzchar(sid)) Filter(function(g) identical(g$session, sid), groups) else list()
+    if (!length(own)) {
+      anc <- ancestor_pids()
+      own <- Filter(function(g) g$ppid %in% anc, groups)
     }
+    if (length(own)) groups <- own else other_server <- TRUE
+  }
+  for (g in groups) {
+    last <- tail(g$lines, 1)
+    if (grepl(": indexing ", last, fixed = TRUE) && !grepl("index ready", last, fixed = TRUE)) {
+      still_indexing <- paste0(sub("^.*R LSP: ", "", last), if (other_server) sprintf(" (server pid %s)", g$pid) else "")
+    }
+    broken <- grep("renv activation|added no library", g$lines, value = TRUE)
+    if (length(broken)) renv_broken <- sub("^.*R LSP: ", "", tail(broken, 1))
   }
 }
 
@@ -102,12 +151,19 @@ null_answer <- grepl("^No (references|definition|hover|call hierarchy|incoming|o
 # An answer given while the index was still building: an empty one is not
 # an answer at all, a non-empty one may be short.
 if (!is.null(still_indexing)) {
+  who <- if (other_server) "a server for this project (another session's, or this one's)" else "the R language server"
   notes <- c(notes, if (null_answer) paste0(
-    "This empty result is not an answer: the R language server was still indexing this project (", still_indexing,
+    "This empty result is not an answer: ", who, " was still indexing this project (", still_indexing,
     ") when it replied. Repeat the same call once `r-lsp-status` shows 'index ready' (the index wait is capped at ",
     "R_LSP_INDEX_WAIT seconds, 30 by default; a larger project can need more).") else paste0(
-    "The R language server is still indexing this project (", still_indexing,
+    if (other_server) "A server for this project (another session's, or this one's)" else "The R language server",
+    " is still indexing this project (", still_indexing,
     "). This answer may be incomplete; the same call returns complete results once `r-lsp-status` shows 'index ready'."))
+}
+if (!is.null(renv_broken)) {
+  notes <- c(notes, paste0("The server could not use this project's renv library (", renv_broken,
+    "), so a diagnostic saying a package the project pins is not installed, an undefined-function diagnostic ",
+    "for one of its functions, and an empty hover on it are not answers until that is fixed."))
 }
 if (!is.null(sym) && !sym$shifted && sym$first_after_punct && null_answer) {
   notes <- c(notes, sprintf("The server has an off-by-one for the first character of a symbol that directly follows punctuation: repeat the call at character %d (inside `%s`) before concluding there is nothing.",

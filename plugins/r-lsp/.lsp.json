@@ -4,7 +4,9 @@
     "args": [],
     "extensionToLanguage": {
       ".R": "r",
+      ".r": "r",
       ".Rmd": "rmd",
+      ".rmd": "rmd",
       ".Rmarkdown": "rmd",
       ".qmd": "rmd"
     },

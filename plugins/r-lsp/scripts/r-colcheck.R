@@ -6,13 +6,16 @@ usage <- function(to = stdout()) {
   cat("usage: r-colcheck [--json] [--steps] [--root DIR] FILE.R ...\n",
       "       r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--load-all]\n",
       "       r-colcheck refresh [--stale] [KEY ...]\n",
+      "       r-colcheck discover | learn --all [--dry-run]\n",
       "       r-colcheck schemas | forget KEY | help\n",
       "Reports bare column names in tidyverse pipelines that cannot exist, checked against the\n",
       "columns of the data files the code reads (headers only) or, for data it cannot open\n",
       "(S3, databases, project loaders), against the schema cache .colcheck/schemas.json.\n",
       "Frames from sources it cannot resolve are noted when they are piped into verbs; `learn`\n",
       "evaluates the loader expression once, in the project, and caches the column names;\n",
-      "`refresh` re-runs the cached expressions (all, the stale ones, or the keys given).\n",
+      "`refresh` re-runs the cached expressions (all, the stale ones, or the keys given);\n",
+      "`discover` lists every source the project uses that is not cached, with its learn command,\n",
+      "and `learn --all` runs them (a loader registry in .colcheck.json gives each its cheap expression).\n",
       "`--steps` lists the column set after every pipeline step (with --json: {findings, steps}).\n",
       "The summary on stderr says how many steps were checked of all the steps seen.\n", sep = "", file = to)
 }

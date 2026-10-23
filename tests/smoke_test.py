@@ -377,8 +377,91 @@ def scenario_shared_scope(s):
     check("flag_missing" in hover, f"hover from a script into R/ is empty (document scope not shared): {hover[:80]!r}")
     check(bool(defn) and "flags.R" in json.dumps(defn), f"definition from a script did not reach R/flags.R: {defn}")
     with open(status_file) as f:
-        check("loaded 2 test/script files as documents, plus 1 Rmd/qmd" in f.read(),
-              "status log has no 'loaded ... test/script files ..., plus 1 Rmd/qmd' event")
+        log = f.read()
+    check("loaded 2 test/script files as documents, plus 1 Rmd/qmd" in log,
+          "status log has no 'loaded ... test/script files ..., plus 1 Rmd/qmd' event")
+    # On a languageserver whose discover() fills the file list later from a
+    # worker (git master), the server walks the tree itself with the index's
+    # rules; here discover() is synchronous, so the walk must not have run,
+    # and run by hand it must list what the index lists (R/ excepted).
+    check("walked" not in log, f"the fallback walk ran although the index had its file list:\n{log}")
+    server_r = os.path.join(os.path.dirname(WRAPPER), "r-lsp-server.R")
+    same = rscript(f"""
+        ns <- asNamespace("languageserver")
+        exprs <- parse("{server_r}")
+        def <- Filter(function(e) is.call(e) && identical(e[[1L]], as.name("<-")) && identical(e[[2L]], as.name("walk_index_files")), as.list(exprs))
+        eval(def[[1L]])
+        root <- normalizePath("{root}")
+        idx <- ns$WorkspaceIndex$new(root)
+        walked <- sort(walk_index_files(idx, root))
+        idx$discover()
+        listed <- sort(unname(vapply(setdiff(idx$files$keys(), idx$package_source_uris()), ns$path_from_uri, "")))
+        cat(identical(walked, listed), basename(walked))
+    """)
+    check(same.split()[0] == "TRUE" and set(same.split()[1:]) == {"run.R", "test-flags.R"},
+          f"the fallback walk and the index disagree on the files to load: {same}")
+
+
+def scenario_stale_files(s):
+    """Files changed on disk outside Edit/Write (git checkout, sed, styler, a
+    heredoc) are re-read before a cross-file request. Claude Code never sends
+    didChangeWatchedFiles and re-opens only the file it asks about, so the
+    server answered from the old text of every other file: a caller that no
+    longer existed, a deleted vignette, the old signature on hover."""
+    root = os.path.join(s.scratch, "stale_files")
+    shutil.copytree(os.path.join(FIXTURES, "pkgscope"), root)
+    status_file = os.path.join(s.scratch, "stale_files.status.log")
+    test_file = os.path.join(root, "tests", "testthat", "test-flags.R")
+    flags = os.path.join(root, "R", "flags.R")
+
+    def located(lsp):
+        locs = lsp.request("textDocument/references", {
+            "textDocument": {"uri": lsp.uri("scripts/run.R")}, "position": {"line": 2, "character": 12},
+            "context": {"includeDeclaration": True}}).get("result") or []
+        out = {}
+        for loc in locs:
+            out.setdefault(loc["uri"].rsplit("/", 1)[-1], set()).add(loc["range"]["start"]["line"] + 1)
+        return out
+
+    lsp = s.server(root, env={"CLAUDE_PROJECT_DIR": root, "R_LSP_STATUS_FILE": status_file})
+    try:
+        lsp.open("scripts/run.R")
+        before = {}
+        for _ in range(15):
+            before = located(lsp)
+            if {"flags.R", "test-flags.R", "usage.Rmd"} <= set(before):
+                break
+            time.sleep(1)
+        # Changed on disk as a shell would: a second test caller, the
+        # vignette gone, a new signature and definition line in R/.
+        time.sleep(1.1)   # a filesystem with whole-second mtimes
+        with open(test_file, "a") as f:
+            f.write("test_that('again', {\n  expect_equal(unname(flag_missing(c(NA, 2))), -2)\n})\n")
+        os.remove(os.path.join(root, "vignettes", "usage.Rmd"))
+        with open(flags, "w") as f:
+            f.write("#' Flag missing values\n#' @param x numeric\n#' @param na_value used when the first value is missing\n#' @export\n"
+                    "flag_missing <- function(x, na_value = 0) {\n  if (!is.na(x[1])) y <- sum(x) else y <- na_value - sum(x, na.rm = TRUE)\n"
+                    "  names(y) <- as.character(length(x))\n  y\n}\n")
+        lsp.open("scripts/run.R")   # the LSP tool re-opens the file it asks about, nothing else
+        after = located(lsp)
+        hover = lsp.hover("scripts/run.R", 2, 12)
+        defn = lsp.request("textDocument/definition", {
+            "textDocument": {"uri": lsp.uri("scripts/run.R")}, "position": {"line": 2, "character": 12}}).get("result")
+    finally:
+        lsp.close()
+    check({"flags.R", "test-flags.R", "usage.Rmd"} <= set(before) and before.get("test-flags.R") == {2},
+          f"references before the change are not the fixture's: {before}")
+    check("usage.Rmd" not in after, f"references still list the deleted vignette: {after}")
+    check(after.get("test-flags.R") == {2, 5}, f"references missed the caller appended to the test file on disk: {after}")
+    check(after.get("run.R") == {3} and after.get("flags.R") == {5}, f"references after the change unexpected: {after}")
+    check("na_value" in hover, f"hover gives the old signature after R/flags.R changed on disk: {hover[:120]!r}")
+    defn = defn if isinstance(defn, list) else [defn] if defn else []
+    check(any(d.get("uri", "").endswith("flags.R") and d["range"]["start"]["line"] + 1 == 5 for d in defn),
+          f"definition did not move to the new line of R/flags.R: {defn}")
+    with open(status_file) as f:
+        log = f.read()
+    check("re-read 2 file(s) changed on disk outside the session, dropped 1 deleted" in log,
+          f"status log has no 're-read ... dropped ...' event:\n{log}")
 
 
 def scenario_other_repository(s):
@@ -471,6 +554,27 @@ def scenario_colcheck(s):
     out = subprocess.run([tool, "--root", root, again], capture_output=True, text=True, timeout=120)
     got = {int(l.split(":")[1]) for l in out.stdout.splitlines() if l.startswith("R/again.R:")}
     check(got == {5, 6}, f"reassignment from itself mis-checked (lines {sorted(got)}):\n{out.stdout}")
+    # Verbs that change the column set: a:b ranges, join suffixes and renamed
+    # keys, the groups summarise() leaves, pivot_longer() with several
+    # names_to, set-keeping verbs, %<>% and assignment inside a branch.
+    verbs_r = os.path.join(root, "R", "verbs.R")
+    out = subprocess.run([tool, "--root", root, verbs_r], capture_output=True, text=True, timeout=120)
+    reported = {int(line.split(":")[1]) for line in out.stdout.splitlines()
+                if line.startswith("R/verbs.R:") and ("is not a column" in line or "no argument" in line)}
+    with open(verbs_r) as f:
+        vsrc = f.read().splitlines()
+    bad = {i for i, line in enumerate(vsrc, 1) if line.rstrip().endswith("# bad")}
+    check(bad <= reported, f"verb tracking missed lines {sorted(bad - reported)}:\n{out.stdout}")
+    check(reported <= bad, f"verb tracking flagged correct lines {sorted(reported - bad)}:\n{out.stdout}")
+    check("hit an error" not in out.stdout and "checker error" not in out.stderr, f"checker errors on R/verbs.R:\n{out.stdout}{out.stderr}")
+    vsteps = subprocess.run([tool, "--steps", "--root", root, verbs_r], capture_output=True, text=True, timeout=120).stdout
+    check('select(sales, region:amount) => region, year, amount' in vsteps
+          and 'left_join(sales, other, by = "region") => region, year, amount.x, customer, amount.y, pop' in vsteps
+          and 'left_join(sales, lookup, by = c(customer = "id")) => region, year, amount, customer, score' in vsteps
+          and 'summarise(., m = mean(amount)) => region, year, m [grouped by region]' in vsteps
+          and 'names_sep = "_") => region, year, amount, customer, set, a, b' in vsteps
+          and 'unite(sales, "key", region, year) => key, amount, customer' in vsteps,
+          f"verb steps unexpected:\n{vsteps}")
     tricky = subprocess.run([tool, "--root", root, os.path.join(root, "R", "tricky_ok.R")],
                             capture_output=True, text=True, timeout=120).stdout
     tricky_findings = [l for l in tricky.splitlines() if "is not a column" in l or "no argument" in l]
@@ -498,6 +602,38 @@ def scenario_colcheck(s):
     check("'k' is known up to" not in tricky
           and "'k24' is known up to summarise(across(where(is.numeric), mean), .by = region)" in tricky
           and "cannot be worked out statically" in tricky, f"stop notes for summarise(across()) unexpected:\n{tricky}")
+    # a native-pipe step through a call the checker does not know gets the note the %>% form gets
+    check("'m2' is known up to janitor::clean_names(sales)" in tricky and "'n3' is known up to unknown_wrapper_fn(sales)" in tricky,
+          f"|> through an unknown function must stop tracking with a note:\n{tricky}")
+
+    # Reader arguments that change the column names (col_select, col_names,
+    # header=, id=, skip=, make.names repair, fread select/drop) and base-R
+    # column access (df$x, df[["x"]], df[, "x"], columns written in place).
+    def marked_file(name):
+        path = os.path.join(root, "R", name + ".R")
+        out = subprocess.run([tool, "--root", root, path], capture_output=True, text=True, timeout=120)
+        check("checker error" not in out.stderr and "hit an error" not in out.stdout, f"{name}.R: checker error:\n{out.stdout}{out.stderr}")
+        reported = {int(line.split(":")[1]) for line in out.stdout.splitlines()
+                    if line.startswith(f"R/{name}.R:") and "is not a column" in line}
+        with open(path) as f:
+            marked = {i for i, line in enumerate(f.read().splitlines(), 1) if line.rstrip().endswith("# bad")}
+        check(marked <= reported, f"{name}.R: r-colcheck missed lines {sorted(marked - reported)}:\n{out.stdout}")
+        check(reported <= marked, f"{name}.R: r-colcheck flagged correct lines {sorted(reported - marked)}:\n{out.stdout}")
+        return out.stdout
+    out = marked_file("readers")
+    check("'r45' is known up to read_csv(" in out and "its col_select argument cannot be read statically" in out
+          and "'r46' is known up to read.csv(" in out and "its header argument cannot be read statically" in out,
+          f"an unreadable reader argument must stop tracking with a note:\n{out}")
+    marked_file("access")
+    # readxl and arrow arguments, and an arrow dataset directory, when both packages are installed
+    if rscript('cat(requireNamespace("readxl", quietly = TRUE) && requireNamespace("arrow", quietly = TRUE))').strip() == "TRUE":
+        rscript('invisible(file.copy(readxl::readxl_example("datasets.xlsx"), "data/datasets.xlsx")); '
+                'arrow::write_parquet(read.csv("data/sales.csv"), "data/sales.parquet"); '
+                'arrow::write_dataset(read.csv("data/sales.csv"), "data/sales_ds", partitioning = "year")', cwd=root)
+        out = marked_file("readers_pkgs")
+        check("'x11' is known up to readxl::read_excel(" in out and "its sheet argument cannot be read statically" in out,
+              f"an unreadable sheet argument must stop tracking with a note:\n{out}")
+        check("data from sales_ds" in out, f"an arrow dataset directory was not read:\n{out}")
 
     # Frames passed through project functions (same file, source()d file), both pipes.
     funcs = os.path.join(root, "R", "funcs.R")
@@ -597,6 +733,49 @@ def scenario_colcheck(s):
     check(not silent.strip(), "post-edit hook spoke for a non-R file")
 
 
+def scenario_colmap(s):
+    """r-colmap: the data map (sources, their columns, where each is used,
+    dropped or created), built from r-colcheck's step records."""
+    tool = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-colmap")
+    root = os.path.join(FIXTURES, "columns")
+
+    def run(*args, cwd=root):
+        out = subprocess.run([tool, *args], cwd=cwd, capture_output=True, text=True, timeout=180)
+        check(out.returncode == 0, f"r-colmap {' '.join(args)} exited {out.returncode}:\n{out.stderr}")
+        return out.stdout
+
+    full = run("--file", "R/analysis.R")
+    # sales.csv, mtcars, and each tibble()/tribble() literal as a source of its own
+    check("r-colmap: 6 data sources read by 1 file" in full.splitlines()[0], f"colmap header unexpected:\n{full[:300]}")
+    check("sales.csv   first used at R/analysis.R:10   4 columns: region, year, amount, customer" in full,
+          f"colmap source line unexpected:\n{full[:1500]}")
+    check("  customer             used 1 time: R/analysis.R:73 (select)" in full, f"last_col() use of customer missing:\n{full[:2500]}")
+    check("  region               used " in full and "dropped at R/analysis.R:23 (summarise)" in full, f"region line unexpected:\n{full[:2500]}")
+    check("created by the code:" in full and "  total                at R/analysis.R:10 (summarise); used 1 time" in full
+          and "  big                  at R/analysis.R:12 (mutate); never used afterwards" in full, f"created columns unexpected:\n{full}")
+    for wrong in ("regoin", "amuont", "yaer"):
+        check(f"  {wrong} " not in full, f"a reported mistake ({wrong}) is listed as a column the code creates:\n{full}")
+    check("datasets::mtcars" in full and "tibble() literal at R/analysis.R:" in full, f"other sources missing:\n{full}")
+
+    one = run("--file", "R/analysis.R", "amount", "regoin")
+    check("amount:\n  sales.csv\n    used at R/analysis.R:10 (filter(amount > threshold, year >= 2020)), R/analysis.R:10 (summarise(total = sum(amount), n = n()))" in one,
+          f"column lookup unexpected:\n{one}")
+    check("ggplot(sales, aes(x = year, y = amount, colour = region))" in one, f"ggplot use of amount missing:\n{one}")
+    check("regoin:\n  not a column of any source the map knows. Nearest: region" in one, f"unknown column lookup unexpected:\n{one}")
+
+    data = json.loads(run("--json", "--file", "R/analysis.R"))
+    by_src = {d["source"]: d for d in data}
+    check(by_src["sales.csv"]["columns"] == ["region", "year", "amount", "customer"] and by_src["sales.csv"]["unused"] == []
+          and any(u["column"] == "total" and not u["in_data"] and u["sites"][0]["kind"] == "created" and u["sites"][0]["verb"] == "summarise"
+                  for u in by_src["sales.csv"]["uses"]), f"colmap JSON unexpected:\n{json.dumps(data)[:1200]}")
+
+    s3 = run(cwd=os.path.join(FIXTURES, "s3columns"))
+    check('cached schema "returns/monthly"   first used at R/report.R:10   3 columns: date, fund_id, ret' in s3
+          and "Not mapped: 2 frames from sources the checker cannot open" in s3, f"colmap on the cache fixture unexpected:\n{s3}")
+    empty = s.make_project("colmap_empty", {"R/x.R": os.path.join(FIXTURES, "bugs", "bugs.R")})
+    check("No frame with known columns: nothing to map." in run("--root", empty, cwd=empty), "colmap with nothing to map should say so")
+
+
 def scenario_colcheck_cache(s):
     """Data the checker cannot open (an S3-style loader) is checked through the
     schema cache; unresolved frames are noted; `learn` fills the cache."""
@@ -621,6 +800,14 @@ def scenario_colcheck_cache(s):
     check(columns <= bad, f"cache-backed check flagged correct lines {sorted(columns - bad)}:\n{out}")
     check(notes == noted, f"unresolved-source notes expected on {sorted(noted)}, got {sorted(notes)}:\n{out}")
     check("days old" in out, f"no staleness note for the old cache entry:\n{out}")
+    # the loader is a project function: the learn command brings its file along, and runs as printed
+    check("Learn it once: r-colcheck learn \"holdings/latest\" 's3_read(\"holdings/latest\")' --source R/loaders.R" in out,
+          f"the learn command must carry --source for a project loader:\n{out}")
+    la = subprocess.run([tool, "learn", "--all", "--root", root], capture_output=True, text=True, timeout=180)
+    check(la.returncode == 0 and 'learned  "holdings/latest": 3 columns' in la.stdout and "learned 1 of 1" in la.stdout,
+          f"learn --all with the derived --source flag failed:\n{la.stdout}{la.stderr}")
+    out, columns, notes = run_check()
+    check(columns == bad | later and not notes, f"after learn --all expected {sorted(bad | later)}, got {sorted(columns)}:\n{out}")
 
     learned = subprocess.run([tool, "learn", "holdings/latest", 's3_read("holdings/latest")',
                               "--source", "R/loaders.R", "--root", root],
@@ -646,6 +833,30 @@ def scenario_colcheck_cache(s):
           f"cache entry lacks inner columns: {entry_cols}")
     listing = subprocess.run([tool, "schemas", "--root", root], capture_output=True, text=True, timeout=120).stdout
     check("holdings/latest  3 columns" in listing, f"schemas listing unexpected:\n{listing}")
+    # learn on an arrow dplyr query records the query's output columns, not
+    # the schema of the dataset it reads; a bare Schema keeps its types; an
+    # arrow object that is not a table is refused
+    have_arrow = rscript('cat(all(vapply(c("arrow", "dplyr"), function(p) nzchar(system.file(package = p)), TRUE)))').strip() == "TRUE"
+    if have_arrow:
+        def learn_arrow(key, expr):
+            return subprocess.run([tool, "learn", key, expr, "--root", root], capture_output=True, text=True, timeout=180)
+        aq = learn_arrow("arrow/query", 'arrow::arrow_table(id = 1:2, amount = c(1, 2), status = "a") |> dplyr::select(id, amount) |> dplyr::mutate(amount2 = amount * 2)')
+        rn = learn_arrow("arrow/renamed", 'arrow::arrow_table(id = 1:2, amount = c(1, 2)) |> dplyr::rename(amt = amount)')
+        sc = learn_arrow("arrow/schema", 'arrow::arrow_table(id = 1:2, amount = c(1, 2))$schema')
+        check(aq.returncode == 0 and rn.returncode == 0 and sc.returncode == 0,
+              f"learn on arrow expressions failed:\n{aq.stderr}{rn.stderr}{sc.stderr}")
+        with open(os.path.join(root, ".colcheck", "schemas.json")) as f:
+            arrow_cache = json.load(f)
+        check([c["name"] for c in arrow_cache["arrow/query"]["columns"]] == ["id", "amount", "amount2"]
+              and arrow_cache["arrow/query"]["method"] == "arrow_schema",
+              f"learn recorded the arrow query's source, not its output: {arrow_cache['arrow/query']}")
+        check([c["name"] for c in arrow_cache["arrow/renamed"]["columns"]] == ["id", "amt"],
+              f"learn missed the arrow query's rename: {arrow_cache['arrow/renamed']}")
+        check(arrow_cache["arrow/schema"]["method"] == "arrow_schema" and all(c.get("type") for c in arrow_cache["arrow/schema"]["columns"]),
+              f"a bare arrow Schema lost its types: {arrow_cache['arrow/schema']}")
+        junk = learn_arrow("arrow/junk", "arrow::ChunkedArray$create(1:3)")
+        check(junk.returncode != 0 and "not a data frame" in junk.stderr,
+              f"learn recorded an arrow array as a table:\n{junk.stdout}{junk.stderr}")
     # a literal inside a lambda is not a cache key
     lam = os.path.join(root, "R", "lambda.R")
     with open(lam, "w") as f:
@@ -657,6 +868,106 @@ def scenario_colcheck_cache(s):
                 "z %>% dplyr::filter(zz == 1)\n")
     out = subprocess.run([tool, "--root", root, lam], capture_output=True, text=True, timeout=120).stdout
     check("'zz'" not in out, f"a literal inside a lambda matched a cache key:\n{out}")
+    # A wrapper around a cached loader (both pipes) is followed instead of
+    # taking the loader's literal; a call naming two cached datasets is not
+    # guessed from the first; 2L in the code matches 2 in a call-shaped key
+    # and a named match beats a positional one; an option argument's value
+    # is no key; `# cols:` is read across a multi-line call, in any case.
+    with open(os.path.join(root, ".colcheck", "schemas.json")) as f:
+        cache = json.load(f)
+    entry = lambda cols: {"expr": "x", "observed_at": "2026-10-01T00:00:00Z", "method": "data_frame",  # noqa: E731
+                          "columns": [{"name": c, "type": "character"} for c in cols]}
+    cache['prepare(type = "monthly")'] = entry(["month", "mret"])
+    cache['prepare(type = "monthly", lag = 2)'] = entry(["month", "mret", "lag2"])
+    cache['prepare("daily")'] = entry(["day", "dret"])
+    cache["p"] = entry(["pp"])
+    with open(os.path.join(root, ".colcheck", "schemas.json"), "w") as f:
+        json.dump(cache, f)
+    with open(os.path.join(root, "R", "join.R"), "w") as f:
+        f.write('s3_join <- function(a, b) dplyr::inner_join(s3_read(a), s3_read(b), by = "fund_id")\n')
+    keys = os.path.join(root, "R", "keys.R")
+    with open(keys, "w") as f:
+        f.write('source("R/loaders.R")\nsource("R/join.R")\nlibrary(dplyr)\n'
+                'clean <- function(d) d |> rename(w = weight)\n'
+                'x <- clean(s3_read("holdings/latest"))\n'
+                'x |> select(w)\n'
+                'x |> select(weight) # bad\n'
+                'y <- s3_read("holdings/latest") |> clean()\n'
+                'y |> select(w)\n'
+                'y |> select(weight) # bad\n'
+                'j <- s3_join("returns/monthly", "holdings/latest")\n'
+                'j |> select(weight, nope)\n'
+                'm4 <- prepare(df, type = "monthly", lag = 2L)\n'
+                'm4 |> select(lag2, nope) # bad\n'
+                'm7 <- prepare(df, "daily", type = "monthly")\n'
+                'm7 |> select(mret, nope) # bad\n'
+                'o <- fetch_table("orders", mode = "p")\n'
+                'o |> select(pp)\n'
+                'a5 <- load_from_somewhere(\n  "x"\n)   # Cols: returns/monthly\n'
+                'a5 |> select(fundid) # bad\n'
+                'z <- s3_read(paste0("holdings/", "latest"))\n'
+                'z |> select(wieght) # bad\n')
+    out = subprocess.run([tool, "--root", root, keys], capture_output=True, text=True, timeout=120).stdout
+    klines = [l for l in out.splitlines() if l.startswith("R/keys.R:")]
+    got = {(int(l.split(":")[1]), l.split("'")[1]) for l in klines if "is not a column" in l}
+    check(got == {(7, "weight"), (10, "weight"), (14, "nope"), (16, "nope"), (22, "fundid"), (24, "wieght")},
+          f"cache key matching unexpected: {sorted(got)}\n{out}")
+    ksrc = {int(l.split(":")[1]): l for l in klines if "is not a column" in l}
+    check('cached schema "prepare(type = "monthly", lag = 2)"' in ksrc[14] and 'cached schema "prepare(type = "monthly")"' in ksrc[16]
+          and 'cached schema "holdings/latest"' in ksrc[24] and 'cached schema "returns/monthly"' in ksrc[22],
+          f"call-shaped or built keys resolved to the wrong entry:\n{out}")
+    note_j = [l for l in klines if l.startswith("R/keys.R:11:")]
+    check(note_j and "'j' comes from s3_join(\"returns/monthly\", \"holdings/latest\"), which names 2 cached datasets" in note_j[0]
+          and "r-colcheck learn 's3_join(\"returns/monthly\", \"holdings/latest\")' 's3_join(\"returns/monthly\", \"holdings/latest\")' --source R/join.R --source R/loaders.R" in note_j[0],
+          f"a call naming two cached datasets must get its own note:\n{out}")
+    note_o = [l for l in klines if l.startswith("R/keys.R:17:")]
+    check(note_o and 'no cached schema for key "orders"' in note_o[0] and "'pp'" not in out,
+          f"an option argument's value matched a cache key:\n{out}")
+    learned = subprocess.run([tool, "learn", 's3_join("returns/monthly", "holdings/latest")', 's3_join("returns/monthly", "holdings/latest")',
+                              "--source", "R/join.R", "--source", "R/loaders.R", "--root", root], capture_output=True, text=True, timeout=120)
+    check(learned.returncode == 0 and "5 columns" in learned.stdout, f"learning the call-shaped key the note suggests failed:\n{learned.stdout}{learned.stderr}")
+    out = subprocess.run([tool, "--root", root, keys], capture_output=True, text=True, timeout=120).stdout
+    check("R/keys.R:12: 'nope' is not a column" in out and 'cached schema "s3_join(' in out and "names 2 cached datasets" not in out,
+          f"the call-shaped key did not resolve the join:\n{out}")
+    # A function key answers calls without a literal only: a project function
+    # of the same bare name as a cached "pkg::fn" entry is followed, not
+    # matched, and a keyed loader whose literal has no entry stays
+    # unresolved (with the note for that literal) instead of taking the
+    # loader's bare key.
+    with open(os.path.join(root, ".colcheck", "schemas.json")) as f:
+        cache = json.load(f)
+    cache["teamdata::default_rates"] = entry(["rate"])
+    cache["s3_read"] = entry(["generic"])
+    with open(os.path.join(root, ".colcheck", "schemas.json"), "w") as f:
+        json.dump(cache, f)
+    hj = os.path.join(root, "R", "hijack.R")
+    with open(hj, "w") as f:
+        f.write('source("R/loaders.R")\nlibrary(dplyr)\n'
+                'default_rates <- function() s3_read("returns/monthly")\n'
+                'd <- default_rates()\n'
+                'd |> select(ret)\n'
+                'd |> select(rate) # bad\n'
+                'm <- s3_read("meta/funds")\n'
+                'm |> select(name, generic)\n'
+                'r <- s3_read("returns/monthly")\n'
+                'r |> select(generic) # bad\n')
+    out = subprocess.run([tool, "--root", root, hj], capture_output=True, text=True, timeout=120).stdout
+    hgot = {(int(l.split(":")[1]), l.split("'")[1]) for l in out.splitlines() if l.startswith("R/hijack.R:") and "is not a column" in l}
+    check(hgot == {(6, "rate"), (10, "generic")}, f"function keys hijacked a project function or a keyed loader call: {sorted(hgot)}\n{out}")
+    check("R/hijack.R:7: 'm' comes from a source the checker cannot open" in out and 'no cached schema for key "meta/funds"' in out,
+          f"a keyed loader call with an unlearned literal must get the note for that literal:\n{out}")
+    # a local file that is there but cannot be read (an RDS over 20 MB) says why and falls back to the cache
+    rscript('dir.create("data", showWarnings = FALSE); saveRDS(data.frame(a = runif(1.5e6), b = runif(1.5e6)), "data/big.rds", compress = FALSE)', cwd=root)
+    big = os.path.join(root, "R", "big.R")
+    with open(big, "w") as f:
+        f.write('b <- readRDS("data/big.rds")\nb |> dplyr::select(zz)\n')
+    out = subprocess.run([tool, "--root", root, big], capture_output=True, text=True, timeout=120).stdout
+    check("big.rds is an RDS file of 23 MB, over the 20 MB the checker loads" in out
+          and "r-colcheck learn \"data/big.rds\" 'readRDS(\"data/big.rds\")'" in out, f"unreadable local file note unexpected:\n{out}")
+    lb = subprocess.run([tool, "learn", "data/big.rds", 'readRDS("data/big.rds")', "--root", root], capture_output=True, text=True, timeout=120)
+    out = subprocess.run([tool, "--root", root, big], capture_output=True, text=True, timeout=120).stdout
+    check(lb.returncode == 0 and "R/big.R:2: 'zz' is not a column" in out and 'cached schema "data/big.rds"' in out,
+          f"the cache did not cover a local file the checker cannot read:\n{lb.stdout}{lb.stderr}{out}")
     # `# cols:` on a split/map statement survives the lambda walk, brace body with an assignment included
     sp = os.path.join(root, "R", "split.R")
     with open(sp, "w") as f:
@@ -738,6 +1049,48 @@ def scenario_colcheck_cache(s):
     with open(os.path.join(renv_root, ".colcheck", "schemas.json")) as f:
         probe_cols = [c["name"] for c in json.load(f)["probe"]["columns"]]
     check(probe_cols == ["renv_on"], f"learn ran without renv active: columns {probe_cols}")
+
+    # The loader registry in .colcheck.json: a registered loader is keyed on
+    # its key argument, the note gives the learn command the registry
+    # derives, a parquet on a bucket is learned from its footer, `discover`
+    # lists every uncached source and `learn --all` learns them in one run.
+    reg = os.path.join(s.scratch, "s3registry")
+    shutil.copytree(os.path.join(FIXTURES, "s3columns"), reg)
+    with open(os.path.join(reg, ".colcheck.json"), "w") as f:
+        json.dump({"loaders": [{"fn": "s3_read", "key": 1, "learn": "s3_read(KEY)", "source": ["R/loaders.R"]},
+                               {"fn": "fetch_table", "key": "name", "learn": "s3_read(KEY)", "source": ["R/loaders.R"]}],
+                   "schema_ttl_days": 30}, f)
+    with open(os.path.join(reg, "R", "loaders.R"), "a") as f:
+        f.write("fetch_table <- function(date, name) s3_read(name)\n")
+    more = os.path.join(reg, "R", "more.R")
+    with open(more, "w") as f:
+        f.write('source("R/loaders.R")\nlibrary(dplyr)\nh <- fetch_table("2024-01", name = "holdings/latest")\nh2 <- h |> filter(wieght > 0)\n'
+                'p <- arrow::read_parquet("s3://my-bucket/prices/2024.parquet")\np2 <- p |> filter(px > 0)\n')
+    out = subprocess.run([tool, "--root", reg, more], capture_output=True, text=True, timeout=120).stdout
+    check('no cached schema for key "holdings/latest"' in out
+          and 'r-colcheck learn "holdings/latest" \'s3_read("holdings/latest")\' --source R/loaders.R (from the loader registry' in out,
+          f"registered loader note unexpected (key argument, derived command):\n{out}")
+    check('r-colcheck learn "s3://my-bucket/prices/2024.parquet" \'arrow::open_dataset("s3://my-bucket/prices/2024.parquet")\'' in out
+          and "reads the schema without the rows" in out, f"remote parquet note should suggest arrow::open_dataset:\n{out}")
+    disc = subprocess.run([tool, "discover", "--root", reg], capture_output=True, text=True, timeout=180)
+    check(disc.returncode == 0 and "2 data sources the checker cannot open, used in 3 places" in disc.stdout
+          and '"holdings/latest"   from fetch_table("2024-01", name = "holdings/latest")   at R/more.R:3, R/report.R:17' in disc.stdout
+          and '"returns/monthly"   3 columns, observed 2025-01-15' in disc.stdout and ", stale)" in disc.stdout
+          and "r-colcheck refresh --stale" in disc.stdout and "r-colcheck learn --all" in disc.stdout,
+          f"discover output unexpected:\n{disc.stdout}{disc.stderr}")
+    dry = subprocess.run([tool, "learn", "--all", "--dry-run", "--root", reg], capture_output=True, text=True, timeout=180)
+    check(dry.returncode == 0 and dry.stdout.count("r-colcheck learn ") == 2 and "2 source(s) would be learned" in dry.stdout,
+          f"learn --all --dry-run unexpected:\n{dry.stdout}{dry.stderr}")
+    with open(os.path.join(reg, ".colcheck", "schemas.json")) as f:
+        check("holdings/latest" not in f.read(), "test premise: holdings/latest cached before learn --all")
+    # the bucket is not reachable from here: one learned, one failed, exit 1
+    la = subprocess.run([tool, "learn", "--all", "--root", reg], capture_output=True, text=True, timeout=300)
+    check(la.returncode == 1 and 'learned  "holdings/latest": 3 columns' in la.stdout
+          and 'failed   "s3://my-bucket/prices/2024.parquet"' in la.stdout and "learned 1 of 2" in la.stdout,
+          f"learn --all unexpected:\n{la.stdout}{la.stderr}")
+    out = subprocess.run([tool, "--root", reg, more], capture_output=True, text=True, timeout=120).stdout
+    check("R/more.R:4: 'wieght' is not a column" in out and 'cached schema "holdings/latest"' in out,
+          f"a registered loader's key argument did not resolve after learn --all:\n{out}")
 
 
 def scenario_colcheck_packages(s):
@@ -885,6 +1238,21 @@ def scenario_lint_fallback(s):
         ctx = hook_context(run_hook(hook, payload, env=env))
         check("summarise_each" in ctx and ("deprecated" in ctx or "superseded" in ctx or "defunct" in ctx),
               f"lifecycle lint missing from the hook note:\n{ctx}")
+        # dplyr 1.2 made it defunct: lintr types that "error", which the hook
+        # once dropped along with parse errors (now only lintr's own parse
+        # pseudo-lint, linter "error", is left out).
+        dplyr = tuple(int(x) for x in rscript('cat(as.character(packageVersion("dplyr")))').strip().split(".")[:2])
+        if dplyr >= (1, 2):
+            check("summarise_each() is defunct" in ctx, f"the defunct call (an error-type lint) is missing from the hook note:\n{ctx}")
+        with open(probe, "a") as f:
+            f.write("v <- (\n")
+        ctx = hook_context(run_hook(hook, payload, env=env))
+        check(ctx.count("unexpected end of input") == 1 and "[error]" not in ctx,
+              f"a parse error should be reported once, by r-colcheck, not also as a lint:\n{ctx}")
+        with open(probe) as f:
+            kept = f.read().replace("v <- (\n", "")
+        with open(probe, "w") as f:
+            f.write(kept)
     started = run_hook(start, {}, env=env, stdin_text="{}")
     check("Lint profile inactive" in started and ".lintr takes precedence" in started and "post-edit hook" in started,
           f"session-start did not report the inactive profile:\n{started}")
@@ -908,7 +1276,50 @@ def scenario_callmap(s):
     root = os.path.join(s.scratch, "callmap")
     files = {
         "DESCRIPTION": "Package: callmapfix\nTitle: Fixture\nVersion: 0.0.1\nDescription: r-callmap fixture.\nLicense: MIT\n",
-        "NAMESPACE": "export(outer_step)\nexport(run_all)\nS3method(print, myclass)\n",
+        "NAMESPACE": "export(outer_step)\nexport(run_all)\nexport(Account)\nS3method(print, myclass)\n",
+        # R6: Class$new() reaches initialize (up the inherit chain), self$/
+        # private$/super$ and an object made in the same function resolve.
+        "R/account.R": ("Account <- R6::R6Class(\"Account\",\n  public = list(\n    balance = 0,\n"
+                        "    initialize = function(balance = 0) {\n      self$balance <- balance\n      private$audit(\"init\")\n    },\n"
+                        "    deposit = function(x) {\n      self$balance <- self$balance + validate_amount(x)\n"
+                        "      private$audit(\"deposit\")\n      invisible(self)\n    }\n  ),\n"
+                        "  private = list(audit = function(what) message(what)),\n"
+                        "  active = list(pretty = function() paste0(\"$\", self$balance))\n)\n\n"
+                        "Savings <- R6::R6Class(\"Savings\", inherit = Account,\n"
+                        "  public = list(accrue = function(rate) {\n    super$deposit(self$balance * rate)\n    self$deposit(0)\n  })\n)\n\n"
+                        "validate_amount <- function(x) {\n  stopifnot(is.numeric(x))\n  x\n}\n\n"
+                        "open_account <- function() {\n  acct <- Account$new(10)\n  acct$deposit(5)\n  acct$pretty\n}\n"),
+        # Dotted names: an S3 method needs a registered or project generic, or
+        # a base generic with a class the code names; the rest are functions.
+        "R/dotted.R": ("summary.stats <- function(x) mean(x)\nt.test_wrapper <- function(x) x\n"
+                       "split.by <- function(df, g) split(df, df[[g]])\n"
+                       "format.money <- function(x, ...) paste0(\"$\", unclass(x))\n"
+                       "new_money <- function(x) structure(x, class = \"money\")\n"),
+        # Aliases and lists of functions, a memoised literal, a string held in
+        # a local or pasted from literals, a comment naming the callee.
+        "R/values.R": ("twice_helper <- helper\nhelpers <- list(h = helper, byname = by_string)\n"
+                       "memo_helper <- memoise::memoise(function(x) helper(x) + 1)\n"
+                       "use_alias <- function(x) twice_helper(x)\n"
+                       "use_registry <- function(x) helpers$h(x) + helpers[[\"byname\"]](list(x))\n"
+                       "use_memo <- function(x) memo_helper(x)\n\n"
+                       "pinned <- function(xs) {\n  lapply(\n    # map helper over each item\n    xs, helper)\n}\n\n"
+                       "by_const <- function(xs) {\n  fname <- \"by_string\"\n  do.call(fname, list(xs))\n}\n"
+                       "by_paste <- function(xs) {\n  f <- match.fun(paste0(\"by_\", \"string\"))\n  f(xs)\n}\n"),
+        # A testthat helper with a setup statement and a fixture built at the
+        # top is shared with the test files, like a file of definitions.
+        "tests/testthat/helper-fixtures.R": ("withr::local_options(list(digits = 3))\nfixture <- by_string(list(1, 2))\n"
+                                             "check_by <- function(x) testthat::expect_equal(by_string(x), 3)\n"),
+        # Outside R/: a definitions file loaded by a loop is shared wherever it
+        # lives (a bare setClass() does not make it a script); a function
+        # defined in a script is private to the script and its source()rs.
+        "analysis/lib/tools.R": "setClass(\"Thing\", representation(x = \"numeric\"))\ntool_fn <- function(x) helper(x)\n",
+        "analysis/main.R": ("for (p in list.files(\"analysis/lib\", full.names = TRUE)) source(p)\n"
+                            "main_only <- function() tool_fn(2)\nprint(main_only())\n"),
+        "analysis/other.R": "main_only()\ntool_fn(3)\ntar_read(total)\n",
+        # targets: a command naming another target depends on it; a target is
+        # pinned to its own tar_target() line, not the first mention of its name.
+        "_targets.R": ("library(targets)\ntar_source(\"R\")\nlist(\n  tar_target(raw, helper(1)),\n"
+                       "  tar_target(report, describe(total)),\n  tar_target(total, by_string(list(raw)))\n)\n"),
         "R/chain.R": ("outer_step <- function(x, n = 1) {\n  y <- middle_step(x)\n  y + n\n}\n\n"
                       "middle_step <- function(x) {\n  inner_step(x) * 2\n}\n\n"
                       "inner_step <- function(x) {\n  x + 1\n}\n"),
@@ -920,7 +1331,9 @@ def scenario_callmap(s):
                       "describe.myclass <- function(obj, ...) {\n  helper(obj$value)\n}\n\n"
                       "print.myclass <- function(x, ...) {\n  cat(\"myclass\", describe(x), \"\\n\")\n  invisible(x)\n}\n\n"
                       "orphan <- function() {\n  \"nobody calls me\"\n}\n"),
-        "tests/testthat/test-a.R": "test_that(\"outer_step works\", {\n  expect_equal(outer_step(1), 5)\n})\n",
+        "tests/testthat/test-a.R": ("test_that(\"outer_step works\", {\n  expect_equal(outer_step(1), 5)\n})\n"
+                                    "test_that(\"savings\", {\n  a <- Savings$new(1)\n  a$accrue(0.5)\n"
+                                    "  expect_equal(a$balance, 1.5)\n  check_by(fixture)\n})\n"),
         "scripts/run.R": "source(\"R/apply.R\")\nres <- run_all(list(1, 2))\nprint(res)\n",
         # Chunks are read as knitr runs them: prose and a python chunk are not
         # calls, a chunk that does not parse is skipped on its own, a function
@@ -945,7 +1358,7 @@ def scenario_callmap(s):
     # From a subdirectory with no --root: the wrapper finds the package root.
     full = run(cwd=os.path.join(root, "R"))
     lines = full.splitlines()
-    check("static call map of" in lines[0] and "12 functions in 6 files, 1 of them Rmd/qmd" in lines[0],
+    check("static call map of" in lines[0] and "36 functions and 3 targets in 14 files, 1 of them Rmd/qmd" in lines[0],
           f"header unexpected:\n{full[:600]}")
     rmd = os.path.join(root, "vignettes", "intro.Rmd")
     broken_chunk = line_of(rmd, "```{r broken}") + 1
@@ -993,6 +1406,83 @@ def scenario_callmap(s):
     check("orphan" in unref and "wrap" in unref and "print.myclass" not in unref and "outer_step" not in unref
           and "vig_helper" not in unref, f"unreferenced unexpected:\n{unref}")
     check("Recursion/cycles" not in full, f"cycles reported for an acyclic fixture:\n{full}")
+    check("[private to this file]" in vig and "[private to this file]" not in inner, f"the private tag is for a script's definitions:\n{vig}\n{inner}")
+
+    def row(rel, sig, anchor):
+        """The listing line of the definition `sig` whose line holds `anchor` in `rel`."""
+        loc = f"{rel}:{line_of(os.path.join(root, rel), anchor)}"
+        hit = [l for l in lines if l.strip().startswith(loc + " ") and f"  {sig}" in l]
+        check(len(hit) == 1, f"no definition line '{loc} {sig}':\n{full}")
+        return hit[0]
+
+    # Definitions outside R/ (CM-B1): a loop-loaded lib file and a testthat
+    # helper with top-level statements are shared; a script's own function is
+    # private to it and its source()rs, and says so.
+    tool_fn = row("analysis/lib/tools.R", "tool_fn(x)", "tool_fn <- function")
+    main_only = row("analysis/main.R", "main_only()", "main_only <- function")
+    check_by = row("tests/testthat/helper-fixtures.R", "check_by(x)", "check_by <- function")
+    check("called by: main_only, analysis/other.R" in tool_fn and "private" not in tool_fn, f"lib function lost its callers:\n{tool_fn}")
+    check("[private to this file]" in main_only and "calls: tool_fn" in main_only and "called by: analysis/main.R" in main_only
+          and "other.R" not in main_only, f"script-private function unexpected:\n{main_only}")
+    check(any(l.startswith("analysis/other.R") and "top-level code calls: tool_fn, target total" in l for l in lines),
+          f"other.R heading unexpected (main_only is private to main.R, tar_read() names a target):\n{full}")
+    check("calls: by_string" in check_by and "called by: tests/testthat/test-a.R" in check_by and "private" not in check_by,
+          f"testthat helper unexpected:\n{check_by}")
+    check("check_by" not in unref and "tool_fn" not in unref and "main_only" in entry, f"summary sections unexpected:\n{entry}\n{unref}")
+
+    # Dotted names (CM-B4).
+    stats = row("R/dotted.R", "summary.stats(x)", "summary.stats <- function")
+    money = row("R/dotted.R", "format.money(x, ...)", "format.money <- function")
+    check('[not an S3 method of summary: no class "stats" in the project]' in stats and "[S3 method" not in stats,
+          f"summary.stats tagged as a method:\n{stats}")
+    check("[S3 method of format]" in money, f"format.money not a method although class \"money\" is made:\n{money}")
+    for plain in ("summary.stats", "t.test_wrapper", "split.by"):
+        check(plain in unref and plain in entry, f"{plain} missing from the entry/unreferenced lists:\n{entry}\n{unref}")
+    check("format.money" not in unref and "[S3 method of t]" not in full, f"unreferenced unexpected:\n{unref}")
+
+    # R6 (CM-B2).
+    account = os.path.join(root, "R", "account.R")
+    cls = row("R/account.R", "Account (R6 class)", "Account <- R6::R6Class")
+    init = row("R/account.R", "Account$initialize(balance)", "initialize = function")
+    deposit = row("R/account.R", "Account$deposit(x)", "deposit = function")
+    pretty = row("R/account.R", "Account$pretty()", "pretty = function")
+    accrue = row("R/account.R", "Savings$accrue(rate)", "accrue = function")
+    opened = row("R/account.R", "open_account()", "open_account <- function")
+    check("[exported]" in cls, f"export(Account) did not resolve:\n{cls}")
+    check("calls: Account$audit" in init and "called by: open_account, tests/testthat/test-a.R" in init,
+          f"Class$new() does not reach initialize (also through Savings, which inherits it):\n{init}")
+    check("calls: validate_amount, Account$audit" in deposit and "called by: Savings$accrue (2), open_account" in deposit,
+          f"super$/self$ up the inherit chain and obj$method() unexpected:\n{deposit}")
+    check("called by: open_account" in pretty, f"active binding access unexpected:\n{pretty}")
+    check("calls: Account$deposit" in accrue and "called by: tests/testthat/test-a.R" in accrue, f"Savings$accrue unexpected:\n{accrue}")
+    check("calls: Account$initialize, Account$deposit, Account$pretty" in opened, f"open_account unexpected:\n{opened}")
+    check("Account$deposit (via Savings$accrue)" in run("--tests", "Account$deposit"), "--tests does not reach an R6 method through $new/obj$m()")
+    near_cls = run("Account")
+    check(f"methods: Account$initialize (R/account.R:{line_of(account, 'initialize = function')})" in near_cls, f"class neighbourhood unexpected:\n{near_cls}")
+
+    # Aliases, lists of functions and wrapped literals (CM-B3); constant
+    # strings (CM-B7); the call site is never a comment line (CM-B6).
+    values = os.path.join(root, "R", "values.R")
+    check("calls: helper" in row("R/values.R", "use_alias(x)", "use_alias <- function"), "a call through an alias is not a call")
+    check("calls: helper, by_string" in row("R/values.R", "use_registry(x)", "use_registry <- function"), "helpers$h()/helpers[[\"byname\"]]() not resolved")
+    memo = row("R/values.R", "memo_helper(x)", "memo_helper <- memoise")
+    check("calls: helper" in memo and "called by: use_memo" in memo, f"memoised literal unexpected:\n{memo}")
+    check("use_alias" in helper and "use_registry" in helper and "memo_helper" in helper and "twice_helper" not in full,
+          f"helper's callers through aliases unexpected:\n{helper}")
+    check("calls: by_string (by string)" in row("R/values.R", "by_const(xs)", "by_const <- function"), "do.call(fname) with a constant local not resolved")
+    check("calls: by_string (by string)" in row("R/values.R", "by_paste(xs)", "by_paste <- function"), "match.fun(paste0()) of literals not resolved")
+    near_helper = run("helper")
+    check(f"pinned (as value)   R/values.R:{line_of(values, 'pinned <- function')}   (call at R/values.R:{line_of(values, 'xs, helper)')})" in near_helper,
+          f"call site pinned to a comment line:\n{near_helper}")
+
+    # targets (CM-B5): dependencies between targets, pinned to their own line.
+    tfile = os.path.join(root, "_targets.R")
+    raw = row("_targets.R", "target raw", "tar_target(raw")
+    total = row("_targets.R", "target total", "tar_target(total")
+    check("calls: helper   called by: target total" in raw, f"target raw unexpected:\n{raw}")
+    check("calls: by_string, target raw" in total and "called by: target report, analysis/other.R" in total, f"target total unexpected:\n{total}")
+    check(f"_targets.R:{line_of(tfile, 'tar_target(report')}   target report" in full and "calls: describe, target total" in full,
+          f"target report unexpected:\n{full}")
 
     # Neighbourhood: callers two levels up, with call sites, and nothing unrelated.
     near = run("inner_step")
@@ -1014,7 +1504,7 @@ def scenario_callmap(s):
 
     data = json.loads(run("--json"))
     by_name = {d["name"]: d for d in data}
-    check(len(data) == 12 and by_name["outer_step"]["exported"] is True and by_name["print.myclass"]["kind"] == "s3_method",
+    check(len(data) == 39 and by_name["outer_step"]["exported"] is True and by_name["print.myclass"]["kind"] == "s3_method",
           f"JSON map unexpected:\n{json.dumps(data)[:800]}")
     check({"by": "vignettes/intro.Rmd", "kind": "direct", "file": "vignettes/intro.Rmd", "line": line_of(rmd, "outer_step(1)")}
           in by_name["outer_step"]["called_by"], f"JSON vignette call site unexpected:\n{json.dumps(by_name['outer_step'])}")
@@ -1023,6 +1513,84 @@ def scenario_callmap(s):
           f"JSON edges unexpected:\n{json.dumps(by_name['run_all'])}")
     sub = json.loads(run("--json", "inner_step"))
     check(sorted(d["name"] for d in sub) == ["inner_step", "middle_step", "outer_step", "vig_helper"], f"JSON neighbourhood unexpected:\n{sub}")
+    check(by_name["middle_step"]["end"] == line_of(chain, "middle_step <- function") + 2, f"JSON end line unexpected:\n{by_name['middle_step']}")
+
+    # --tests: the test files that reach a function through its callers.
+    tests = run("--tests", "inner_step", "helper")
+    check("tests/testthat/test-a.R   inner_step (via middle_step <- outer_step)" in tests
+          and "Rscript -e 'devtools::test(filter = \"^a$\")'" in tests and "No test reaches: helper" in tests,
+          f"--tests output unexpected:\n{tests}")
+    # --file: the neighbourhood of every function defined in one file.
+    per_file = run("--file", "R/apply.R", "--depth", "1")
+    check("around run_all, helper, by_string, wrap, depth 1" in per_file.splitlines()[0] and "by_string (by string)" in per_file,
+          f"--file output unexpected:\n{per_file}")
+
+    # --diff: what the working tree changes against HEAD. The fixture becomes a
+    # repository; then a signature changes, a body changes, a function goes, a
+    # new one arrives in a new (untracked) file, and top-level code changes.
+    def git(*a):
+        out = subprocess.run(["git", *a], cwd=root, capture_output=True, text=True)
+        check(out.returncode == 0, f"git {' '.join(a)} failed:\n{out.stderr}")
+        return out.stdout
+    git("init", "-q")
+    git("add", "-A")
+    git("-c", "user.email=smoke@test", "-c", "user.name=smoke", "commit", "-qm", "base")
+    before = run("--diff")
+    check("No R file differs from HEAD" in before, f"--diff on a clean tree unexpected:\n{before}")
+    with open(chain) as f:
+        text = f.read()
+    text = text.replace("inner_step <- function(x) {\n  x + 1\n}", "inner_step <- function(x, offset = 1) {\n  x + offset\n}")
+    with open(chain, "w") as f:
+        f.write(text)
+    printr = os.path.join(root, "R", "print.R")
+    with open(printr) as f:
+        text = f.read()
+    with open(printr, "w") as f:
+        f.write(text.replace('orphan <- function() {\n  "nobody calls me"\n}\n', ""))
+    with open(os.path.join(root, "R", "apply.R"), "a") as f:
+        f.write("\nhelper <- function(x) x * 4\n")
+    with open(os.path.join(root, "R", "extra.R"), "w") as f:
+        f.write("extra_fn <- function() helper(1)\n")
+    with open(os.path.join(root, "scripts", "run.R"), "a") as f:
+        f.write("print(orphan())\n")
+    diff = run("--diff")
+    check(f"inner_step(x, offset)   R/chain.R:{line_of(chain, 'inner_step <- function')}   [arguments were (x)]   called by: middle_step, vig_helper" in diff,
+          f"--diff missed the signature change:\n{diff}")
+    check("A changed argument list" in diff and "[body changed]" in diff and "extra_fn()   R/extra.R:1   [new]" in diff,
+          f"--diff change kinds unexpected:\n{diff}")
+    check("helper(x)   R/apply.R:16   [body changed]   [also defined at R/apply.R:6]" in diff,
+          f"--diff missed the redefined helper:\n{diff}")
+    check("orphan()   was R/print.R:" in diff and "still mentioned at: scripts/run.R:4" in diff, f"--diff missed the removed function:\n{diff}")
+    check("Top-level code changed:" in diff and "  scripts/run.R (lines 4)" in diff and "R/print.R" not in diff.split("Top-level code changed:")[1].split("\n\n")[0],
+          f"--diff top-level section unexpected:\n{diff}")
+    check("tests/testthat/test-a.R   inner_step (via middle_step <- outer_step)" in diff and "No test reaches: " in diff
+          and "extra_fn" in diff.split("No test reaches: ")[1], f"--diff tests section unexpected:\n{diff}")
+    check("Callers and callees of the changed definitions (depth 2):" in diff and f"      outer_step   R/chain.R:{top_def}   (call at R/chain.R:{top_call})" in diff,
+          f"--diff neighbourhood unexpected:\n{diff}")
+    data = json.loads(run("--json", "--diff"))
+    changed = {c["name"]: c for c in data["changed"]}
+    check(changed["inner_step"]["change"] == "arguments were (x)" and changed["extra_fn"]["change"] == "new"
+          and data["deleted"][0]["name"] == "orphan" and data["deleted"][0]["mentions"] == ["scripts/run.R:4"]
+          and any(t["file"] == "tests/testthat/test-a.R" and "inner_step" in t["reaches"] for t in data["tests"])
+          and "extra_fn" in data["untested"], f"--diff JSON unexpected:\n{json.dumps(data)[:1200]}")
+    nogit = s.make_project("callmap_nogit", {"R/apply.R": os.path.join(root, "R", "apply.R")})
+    check("is not inside a git repository" in run("--root", nogit, "--diff"), "--diff outside git should say so")
+
+    # Without a NAMESPACE the dotted-name rule is the same: a class the code
+    # names corroborates a base generic's method, nothing else does.
+    plain = run("--root", s.make_project("callmap_plain", {"R/dotted.R": os.path.join(root, "R", "dotted.R")}))
+    check('[not an S3 method of summary: no class "stats" in the project]' in plain and "[S3 method of format]" in plain
+          and "[S3 method of t]" not in plain, f"dotted names outside a package unexpected:\n{plain}")
+
+    # A wrong or empty root is an error (exit 2, nothing on stdout), not a map
+    # of no functions (DT-06).
+    empty = os.path.join(s.scratch, "callmap_empty")
+    os.makedirs(empty, exist_ok=True)
+    for args, said in ((["--root", "/nonexistent/dir", "helper"], "no such directory"), (["--root", empty], "no R, Rmd or qmd file"),
+                       (["--json", "--root", empty], "pass --root DIR"), (["--root", os.path.join(root, "DESCRIPTION")], "no such directory")):
+        out = subprocess.run([tool, *args], cwd=root, capture_output=True, text=True, timeout=120)
+        check(out.returncode == 2 and said in out.stderr and out.stdout == "",
+              f"r-callmap {' '.join(args)}: exit {out.returncode}, expected 2 and '{said}' on stderr:\n{out.stdout}{out.stderr}")
 
 
 def scenario_hooks(s):
@@ -1130,6 +1698,66 @@ def scenario_hooks(s):
                            capture_output=True, text=True).stdout
     check("has exited" in shown, f"r-lsp-status did not notice the dead server:\n{shown}")
 
+    # Two live servers in one project (a second session in the same
+    # directory): every line carries its server's pid, and the readers show
+    # this session's server when its session id or its parent process (here
+    # the test process, an ancestor of the hook) tells it apart, else every
+    # live one, saying so. Server a is ready, server b still indexing.
+    pid_a, pid_b = os.getpid(), os.getppid()
+
+    def two_servers(ppid_b, sessions=True):
+        with open(status_file, "w") as f:
+            f.write(f"12:00:00 [{root}] [pid {pid_a}] R LSP: server started (pid {pid_a}, ppid 1, languageserver 0.3.20{', session sess-a' if sessions else ''})\n"
+                    f"12:00:01 [{root}] [pid {pid_a}] R LSP: index ready (3 files, 1.0 s)\n"
+                    f"12:05:00 [{root}] [pid {pid_b}] R LSP: server started (pid {pid_b}, ppid {ppid_b}, languageserver 0.3.20{', session sess-b' if sessions else ''})\n"
+                    f"12:05:01 [{root}] [pid {pid_b}] R LSP: workspace: indexing 3 files\n"
+                    f"12:05:02 [{root}] [pid {pid_a}] R LSP: added workspace /tmp/other\n")
+
+    def status_as(session):
+        return subprocess.run([status_tool], env=dict(os.environ, CLAUDE_PROJECT_DIR=root, R_LSP_STATUS_FILE=status_file,
+                                                      CLAUDE_CODE_SESSION_ID=session), capture_output=True, text=True).stdout
+
+    def note_as(session):
+        p = dict(payload, session_id=session) if session else {k: v for k, v in payload.items() if k != "session_id"}
+        return hook_context(run_hook(lsp_hook, p, env={"CLAUDE_PROJECT_DIR": root, "R_LSP_STATUS_FILE": status_file,
+                                                        "CLAUDE_CODE_SESSION_ID": session}))
+
+    two_servers(ppid_b=1)
+    shown = status_as("sess-a")
+    check("index ready" in shown and "added workspace" in shown and "indexing 3 files" not in shown,
+          f"r-lsp-status as session a showed the other session's server:\n{shown}")
+    check("still indexing" not in note_as("sess-a"), "post-lsp note said 'still indexing' from the other session's server")
+    shown = status_as("sess-b")
+    check("indexing 3 files" in shown and "index ready" not in shown, f"r-lsp-status as session b wrong:\n{shown}")
+    ctx = note_as("sess-b")
+    check("still indexing" in ctx and "another session" not in ctx, f"post-lsp note as session b wrong:\n{ctx}")
+    two_servers(ppid_b=1, sessions=False)
+    shown = status_as("")
+    check("2 servers are running" in shown and "index ready" in shown and "indexing 3 files" in shown,
+          f"r-lsp-status with no way to tell the servers apart should show both:\n{shown}")
+    ctx = note_as("")
+    check("still indexing" in ctx and "another session's, or this one's" in ctx and f"server pid {pid_b}" in ctx,
+          f"post-lsp note with two live servers should name the uncertainty and the pid:\n{ctx}")
+    two_servers(ppid_b=pid_a, sessions=False)   # b was started by this process, the hook's ancestor
+    shown = status_as("")
+    check("indexing 3 files" in shown and "index ready" not in shown and "2 servers" not in shown,
+          f"r-lsp-status did not pick the server whose parent is its ancestor:\n{shown}")
+    ctx = note_as("")
+    check("still indexing" in ctx and "another session" not in ctx, f"post-lsp note did not pick the server by ancestry:\n{ctx}")
+    # A server that could not activate renv: the note says its 'not
+    # installed' diagnostics and empty hovers are not answers.
+    with open(status_file, "a") as f:
+        f.write(f"12:06:00 [{root}] [pid {pid_b}] R LSP: renv activation added no library: packages the project pins read as not installed\n")
+    ctx = note_as("")
+    check("could not use this project's renv library" in ctx and "added no library" in ctx, f"post-lsp note missed the renv failure:\n{ctx}")
+    # Without CLAUDE_PROJECT_DIR (the Bash tool after a cd into a
+    # subdirectory) the project is the nearest ancestor with events.
+    no_project = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
+    shown = subprocess.run([status_tool], cwd=os.path.join(root, "R"), env=dict(no_project, R_LSP_STATUS_FILE=status_file, CLAUDE_CODE_SESSION_ID=""),
+                           capture_output=True, text=True).stdout
+    check("indexing 3 files" in shown and "No R LSP status events" not in shown,
+          f"r-lsp-status run from a subdirectory did not find the project's events:\n{shown}")
+
     # The monitor forwards only the events Claude can act on, for this
     # directory only, and drops the timestamp and tag.
     monitor = os.path.join(REPO, "plugins", "r-lsp", "hooks", "monitor-status.sh")
@@ -1165,10 +1793,172 @@ def scenario_hooks(s):
         check(False, "monitor kept running in a directory with no R files")
 
 
+def scenario_hooks_changes(s):
+    """Changes the Edit|Write hook never sees. A file written through Bash is
+    checked by the post-bash hook (bug linters included) once, the ledger
+    keeping it from being checked again; the stop hook holds the turn once
+    for findings in a file no check has seen; a subagent gets the context at
+    its start and the bug linters after its edits; session start on compact
+    re-stamps the session."""
+    root = s.make_project("hooks_changes", {"data/sales.csv": os.path.join(FIXTURES, "columns", "data", "sales.csv")})
+    data_dir = os.path.join(s.scratch, "hooks_changes_data")
+    env = {"CLAUDE_PROJECT_DIR": root, "CLAUDE_PLUGIN_DATA": data_dir}
+    hooks = os.path.join(REPO, "plugins", "r-lsp", "hooks")
+    sid = "smoke-session"
+
+    def payload(**kw):
+        return dict({"session_id": sid, "cwd": root}, **kw)
+
+    def hook(name, **kw):
+        return run_hook(os.path.join(hooks, name), payload(**kw), env=env)
+
+    rfile = os.path.join(root, "R", "clean.R")
+    os.makedirs(os.path.dirname(rfile))
+    with open(rfile, "w") as f:
+        f.write("library(dplyr)\nsales <- readr::read_csv('data/sales.csv')\nout <- sales %>% filter(regoin == 'A')\n"
+                "undefined_helper_xyz(out)\n")
+    # Before any session start there is no stamp: the hooks stay quiet.
+    check(not hook("post-bash.sh", tool_name="Bash", tool_input={"command": "cat > R/clean.R"}).strip(),
+          "post-bash spoke before the session was stamped")
+    out = hook("session-start.sh", source="compact")
+    check("R LSP plugin: R scripts project" in out, f"session-start context on compact unexpected:\n{out}")
+    stamp = os.path.join(data_dir, "sessions", sid, "start.stamp")
+    check(os.path.exists(stamp), "session-start did not stamp the session")
+    time.sleep(1.1)  # the ledger keys on whole seconds
+    with open(rfile, "a") as f:
+        f.write("# written through Bash\n")
+    ctx = hook_context(hook("post-bash.sh", tool_name="Bash", tool_input={"command": "cat >> R/clean.R <<'EOF'"}))
+    check("this command changed 1 R file (R/clean.R)" in ctx and "'regoin' is not a column" in ctx, f"post-bash note unexpected:\n{ctx}")
+    check("bug linters" in ctx and "undefined_helper_xyz" in ctx and "could not find function" in ctx,
+          f"post-bash note has no bug-linter diagnostics (the server never sees Bash-made changes):\n{ctx}")
+    check("does not see changes made through Bash" in ctx, f"post-bash note does not warn about the server's stale view:\n{ctx}")
+    check(not hook("post-bash.sh", tool_name="Bash", tool_input={"command": "ls"}).strip(), "post-bash checked the same file twice")
+    check(not hook("stop-check.sh", stop_hook_active=False).strip(), "stop hook spoke although every file was checked")
+    time.sleep(1.1)
+    with open(rfile, "a") as f:
+        f.write("more <- sales %>% select(amuont)\n")
+    data = json.loads(hook("stop-check.sh", stop_hook_active=False))
+    check(data["decision"] == "block" and "without a post-edit check" in data["reason"] and "'amuont' is not a column" in data["reason"]
+          and "will not hold the turn twice" in data["reason"], f"stop hook block unexpected:\n{data}")
+    check(not hook("stop-check.sh", stop_hook_active=False).strip(), "stop hook held the turn again for a file it had checked")
+    time.sleep(1.1)
+    with open(rfile, "a") as f:
+        f.write("again <- sales %>% select(amuont)\n")
+    check(not hook("stop-check.sh", stop_hook_active=True).strip(), "stop hook held the turn twice (stop_hook_active)")
+
+    # A subagent: context at its start, the bug linters after its edits.
+    ctx = hook_context(hook("subagent-start.sh", agent_id="agent-1", agent_type="general-purpose"))
+    check("You are a subagent" in ctx and "r-callmap" in ctx and "R LSP plugin:" in ctx, f"subagent-start context unexpected:\n{ctx}")
+    ctx = hook_context(hook("post-edit.sh", agent_id="agent-1", tool_name="Edit", tool_input={"file_path": rfile}))
+    check("bug linters" in ctx and "undefined_helper_xyz" in ctx and "'regoin' is not a column" in ctx,
+          f"post-edit inside a subagent ran no bug linters:\n{ctx}")
+    ctx = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": rfile}))
+    check("bug linters" not in ctx and "'regoin' is not a column" in ctx,
+          f"post-edit in the main conversation ran the bug linters without a .lintr (the server reports there):\n{ctx}")
+    check(not hook("post-bash.sh", tool_name="Bash", tool_input={"command": "ls"}).strip(), "post-bash re-checked a file the edit hook had checked")
+
+    # Many files at once (a git checkout): the newest ten are checked, the rest listed.
+    time.sleep(1.1)
+    for i in range(12):
+        with open(os.path.join(root, "R", f"gen_{i:02d}.R"), "w") as f:
+            f.write(f"gen_{i} <- function(x) x + {i}\n")
+    ctx = hook_context(hook("post-bash.sh", tool_name="Bash", tool_input={"command": "git checkout other"}))
+    check("this command changed 12 R files" in ctx and "and 2 more" in ctx and "Not checked (over the limit of 10 per command)" in ctx
+          and "Checked (10 files): no column, argument or parse findings" in ctx, f"post-bash note for many files unexpected:\n{ctx}")
+    check(not hook("post-bash.sh", tool_name="Bash", tool_input={"command": "ls"}).strip(), "post-bash re-checked files it had listed")
+
+    # Outside an R project nothing runs.
+    other = os.path.join(s.scratch, "hooks_changes_other")
+    os.makedirs(other, exist_ok=True)
+    with open(os.path.join(other, "main.py"), "w") as f:
+        f.write("print(1)\n")
+    quiet = run_hook(os.path.join(hooks, "post-bash.sh"), {"session_id": "other-session", "cwd": other, "tool_name": "Bash"},
+                     env={"CLAUDE_PROJECT_DIR": other, "CLAUDE_PLUGIN_DATA": data_dir})
+    check(not quiet.strip(), f"post-bash spoke outside an R project:\n{quiet}")
+
+    # A file in another repository (after /add-dir, or edited by a subagent)
+    # or in a package nested under the session root is checked against its
+    # own project: R/ helpers, .colcheck.json, schema cache, renv library.
+    # Rooted at the session, pkgcols' pipeline helper was unknown and the
+    # finding silently lost.
+    other_repo = os.path.join(s.scratch, "hooks_changes_other_repo")
+    shutil.copytree(os.path.join(FIXTURES, "pkgcols"), other_repo)
+    ctx = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": os.path.join(other_repo, "R", "pipeline.R")}))
+    check("R/pipeline.R:5: 'amout' is not a column" in ctx, f"post-edit on a file in another repository missed the finding:\n{ctx}")
+    mono = os.path.join(s.scratch, "hooks_changes_mono")
+    os.makedirs(os.path.join(mono, "pkgs"))
+    open(os.path.join(mono, ".git"), "w").close()
+    shutil.copytree(os.path.join(FIXTURES, "pkgcols"), os.path.join(mono, "pkgs", "a"))
+    ctx = hook_context(run_hook(os.path.join(hooks, "post-edit.sh"),
+                                {"session_id": sid, "cwd": mono, "tool_name": "Edit",
+                                 "tool_input": {"file_path": os.path.join(mono, "pkgs", "a", "R", "pipeline.R")}},
+                                env={"CLAUDE_PROJECT_DIR": mono, "CLAUDE_PLUGIN_DATA": data_dir}))
+    check("R/pipeline.R:5: 'amout' is not a column" in ctx, f"post-edit on a package nested under the session root missed the finding:\n{ctx}")
+
+    # R itself failing (a broken library) is said, not swallowed with its
+    # stderr: silence means checked and clean. A fake Rscript stands in.
+    fake = os.path.join(s.scratch, "fake_rscript")
+    os.makedirs(fake, exist_ok=True)
+    with open(os.path.join(fake, "Rscript"), "w") as f:
+        f.write("#!/bin/sh\nexit 3\n")
+    os.chmod(os.path.join(fake, "Rscript"), 0o755)
+    broken_env = dict(env, PATH=fake + os.pathsep + os.environ.get("PATH", ""))
+    ctx = hook_context(run_hook(os.path.join(hooks, "post-edit.sh"), payload(tool_name="Edit", tool_input={"file_path": rfile}), env=broken_env))
+    check("did not run on" in ctx and "status 3" in ctx and rfile in ctx and "r-colcheck" in ctx,
+          f"post-edit hook was silent when Rscript failed:\n{ctx}")
+    time.sleep(1.1)
+    crash = os.path.join(root, "R", "crash.R")
+    with open(crash, "w") as f:
+        f.write("x <- 1\n")
+    ctx = hook_context(run_hook(os.path.join(hooks, "post-bash.sh"), payload(tool_name="Bash", tool_input={"command": "touch R/crash.R"}), env=broken_env))
+    check("the check did not run" in ctx and "status 3" in ctx and "R/crash.R" in ctx, f"post-bash hook was silent when Rscript failed:\n{ctx}")
+    out = run_hook(os.path.join(hooks, "stop-check.sh"), payload(stop_hook_active=False), env=broken_env)
+    check("systemMessage" in out and "could not be checked" in out, f"stop hook was silent when Rscript failed:\n{out}")
+    # The ledger was not written, so the real check still happens.
+    ctx = hook_context(hook("post-bash.sh", tool_name="Bash", tool_input={"command": "ls"}))
+    check("this command changed 1 R file (R/crash.R)" in ctx and "Checked: no column" in ctx,
+          f"a file whose check crashed was not checked again:\n{ctx}")
+
+
+    # r-lint: the same linters from the shell, exit 1 with findings, parse errors named.
+    lint_tool = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-lint")
+    out = subprocess.run([lint_tool, rfile], capture_output=True, text=True, timeout=120)
+    check(out.returncode == 1 and "undefined_helper_xyz" in out.stdout and "[undefined_function_linter]" in out.stdout
+          and "r-lint: " in out.stderr and "finding(s) in 1 file(s)" in out.stderr, f"r-lint unexpected:\n{out.stdout}{out.stderr}")
+    broken = os.path.join(root, "R", "broken.R")
+    with open(broken, "w") as f:
+        f.write("x <- (1\n")
+    out = subprocess.run([lint_tool, "--json", broken], capture_output=True, text=True, timeout=120)
+    check(out.returncode == 1 and "does not parse" in json.loads(out.stdout)["lints"][0] and "1 did not parse" in out.stderr,
+          f"r-lint on a broken file unexpected:\n{out.stdout}{out.stderr}")
+    clean = os.path.join(root, "R", "clean_fn.R")
+    with open(clean, "w") as f:
+        f.write("add_one <- function(x) x + 1\n")
+    out = subprocess.run([lint_tool, clean], capture_output=True, text=True, timeout=120)
+    check(out.returncode == 0 and not out.stdout.strip(), f"r-lint on a clean file unexpected:\n{out.stdout}{out.stderr}")
+    check(subprocess.run([lint_tool, "nope.R"], capture_output=True, text=True, timeout=60).returncode == 2, "r-lint on a missing file should exit 2")
+
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,
              scenario_renv_old_lintr, scenario_renv_old_purrr,
-             scenario_complete_answers, scenario_cold_hover, scenario_shared_scope, scenario_other_repository,
-             scenario_colcheck, scenario_colcheck_cache, scenario_colcheck_packages, scenario_lint_fallback, scenario_callmap, scenario_hooks]
+             scenario_complete_answers, scenario_cold_hover, scenario_shared_scope, scenario_stale_files, scenario_other_repository,
+             scenario_colcheck, scenario_colcheck_cache, scenario_colcheck_packages, scenario_lint_fallback, scenario_callmap, scenario_colmap,
+             scenario_hooks, scenario_hooks_changes]
+
+
+def check_manifests():
+    """The plugin's version is written in two manifests; a release moves both."""
+    with open(os.path.join(REPO, "plugins", "r-lsp", ".claude-plugin", "plugin.json")) as f:
+        plugin = json.load(f)["version"]
+    with open(os.path.join(REPO, ".claude-plugin", "marketplace.json")) as f:
+        market = json.load(f)["plugins"][0]["version"]
+    check(plugin == market, f"plugin.json says {plugin}, marketplace.json says {market}")
+    with open(os.path.join(REPO, "plugins", "r-lsp", "hooks", "hooks.json")) as f:
+        hooks = json.load(f)["hooks"]
+    for event, entries in hooks.items():
+        for entry in entries:
+            for h in entry["hooks"]:
+                script = h["command"].replace("${CLAUDE_PLUGIN_ROOT}", os.path.join(REPO, "plugins", "r-lsp")).strip('"')
+                check(os.access(script, os.X_OK), f"{event} hook {script} is missing or not executable")
 
 
 def main():
@@ -1178,6 +1968,7 @@ def main():
     args = parser.parse_args()
 
     require_packages("languageserver", "lintr")
+    check_manifests()
     scratch = tempfile.mkdtemp(prefix="r-lsp-smoke-")
     s = Scenario(scratch, args.keep)
     failures = 0

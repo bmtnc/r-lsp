@@ -7,6 +7,8 @@
 # r-colcheck refresh [--stale] [KEY ...] [--root DIR]
 # r-colcheck schemas [--root DIR]
 # r-colcheck forget KEY [--root DIR]
+# r-colcheck discover [--root DIR]
+# r-colcheck learn --all [--dry-run] [--root DIR]
 #   The schema cache (.colcheck/schemas.json) for data the checker cannot
 #   open: S3 objects, databases, project loaders. `learn` evaluates EXPR in
 #   the project (renv active, no --vanilla) and records the column names;
@@ -18,7 +20,7 @@ case "${1:-}" in
   help|--help|-h)
     exec Rscript --vanilla "$here/../scripts/r-colcheck.R" --help
     ;;
-  learn|refresh|schemas|forget)
+  learn|refresh|schemas|forget|discover)
     cmd="$1"; shift
     root=""
     rest=()
