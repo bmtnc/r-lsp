@@ -78,7 +78,11 @@ n_defs <- if (have_callmap && length(rfiles) <= 500L) tryCatch({
   sum(vapply(defs$rows, function(d) d$kind != "target", TRUE))
 }, error = function(e) NA_integer_) else NA_integer_
 cat(sprintf(paste("`r-callmap` prints a static call map of%s (what calls what, tests, scripts and Rmd/qmd chunks included);",
-                  "run it, or `r-callmap NAME`, before a refactor and open only the files it names.\n"),
+                  "run it, or `r-callmap NAME`, before a refactor and open only the files it names; `r-callmap --diff` lists what",
+                  "the working tree's changes touch and the tests that reach them. Also on PATH: `r-colmap` (every data source, its",
+                  "columns and where each is used), `r-colcheck` (`discover`, `learn --all` for data that is not a local file),",
+                  "`r-lint FILE` (the bug profile), `r-lsp-status`. The r-refactor, r-review and r-data skills give the order of",
+                  "operations; the r-lsp skill is the reference.\n"),
             if (is.na(n_defs)) " the project's functions" else sprintf(" all %d functions", n_defs)))
 text <- paste(out, collapse = "")
 if (subagent) {

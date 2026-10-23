@@ -113,6 +113,7 @@ r-lsp/
 │   └── fixtures/
 ├── .github/workflows/
 │   └── smoke-test.yml          # Runs the test on push and weekly
+├── CHANGELOG.md                # One entry per release
 └── README.md                   # This file
 ```
 
@@ -429,3 +430,5 @@ python3 tests/smoke_test.py -k renv    # scenarios whose name contains "renv"
 ```
 
 CI runs it on every push and weekly, because a new `languageserver` release can break the wrapper's patches without any change here. Set `R_LSP_WRAPPER` to test a different wrapper script.
+
+A release bumps the version in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (the suite checks they agree), adds its entry to `CHANGELOG.md`, and is a commit whose subject starts with the version, tagged `vX.Y.Z`.

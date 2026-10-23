@@ -4,6 +4,22 @@ R language server for Claude Code, with renv support, tidyverse-aware diagnostic
 
 Gives Claude diagnostics after each edit, hover documentation, go-to-definition, find-references, workspace symbol search and call hierarchy for `.R`, `.Rmd` and `.qmd` files, across a package's `R/`, its tests, its scripts and its vignettes (all loaded at startup), plus `r-colcheck`, which checks the column names in tidyverse code against the data the code reads (local files, or a schema cache for S3 and loader data), `r-callmap`, which prints the project's whole call map at once and what a diff touches, and `r-colmap`, the same for data sources and their columns. Every change to an R file is checked, whether made through Edit, Write, a Bash command or a subagent.
 
+## Quick reference
+
+What Claude (and its subagents) get, with no setup beyond the install:
+
+| | |
+|---|---|
+| After every change to an `.R`/`.Rmd`/`.qmd` file, by Edit, Write or a Bash command, in the main conversation or a subagent | a note: column names that cannot exist (r-colcheck), wrong argument names to the project's functions, parse errors, and the bug linters when the server will not report; silence means checked and clean |
+| At the end of a turn | a file changed in the session that no check saw is checked, and the turn held once if it has findings |
+| LSP tool (`ToolSearch "select:LSP"`) | references, definition, hover, symbols, call hierarchy, complete for the whole project; a note after each result lists what `grep` finds that the answer did not |
+| `r-callmap`, `r-callmap NAME`, `r-callmap --diff [REF]`, `--tests NAME`, `--file PATH` | the static call map; the neighbourhood of a function; what a change touches and the tests that reach it |
+| `r-colmap`, `r-colmap COLUMN` | the data map: sources, columns, where each is used, dropped or created |
+| `r-colcheck FILE`, `--steps`, `discover`, `learn KEY 'EXPR'`, `learn --all`, `refresh` | the column check by hand; the column set after each step; the schema cache for data that is not a local file |
+| `r-lint FILE` | the bug profile by hand |
+| `r-lsp-status` | the server's index events |
+| Skills `r-lsp`, `r-refactor`, `r-review`, `r-data` | the reference, and the order of operations for a refactor, a review of a change, and code against data you cannot see |
+
 ## Prerequisites
 
 - R installed, with `R` and `Rscript` on the `PATH` of the shell you start Claude Code from.

@@ -5,6 +5,14 @@ description: Working in an R repository (.R, .Rmd, .qmd files, R packages, tidyv
 
 # R code intelligence in this repository
 
+Quick reference (every tool is on PATH; details follow):
+
+- `r-callmap` (whole project), `r-callmap NAME` (callers and callees), `r-callmap --diff [REF]` (what a change touches, removed functions still mentioned, the tests to run), `r-callmap --tests NAME`, `r-callmap --file PATH`.
+- `r-colmap` (every data source, its columns, where each is used, dropped or created), `r-colmap COLUMN`.
+- `r-colcheck FILE` (column and argument names against the data), `--steps`, `discover` (uncached sources with their learn commands), `learn KEY 'EXPR'`, `learn --all`, `refresh`.
+- `r-lint FILE` (the bug profile), `r-lsp-status` (index events), the LSP tool after `ToolSearch "select:LSP"`.
+- After every Edit, Write or Bash change of an R file a note reports what the checks found; silence means checked and clean. Skills `r-refactor`, `r-review` and `r-data` give the order of operations for those tasks.
+
 Three tools, three kinds of question. Pick by the shape of the question, not by habit:
 
 | Question | Use | Why |
