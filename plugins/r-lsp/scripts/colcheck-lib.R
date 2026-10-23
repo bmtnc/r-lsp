@@ -1414,6 +1414,7 @@ builtin_dataset <- function(nm, ctx) {
 
 keep_source <- function(cols, template) {
   attr(cols, "source") <- attr(template, "source")
+  attr(cols, "source_line") <- attr(template, "source_line")   # a literal is named by its line in the data map
   attr(cols, "inner") <- attr(template, "inner")
   attr(cols, "open") <- attr(template, "open")
   cols

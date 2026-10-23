@@ -2,6 +2,12 @@
 
 One entry per release, newest first. The version is the one in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`; each release is a commit whose subject starts with the version, tagged `vX.Y.Z` by the maintainer (a cloud session cannot push tags). The commit message carries the full account; this file carries the headline.
 
+## 1.9.1 (2026-10-23)
+
+Two r-colmap fixes from the first reports on 1.9.0 (issues #1 and #2): a join of two parameters where y went through a verb first crashed the whole map, and a literal lost its line after the first verb, so later uses, writes and returns landed in a location-less "tribble() literal" source that merged unrelated frames.
+- A column carried out of a frame by a join is recorded as "carried", distinct from a column "joined" in, so the formatter no longer crashes on a parameter that is the y side of a join; a bug in one source's listing now prints a line for that source instead of ending the run (`--help` says always exits 0, and it does again).
+- A frame keeps its literal's line through every verb and join, so each `tibble()`/`tribble()` literal is one source, named by its line, and the sink, return and later uses of its columns are reported under it. That location-less entry had existed since 1.8.1 for any literal pipeline of more than one step; the fates made it visible.
+
 ## 1.9.0 (2026-10-23)
 
 The data map says where a frame was last seen instead of calling a column unused, a join's other frame keeps its source, sinks count, every function parameter used as a frame is a source of its own, and the skill explains how to read a result.

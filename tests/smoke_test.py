@@ -746,7 +746,7 @@ def scenario_colmap(s):
 
     full = run("--file", "R/analysis.R")
     # sales.csv, mtcars, and each tibble()/tribble() literal as a source of its own
-    check("r-colmap: 6 data sources read by 1 file" in full.splitlines()[0], f"colmap header unexpected:\n{full[:300]}")
+    check("r-colmap: 5 data sources read by 1 file" in full.splitlines()[0], f"colmap header unexpected:\n{full[:300]}")
     check("sales.csv   first used at R/analysis.R:10   4 columns: region, year, amount, customer" in full,
           f"colmap source line unexpected:\n{full[:1500]}")
     check("  customer             used 1 time: R/analysis.R:73 (select)" in full, f"last_col() use of customer missing:\n{full[:2500]}")
@@ -784,7 +784,7 @@ def scenario_colmap(s):
     fates_root = os.path.join(FIXTURES, "colmap")
     fates = run(cwd=fates_root)
     head = fates.splitlines()[0]
-    check("r-colmap: 2 data sources read by 5 files" in head and "function parameters used as frames" in head
+    check("r-colmap: 6 data sources read by 7 files" in head and "function parameters used as frames" in head
           and "\"no use seen\" means none in the steps followed" in fates.splitlines()[1], f"colmap fates header unexpected:\n{fates[:600]}")
     # created in a callee, read in a caller the checker followed: a use, across files
     check("  rolling_12m_value_add at R/panel.R:3 (dplyr::mutate); used 1 time" in fates, f"cross-function use missing:\n{fates}")
@@ -805,6 +805,17 @@ def scenario_colmap(s):
     # deframe() reads two columns; nest() consumes what it nests and is followed; a step the checker cannot follow ends tracking
     check("R/panel.R:17 (tibble::deframe)" in fates and "  nst                  at R/more.R:25 (dplyr::mutate); used 1 time" in fates
           and "tracking ended at R/more.R:25 (tidyr::nest)" in fates, f"verb handling unexpected:\n{fates}")
+    # (issue 1) a join of two parameters where y went through a verb first: no crash, the carried column under its own source
+    check("parameter orders of f()   at R/params_join.R:4   reads 1 column: user_id" in fates
+          and "  joined from parameter users of f() at R/params_join.R:4 (dplyr::left_join):\n  status               no use seen in the steps followed; returned by f() at R/params_join.R:4" in fates
+          and "could not be listed" not in fates, f"join of two parameters unexpected:\n{fates}")
+    # (issue 2) a literal keeps its line past the first verb: no location-less source, the sink and the return land on the literal
+    check("tribble() literal   first used" not in fates
+          and "  total                at R/literals.R:2 (dplyr::mutate); no use seen in the steps followed; written by saveRDS() at R/literals.R:7" in fates
+          and "  total                at R/literals.R:11 (dplyr::mutate); no use seen in the steps followed; returned by return_totals() at R/literals.R:11" in fates
+          and "  amount               never named by the code; returned by join_users() at R/literal_join.R:10" in fates
+          and "  joined from tribble() literal at R/literal_join.R:6 at R/literal_join.R:10 (dplyr::left_join):\n  user_name            used 1 time" in fates,
+          f"literal sources unexpected:\n{fates}")
     one = run("userLastName", cwd=fates_root)
     check("carried into another frame at R/panel.R:13" in one and "then returned by with_users() at R/panel.R:13" in one,
           f"column lookup with fates unexpected:\n{one}")

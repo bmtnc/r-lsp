@@ -113,7 +113,7 @@ colmap_build <- function(root, files = NULL) {
         other$columns <- union(other$columns, s$joined$columns)
         for (k in s$joined$keys) other$sites[[k]] <- c(other$sites[[k]], list(list(loc = loc, verb = verb, kind = "used", call = s$call)))
         for (cn in setdiff(s$joined$columns, s$joined$keys)) {
-          other$sites[[cn]] <- c(other$sites[[cn]], list(list(loc = loc, verb = verb, kind = "joined", call = s$call, into = key)))
+          other$sites[[cn]] <- c(other$sites[[cn]], list(list(loc = loc, verb = verb, kind = "carried", call = s$call, into = key)))
         }
         sources[[from]] <- other
         entry <- sources[[key]] %||% entry
@@ -128,7 +128,7 @@ colmap_build <- function(root, files = NULL) {
     if (e$kind == "parameter") {
       # what the body reads of the frame it was given, less what it made itself
       kinds <- lapply(e$sites, function(sites) vapply(sites, `[[`, "", "kind"))
-      made <- names(kinds)[vapply(kinds, function(x) "created" %in% x || "joined" %in% x, TRUE)]
+      made <- names(kinds)[vapply(kinds, function(x) "created" %in% x || "joined" %in% x, TRUE)]   # carried out is not made
       e$origin <- setdiff(names(kinds)[vapply(kinds, function(x) "used" %in% x, TRUE)], made)
     } else if (is.null(e$origin)) e$origin <- e$columns
     sources[[k]] <- e
@@ -243,7 +243,7 @@ source_lines <- function(src) {
     }
     used <- Filter(function(x) x$kind == "used", sites)
     dropped <- Filter(function(x) x$kind == "dropped", sites)
-    carried <- Filter(function(x) x$kind == "joined", sites)
+    carried <- Filter(function(x) x$kind == "carried", sites)
     parts <- c(if (length(used)) sprintf("used %d%s: %s%s", length(used), if (length(used) == 1L) " time" else " times",
                                          paste(vapply(head(used, 4L), site_short, ""), collapse = ", "),
                                          if (length(used) > 4L) ", ..." else ""),
@@ -279,9 +279,9 @@ colmap_format <- function(map, names = NULL) {
         label <- if (src$kind == "parameter") "" else if (in_origin) "" else if (!is.null(by_kind$joined) && is.null(by_kind$created))
           sprintf("   (not in the data: joined from %s)", by_kind$joined[[1L]]$from) else "   (not in the data: created by the code)"
         out <- c(out, sprintf("  %s%s", src$key, label))
-        for (k in intersect(c("created", "joined", "used", "dropped"), names(by_kind))) {
+        for (k in intersect(c("created", "joined", "used", "dropped", "carried"), names(by_kind))) {
           shown <- head(by_kind[[k]], 12L)
-          shown_k <- if (k == "joined" && !is.null(shown[[1L]]$into)) "carried into another frame" else k
+          shown_k <- if (k == "carried") "carried into another frame" else k
           out <- c(out, sprintf("    %s at %s%s", shown_k, paste(vapply(shown, site_short, "", with_call = TRUE), collapse = ", "),
                                 if (length(by_kind[[k]]) > 12L) sprintf(", and %d more", length(by_kind[[k]]) - 12L) else ""))
         }
@@ -296,11 +296,13 @@ colmap_format <- function(map, names = NULL) {
     }
     return(out)
   }
-  for (src in data_sources(map)) out <- c(out, source_lines(src))
+  safe_lines <- function(src) tryCatch(source_lines(src), error = function(e) c("", sprintf(
+    "%s   could not be listed (%s). This is a bug in r-colmap worth reporting; the other sources are unaffected.", src$key, conditionMessage(e))))
+  for (src in data_sources(map)) out <- c(out, safe_lines(src))
   params <- parameter_sources(map)
   if (length(params)) {
     out <- c(out, "", "Function parameters used as frames (what each body reads of the frame it is given, and what it adds; the callers decide the rest):")
-    for (src in params) out <- c(out, source_lines(src))
+    for (src in params) out <- c(out, safe_lines(src))
   }
   if (length(map$notes)) {
     out <- c(out, "", sprintf("Not mapped: %d frame%s from sources the checker cannot open (r-colcheck discover lists them with the command to learn each).",
