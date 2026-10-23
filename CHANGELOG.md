@@ -2,6 +2,15 @@
 
 One entry per release, newest first. The version is the one in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`; each release is a commit whose subject starts with the version, tagged `vX.Y.Z` by the maintainer (a cloud session cannot push tags). The commit message carries the full account; this file carries the headline.
 
+## 1.9.0 (2026-10-23)
+
+The data map says where a frame was last seen instead of calling a column unused, a join's other frame keeps its source, sinks count, every function parameter used as a frame is a source of its own, and the skill explains how to read a result.
+- `r-colmap`: a created column no followed step reads says where its frame went: `returned by f()` (the callers decide; `r-callmap f`), `written by saveRDS()` (or `write_csv()`, `write_parquet()`, `dbWriteTable()`, `s3write_using()`, ...), `tracking ended at FILE:LINE (verb)`, or `no later step carries it`. A data column no code names is "never named by the code", with where it was carried. `r-colmap COLUMN` adds the same. The header counts the steps followed and the limits line says what "no use seen" means.
+- A join's other frame keeps its own source in the map (it used to vanish, its columns labelled "created by the code"): its keys are used at the join, its other columns "carried into" the result, and the result lists them as "joined from".
+- Every named function's parameter that the body pipes into a verb is a partly known frame: the steps on it are followed, nothing is reported against it, and the map lists `parameter df of f()` with the columns the body reads and adds, so a package driven by targets, scripts or an exported API has column-level visibility inside its functions without a caller.
+- Checker: `nest()` is followed (`nest(data = -id)`, `nest(.by = id)`, grouped `nest()`), `deframe()` reads its two columns, a frame that reaches a sink is recorded, and `--steps` shows `returned by f()` and `written by saveRDS()` lines.
+- Docs: the r-lsp skill's column section is split into headed parts (the check, the three frame states, how a frame becomes known, what counts as a use, what ends tracking, the data map with an annotated listing and the order of operations for a dead-column hunt); the quick references, the r-data skill and the tool's `--help` carry the same wording.
+
 ## 1.8.1 (2026-10-23)
 
 A changelog with one entry per release, the release steps written down, quick references at the top of the plugin README and the r-lsp skill, and a session-start line that names every tool and task skill, so an agent knows what it has.

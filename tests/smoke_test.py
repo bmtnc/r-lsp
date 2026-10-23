@@ -752,7 +752,9 @@ def scenario_colmap(s):
     check("  customer             used 1 time: R/analysis.R:73 (select)" in full, f"last_col() use of customer missing:\n{full[:2500]}")
     check("  region               used " in full and "dropped at R/analysis.R:23 (summarise)" in full, f"region line unexpected:\n{full[:2500]}")
     check("created by the code:" in full and "  total                at R/analysis.R:10 (summarise); used 1 time" in full
-          and "  big                  at R/analysis.R:12 (mutate); never used afterwards" in full, f"created columns unexpected:\n{full}")
+          and "  big                  at R/analysis.R:12 (mutate); no use seen in the steps followed; no later step carries it" in full,
+          f"created columns unexpected:\n{full}")
+    check("never used afterwards" not in full, "the map must not claim a column is never used; it says where the frame was last seen")
     for wrong in ("regoin", "amuont", "yaer"):
         check(f"  {wrong} " not in full, f"a reported mistake ({wrong}) is listed as a column the code creates:\n{full}")
     check("datasets::mtcars" in full and "tibble() literal at R/analysis.R:" in full, f"other sources missing:\n{full}")
@@ -773,7 +775,51 @@ def scenario_colmap(s):
     check('cached schema "returns/monthly"   first used at R/report.R:10   3 columns: date, fund_id, ret' in s3
           and "Not mapped: 2 frames from sources the checker cannot open" in s3, f"colmap on the cache fixture unexpected:\n{s3}")
     empty = s.make_project("colmap_empty", {"R/x.R": os.path.join(FIXTURES, "bugs", "bugs.R")})
-    check("No frame with known columns: nothing to map." in run("--root", empty, cwd=empty), "colmap with nothing to map should say so")
+    none = run("--root", empty, cwd=empty)
+    check("No data source with known columns: nothing to map from the data." in none and "parameter df of g()   at R/x.R:17   reads 1 column: x" in none,
+          f"colmap with no data source should say so and still list the parameters:\n{none}")
+
+    # Where a frame was last seen, on a package whose functions take frames as
+    # parameters and whose callers are not all followed.
+    fates_root = os.path.join(FIXTURES, "colmap")
+    fates = run(cwd=fates_root)
+    head = fates.splitlines()[0]
+    check("r-colmap: 2 data sources read by 5 files" in head and "function parameters used as frames" in head
+          and "\"no use seen\" means none in the steps followed" in fates.splitlines()[1], f"colmap fates header unexpected:\n{fates[:600]}")
+    # created in a callee, read in a caller the checker followed: a use, across files
+    check("  rolling_12m_value_add at R/panel.R:3 (dplyr::mutate); used 1 time" in fates, f"cross-function use missing:\n{fates}")
+    # a sink, and a return to callers the checker never reached
+    check("  trailing_value_add   at R/panel.R:8 (dplyr::mutate); no use seen in the steps followed; written by saveRDS() at R/panel.R:9" in fates
+          and "  self_loaded_created  at R/selfload.R:4 (dplyr::mutate); no use seen in the steps followed; returned by build_panel() at R/selfload.R:4" in fates,
+          f"fates unexpected:\n{fates}")
+    # a join's other frame keeps its own source; its columns are carried in, not created
+    check("users.csv   first used at R/load.R:5   3 columns: id, userLastName, region" in fates
+          and "  userLastName         carried into parameter df of with_users() and panel.csv at R/panel.R:13 (dplyr::left_join)" in fates
+          and "  id                   used 1 time: R/panel.R:13 (dplyr::left_join)" in fates
+          and "  userLastName         at R/panel.R:13" not in fates, f"join source unexpected:\n{fates}")
+    # a parameter used as a frame: what the body reads of it and adds to it
+    check("parameter df of with_users()   at R/panel.R:13   reads 1 column: id" in fates
+          and "  joined from users.csv at R/panel.R:13 (dplyr::left_join):\n  userLastName         no use seen in the steps followed; returned by with_users() at R/panel.R:13" in fates
+          and "parameter panel of assemble_report()   at R/report.R:2   reads 1 column: rolling_12m_value_add" in fates,
+          f"parameter sources unexpected:\n{fates}")
+    # deframe() reads two columns; nest() consumes what it nests and is followed; a step the checker cannot follow ends tracking
+    check("R/panel.R:17 (tibble::deframe)" in fates and "  nst                  at R/more.R:25 (dplyr::mutate); used 1 time" in fates
+          and "tracking ended at R/more.R:25 (tidyr::nest)" in fates, f"verb handling unexpected:\n{fates}")
+    one = run("userLastName", cwd=fates_root)
+    check("carried into another frame at R/panel.R:13" in one and "then returned by with_users() at R/panel.R:13" in one,
+          f"column lookup with fates unexpected:\n{one}")
+    data = json.loads(run("--json", cwd=fates_root))
+    kinds = {d["source"]: d["kind"] for d in data}
+    panel = next(d for d in data if d["source"] == "panel.csv")
+    tva = next(u for u in panel["uses"] if u["column"] == "trailing_value_add")
+    check(kinds.get("panel.csv") == "data" and kinds.get("parameter df of make_panel()") == "parameter"
+          and tva["fates"] and tva["fates"][0]["kind"] == "written" and tva["fates"][0]["fn"] == "saveRDS",
+          f"colmap JSON fates unexpected:\n{json.dumps(data)[:1500]}")
+    colcheck = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-colcheck")
+    steps = subprocess.run([colcheck, "--steps", "R/selfload.R", "R/panel.R"], cwd=fates_root, capture_output=True, text=True, timeout=180)
+    check("R/selfload.R:4: return from build_panel() => returned by build_panel(): id, value, date, self_loaded_created" in steps.stdout
+          and 'R/panel.R:9: saveRDS(result, "output.rds") => written by saveRDS(): trailing_value_add' in steps.stdout,
+          f"--steps fate lines unexpected:\n{steps.stdout}")
 
 
 def scenario_colcheck_cache(s):

@@ -8,9 +8,13 @@ usage <- function() {
   cat("usage: r-colmap [--json] [--root DIR] [--file PATH ...] [COLUMN ...]\n",
       "Prints a map of the data: every data source the project's code reads (a file, a cached\n",
       "schema, a literal), its columns, and for each column where the code uses it (which\n",
-      "verb, file:line), drops it, or creates it, plus the columns never used. With COLUMN,\n",
-      "every site that touches that column in any source. --file limits the files read.\n",
-      "Static: r-colcheck's tracking, so frames it cannot follow are not here. Always exits 0.\n", sep = "")
+      "verb, file:line), drops it, creates it, or joins it in from another source; then each\n",
+      "function parameter a body uses as a frame, with the columns it reads and adds. With\n",
+      "COLUMN, every site that touches that column in any source. --file limits the files read.\n",
+      "Static: r-colcheck's tracking, so a frame it cannot follow is not here, and 'no use seen'\n",
+      "means none in the steps followed (the header counts them): the verdict says where the\n",
+      "frame was last seen (returned by a function, written by a sink, tracking ended), which\n",
+      "is where the use may be. `r-colcheck --steps FILE` shows each step. Always exits 0.\n", sep = "")
   quit(save = "no", status = 0)
 }
 as_json <- FALSE
