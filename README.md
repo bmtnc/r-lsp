@@ -431,4 +431,4 @@ python3 tests/smoke_test.py -k renv    # scenarios whose name contains "renv"
 
 CI runs it on every push and weekly, because a new `languageserver` release can break the wrapper's patches without any change here. Set `R_LSP_WRAPPER` to test a different wrapper script.
 
-A release bumps the version in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (the suite checks they agree), adds its entry to `CHANGELOG.md`, and is a commit whose subject starts with the version, tagged `vX.Y.Z`.
+A release bumps the version in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (the suite checks they agree), adds its entry to `CHANGELOG.md`, and is a commit whose subject starts with the version; the maintainer tags it `vX.Y.Z` (`git tag -a v1.8.1 <commit> && git push origin --tags`; the cloud session's credentials push branches, not tags).

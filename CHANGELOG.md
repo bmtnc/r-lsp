@@ -1,10 +1,10 @@
 # Changelog
 
-One entry per release, newest first. The version is the one in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`; each release is a commit whose subject starts with the version, and a tag `vX.Y.Z` on it. The commit message carries the full account; this file carries the headline.
+One entry per release, newest first. The version is the one in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`; each release is a commit whose subject starts with the version, tagged `vX.Y.Z` by the maintainer (a cloud session cannot push tags). The commit message carries the full account; this file carries the headline.
 
 ## 1.8.1 (2026-10-23)
 
-A changelog with one entry per release, tags on every release, quick references at the top of the plugin README and the r-lsp skill, and a session-start line that names every tool and task skill, so an agent knows what it has.
+A changelog with one entry per release, the release steps written down, quick references at the top of the plugin README and the r-lsp skill, and a session-start line that names every tool and task skill, so an agent knows what it has.
 
 ## 1.8.0 (2026-10-23)
 
