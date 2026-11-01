@@ -915,6 +915,20 @@ def scenario_colmap(s):
           and any(u["column"] == "total" and not u["in_data"] and u["sites"][0]["kind"] == "created" and u["sites"][0]["verb"] == "summarise"
                   and u["sites"][0]["from"] == ["amount"] and u["derived_from"] == ["amount"] and u["feeds"] == ["share"]
                   for u in by_src["sales.csv"]["uses"]), f"colmap JSON unexpected:\n{json.dumps(data)[:1200]}")
+    # each entry carries the id the map keys it by, next to its label: the two
+    # literals with the same text (lines 47 and 48) have different ids
+    check(all("id" in d for d in data) and len({d["id"] for d in data}) == len(data)
+          and by_src["sales.csv"]["id"].startswith("file:") and by_src["sales.csv"]["id"].endswith("/data/sales.csv")
+          and by_src["tibble() literal at R/analysis.R:48"]["id"].endswith("@48") and by_src["parameter df of ok8()"]["id"] == "parameter:ok8:df",
+          f"colmap JSON ids unexpected:\n{json.dumps([d['id'] for d in data])}")
+    # the frames the text map lists as asserted are in the JSON too, as entries of kind "asserted"
+    funcs_text = run("--file", "R/funcs.R")
+    asserted_text = funcs_text.split("Asserted by the code (a frame the checker could not open, given its columns by an assertion):\n")[1].split("\n\n")[0].splitlines()
+    asserted = [d for d in json.loads(run("--json", "--file", "R/funcs.R")) if d["kind"] == "asserted"]
+    check(len(asserted) == len(asserted_text) >= 5
+          and any(d["source"] == "the columns stopifnot() requires on line 90" and d["first"] == "R/funcs.R:91" and d["columns"] == ["region", "amount"]
+                  and d["files"] == ["R/funcs.R"] and d["id"].startswith("assertion:") for d in asserted),
+          f"asserted frames in colmap JSON unexpected:\n{json.dumps(asserted)[:800]}\n{asserted_text}")
 
     s3 = run(cwd=os.path.join(FIXTURES, "s3columns"))
     check('cached schema "returns/monthly"   first used at R/report.R:10   3 columns: date, fund_id, ret' in s3
@@ -976,6 +990,8 @@ def scenario_colmap(s):
     check(kinds.get("panel.csv") == "data" and kinds.get("parameter df of make_panel()") == "parameter"
           and tva["fates"] and tva["fates"][0]["kind"] == "written" and tva["fates"][0]["fn"] == "saveRDS",
           f"colmap JSON fates unexpected:\n{json.dumps(data)[:1500]}")
+    check(all("id" in d for d in data) and next(d for d in data if d["source"] == "output.rds")["id"].startswith("sink:output.rds:"),
+          f"colmap JSON written entries without an id:\n{json.dumps([d.get('id') for d in data])}")
     colcheck = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-colcheck")
     steps = subprocess.run([colcheck, "--steps", "R/selfload.R", "R/panel.R"], cwd=fates_root, capture_output=True, text=True, timeout=180)
     check("R/selfload.R:4: return from build_panel() => returned by build_panel(): id, value, date, self_loaded_created" in steps.stdout
@@ -1024,6 +1040,8 @@ def scenario_colmap(s):
           and dj["no_longer_created"][0]["still_used_at"][0]["file"] == "R/funcs.R" and dj["no_longer_created"][0]["also_made_at"][0]["line"] == 11
           and any(c["column"] == "pct" and c["from"] == ["share"] for c in dj["sources"][0]["columns"])
           and [f["name"] for f in dj["findings"]] == ["shar", "customer"], f"colmap --diff JSON unexpected:\n{json.dumps(dj)[:800]}")
+    check(dj["sources"][0]["source"] == "sales.csv" and dj["sources"][0]["id"].startswith("file:") and dj["sources"][0]["id"].endswith("/data/sales.csv"),
+          f"colmap --diff JSON source id unexpected:\n{json.dumps(dj['sources'][0])[:300]}")
     against = run("--diff", "HEAD", cwd=repo)
     check("against HEAD" in against.splitlines()[0] and "big" in against, "colmap --diff REF unexpected")
     # --source NAME: one dataset; an overwrite is a site of its own
@@ -1031,11 +1049,69 @@ def scenario_colmap(s):
     check("source sales.csv" in one_src.splitlines()[0] and "sales.csv   first used at R/verbs.R" in one_src and one_src.count("   first used at ") == 1,
           f"colmap --source unexpected:\n{one_src}")
     check("No source matches nothing." in run("--source", "nothing", "--file", "R/verbs.R"), "colmap --source with no match should say so")
+    # --source narrows the JSON as it narrows the text map; no match is [] with the text map's message on stderr
+    one_json = json.loads(run("--json", "--source", "sales.csv", "--file", "R/verbs.R"))
+    check([d["source"] for d in one_json] == ["sales.csv"], f"colmap --json --source unexpected:\n{json.dumps(one_json)[:500]}")
+    none_json = subprocess.run([tool, "--json", "--source", "nothing", "--file", "R/verbs.R"], cwd=root, capture_output=True, text=True, timeout=180)
+    check(none_json.returncode == 0 and json.loads(none_json.stdout) == [] and "No source matches nothing." in none_json.stderr,
+          f"colmap --json --source with no match unexpected:\n{none_json.stdout[:300]}\n{none_json.stderr[-300:]}")
+    # a root that does not exist, or --at on a file outside the root, is an error (exit 2), not an empty map or a line no step covers
+    bad_root = subprocess.run([tool, "--root", os.path.join(s.scratch, "no_such_dir")], cwd=root, capture_output=True, text=True, timeout=60)
+    check(bad_root.returncode == 2 and "no such directory" in bad_root.stderr and "nothing to map" not in bad_root.stdout,
+          f"colmap with a nonexistent root should exit 2:\n{bad_root.stdout[:300]}\n{bad_root.stderr[-300:]}")
+    outside = subprocess.run([tool, "--at", os.path.join(FIXTURES, "s3columns", "R", "report.R") + ":10"], cwd=root, capture_output=True, text=True, timeout=180)
+    check(outside.returncode == 2 and "is not under the project root" in outside.stderr and "No pipeline step" not in outside.stdout,
+          f"colmap --at on a file outside the root should exit 2:\n{outside.stdout[:300]}\n{outside.stderr[-300:]}")
     with open(os.path.join(repo, "R", "over.R"), "w") as f:
         f.write('library(dplyr)\nsales <- readr::read_csv("data/sales.csv")\nsales |> mutate(amount = amount * 2) |> select(amount)\n')
     ov = run("--file", "R/over.R", cwd=repo)
     check("  amount               used 2 times: R/over.R:3 (mutate), R/over.R:3 (select); overwritten at R/over.R:3 (mutate)" in ov,
           f"an overwrite is not listed as a site:\n{ov}")
+
+    # A second copy: a pure rename of a file with tibble() literals, a comment
+    # appended to a file that source()s a helper, an edit to a step framed by
+    # a column assertion, and a helper that stops creating a column. No step
+    # is on the changed lines, so the header says so (whatever the gone list
+    # holds); nothing the working tree still creates is listed as gone (the
+    # renamed file's literals are compared under their new path, the helper's
+    # step belongs to the helper), the assertion is not shown as a source, and
+    # the one real loss is.
+    repo2 = os.path.join(s.scratch, "colmap_diff2")
+    shutil.copytree(os.path.join(FIXTURES, "columns"), repo2)
+    os.remove(os.path.join(repo2, ".here"))
+    git2 = lambda *a: subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a], cwd=repo2, capture_output=True, text=True, check=True)  # noqa: E731
+    git2("init", "-q")
+    git2("add", "-A")
+    git2("commit", "-qm", "init")
+    git2("mv", "R/tricky_ok.R", "R/tricky2.R")
+
+    def rewrite(rel, old, new, append=""):
+        path = os.path.join(repo2, rel)
+        with open(path) as f:
+            text = f.read()
+        check(text.count(old) == 1, f"fixture text to change not found once in {rel}: {old!r}")
+        with open(path, "w") as f:
+            f.write(text.replace(old, new) + append)
+    rewrite("R/funcs.R", "df |> mutate(amt2 = amount * 2)", "df |> mutate(amt2 = amount * 3)", append="# a trailing comment\n")
+    rewrite("R/helpers_src.R", "  df %>%\n    mutate(share = amount / sum(amount))\n", "  df\n")
+    diff2 = run("--diff", cwd=repo2)
+    check("No pipeline step with known columns is on the changed lines." in diff2 and "The diff falls in 0 pipeline steps in ," not in diff2,
+          f"colmap --diff header with no touched step unexpected:\n{diff2}")
+    check("assertion:" not in diff2, f"colmap --diff shows a column assertion as a source:\n{diff2}")
+    check("was made at R/tricky_ok.R" not in diff2 and "was made at R/funcs.R" not in diff2
+          and "Columns the changed files created at HEAD and no longer create:\n  share                was made at R/helpers_src.R:3 (mutate) of parameter df of add_share()" in diff2,
+          f"colmap --diff lists columns the working tree still creates, or misses the one it lost:\n{diff2}")
+    dj2 = json.loads(run("--json", "--diff", cwd=repo2))
+    check(dj2["steps"] == 0 and dj2["files"] == [] and dj2["sources"] == [] and [g["column"] for g in dj2["no_longer_created"]] == ["share"],
+          f"colmap --diff JSON with no touched step unexpected:\n{json.dumps(dj2)[:600]}")
+    # the renamed file edited too: its literal's columns are compared under the new path, so only the loss at line 54 is reported
+    rewrite("R/tricky2.R", "u1 <- tibble(id = 1, data = list(tibble(d = 1, r = 2))) %>% unnest(data) %>% filter(d == 1, r == 2, id == 1)",
+            "u1 <- tibble(id = 1, data = list(tibble(d = 1, r = 2))) %>% select(id)")
+    diff3 = run("--diff", cwd=repo2)
+    check("The diff falls in 1 pipeline step in R/tricky2.R, touching 2 columns of 1 source." in diff3 and "\ntibble() literal at R/tricky2.R:54\n" in diff3
+          and "  d                    was made at R/tricky_ok.R:54 (unnest) of tibble() literal at R/tricky2.R:54   not used anywhere now" in diff3
+          and "was made at R/tricky_ok.R:56" not in diff3 and "was made at R/tricky_ok.R:74" not in diff3,
+          f"colmap --diff on a renamed and edited file unexpected:\n{diff3}")
 
 
 def scenario_colcheck_cache(s):

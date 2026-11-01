@@ -62,11 +62,19 @@ while (i <= length(args)) {
   i <- i + 1L
 }
 root <- normalizePath(root %||% colcheck_root(file.path(getwd(), "x.R")), mustWork = FALSE)
+# a wrong root must not come back as an empty map that reads as "nothing to map" (r-callmap exits 2 the same way)
+if (!dir.exists(root)) { cat("r-colmap: no such directory: ", root, "\n", sep = "", file = stderr()); quit(save = "no", status = 2) }
 if (mode == "at") {
   at_file <- sub(":[0-9]+$", "", at)
   at_line <- as.integer(sub("^.*:", "", at))
   if (!file.exists(at_file) && file.exists(file.path(root, at_file))) at_file <- file.path(root, at_file)
   if (!file.exists(at_file)) { cat("r-colmap: no such file: ", at_file, "\n", sep = "", file = stderr()); quit(save = "no", status = 2) }
+  # a file outside the root is never read by the project walk: said so, not reported as a line no step covers
+  at_file <- normalizePath(at_file)
+  if (!startsWith(at_file, paste0(root, "/"))) {
+    cat("r-colmap: ", at_file, " is not under the project root ", root, " (pass --root)\n", sep = "", file = stderr())
+    quit(save = "no", status = 2)
+  }
   # the whole project is read, so the sites that read the step's columns are known
 }
 missing <- files[!file.exists(files)]
@@ -86,8 +94,16 @@ if (mode == "diff") {
 }
 if (as_json) {
   message(paste(colmap_header(map), collapse = "\n"))
-  # one list: the sources (kind "data" or "parameter") and, when nothing is
-  # asked by name, the files and tables the code writes (kind "written")
+  if (length(srcs)) {
+    # --source narrows the JSON as it narrows the text map; no match is an
+    # empty list, with the text map's message on stderr
+    selected <- colmap_select(map, srcs)
+    if (is.null(selected)) { message(colmap_no_source(map, srcs)); cat("[]\n"); quit(save = "no", status = 0) }
+    map <- selected
+  }
+  # one list: the sources (kind "data" or "parameter"), the asserted frames
+  # (kind "asserted") and, when nothing is asked by name, the files and
+  # tables the code writes (kind "written")
   out <- Filter(Negate(is.null), colmap_json(map, names))
   if (!length(names)) out <- c(out, colmap_sinks_json(map))
   cat(jsonlite::toJSON(out, auto_unbox = TRUE, pretty = TRUE, null = "null"), "\n")

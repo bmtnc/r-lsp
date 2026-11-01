@@ -18,7 +18,8 @@
 # keys are used at the join, its other columns carried into the result.
 #
 # Entry points: colmap_build(root, files) -> map; colmap_format(map, names)
-#               -> character lines; colmap_json(map, names) -> list.
+#               -> character lines; colmap_json(map, names) -> list;
+#               colmap_select(map, sources) -> the map narrowed to --source.
 
 # "cached schema \"k\", observed 2025-01-15" and "cached schema \"k\"" are one source.
 source_key <- function(src) sub(", observed [0-9-]+$", "", src)
@@ -168,7 +169,7 @@ colmap_build <- function(root, files = NULL) {
   sources <- Filter(function(e) e$kind == "data" || length(e$origin) || length(e$sites), sources)
   # a column assertion on an unknown frame is not data: listed apart, as what the code asserts
   is_assertion <- startsWith(names(sources) %||% character(), "assertion:")
-  asserted <- sources[is_assertion]
+  asserted <- lapply(sources[is_assertion], function(e) { e$kind <- "asserted"; e })
   sources <- sources[!is_assertion]
   labels <- vapply(sources, `[[`, "", "key")
   for (k in names(sources)) if (sum(labels == sources[[k]]$key) > 1L && startsWith(k, "file:")) {
@@ -184,7 +185,7 @@ colmap_build <- function(root, files = NULL) {
     rel <- relative_path(s$file, root)
     key <- sprintf("sink:%s:%s:%d", s$path, s$file, s$line)
     readers <- if (!is.null(sources[[key]])) sources[[key]]$files else character()
-    list(path = s$path, table = isTRUE(s$table), loc = sprintf("%s:%d", rel, s$line), fn = s$fn, columns = s$columns,
+    list(id = key, path = s$path, table = isTRUE(s$table), loc = sprintf("%s:%d", rel, s$line), fn = s$fn, columns = s$columns,
          open = isTRUE(s$open), read_by = readers)
   })
   # a sink reached twice (a body walked on its own, with a parameter's open
@@ -260,7 +261,9 @@ step_in_diff <- function(s, rel, changes) {
 
 # The steps of one changed file as it was at REF, read through `git show`
 # into a file with the same extension; their file is relabelled to `rel`.
-old_steps_of <- function(root, prefix, base, old_path) {
+# `new_path` is where the file is now (after a rename), so a literal's id
+# names the file as the working tree's map does and the two compare.
+old_steps_of <- function(root, prefix, base, old_path, new_path = old_path) {
   text <- suppressWarnings(tryCatch(system2("git", c("-C", shQuote(root), "show", shQuote(paste0(base, ":", prefix, old_path))),
                                             stdout = TRUE, stderr = FALSE), error = function(e) NULL))
   if (is.null(text) || !is.null(attr(text, "status"))) return(list())
@@ -271,9 +274,12 @@ old_steps_of <- function(root, prefix, base, old_path) {
   if (is.null(res)) return(list())
   bad <- mistakes_of(res)
   # a literal's id names the file it is in: the real path, not the copy's
-  real <- normalizePath(file.path(root, old_path), mustWork = FALSE)
+  real <- normalizePath(file.path(root, new_path), mustWork = FALSE)
   copy <- normalizePath(tmp, mustWork = FALSE)
-  lapply(attr(res, "steps"), function(s) {
+  # only the copy's own steps are the old text's: those of a helper the copy
+  # source()s belong to the helper, which the working tree still has
+  steps <- Filter(function(s) identical(normalizePath(s$file, mustWork = FALSE), copy), attr(res, "steps"))
+  lapply(steps, function(s) {
     s$rel <- old_path
     s$bad <- bad
     if (!is.null(s$source_id) && !is.na(s$source_id)) s$source_id <- sub(copy, real, s$source_id, fixed = TRUE)
@@ -315,7 +321,9 @@ colmap_diff <- function(map, ref = NULL) {
     rel <- rel_of(s$file)
     if (!step_in_diff(s, rel, changes)) next
     key <- step_source_key(s, root)
-    if (is.null(key)) next
+    # a column assertion is a pseudo-source keyed on its line, listed apart
+    # from the sources: not a source the diff reports
+    if (is.null(key) || startsWith(key, "assertion:")) next
     n_steps <- n_steps + 1L
     files <- union(files, rel)
     loc <- sprintf("%s:%d", rel, s$line)
@@ -352,7 +360,7 @@ colmap_diff <- function(map, ref = NULL) {
   gone <- list()
   for (ch in changes) {
     if (isTRUE(ch$new) || is.na(ch$old)) next
-    old <- old_steps_of(root, prefix, base, ch$old)
+    old <- old_steps_of(root, prefix, base, ch$old, new_path = ch$path)
     for (s in old) {
       key <- step_source_key(s, root, rel = s$rel)
       # a column assertion is a pseudo-source keyed on its line: not compared
@@ -382,10 +390,12 @@ colmap_diff_format <- function(map, d) {
   out <- colmap_header(map, sprintf("changes in the working tree against %s", d$base))
   if (!isTRUE(d$ok)) return(c(out, "", d$message))
   n_cols <- sum(vapply(d$touched, function(s) length(s$columns), 1L))
-  out <- c(out, "", sprintf("The diff falls in %d pipeline step%s in %s, touching %d column%s of %d source%s.",
-                            d$n_steps, if (d$n_steps == 1L) "" else "s", paste(d$files, collapse = ", "),
-                            n_cols, if (n_cols == 1L) "" else "s", length(d$touched), if (length(d$touched) == 1L) "" else "s"))
-  if (!length(d$touched) && !length(d$gone)) out <- c(out, "No pipeline step with known columns is on the changed lines.")
+  # with no touched step the counting sentence would name no file: one
+  # sentence says so instead, whatever the gone list holds
+  out <- c(out, "", if (!d$n_steps) "No pipeline step with known columns is on the changed lines." else sprintf(
+    "The diff falls in %d pipeline step%s in %s, touching %d column%s of %d source%s.",
+    d$n_steps, if (d$n_steps == 1L) "" else "s", paste(d$files, collapse = ", "),
+    n_cols, if (n_cols == 1L) "" else "s", length(d$touched), if (length(d$touched) == 1L) "" else "s"))
   sites_text <- function(sites, n = 6L) paste0(paste(vapply(head(sites, n), site_short, ""), collapse = ", "),
                                                if (length(sites) > n) sprintf(", and %d more", length(sites) - n) else "")
   for (src in d$touched) {
@@ -427,7 +437,7 @@ colmap_diff_json <- function(map, d) {
   if (!isTRUE(d$ok)) return(list(base = d$base, error = d$message, sources = list(), no_longer_created = list(), findings = list()))
   list(base = d$base, files = I(d$files), steps = d$n_steps,
        sources = lapply(unname(d$touched), function(src) list(
-         source = src$label %||% src$key,
+         source = src$label %||% src$key, id = src$key,
          columns = lapply(unname(src$columns), function(col) list(
            column = col$column, in_data = col$in_data, kinds = I(col$kinds), from = I(col$from), feeds = I(col$feeds),
            sites = lapply(col$sites, site_json), other_sites = lapply(col$other_sites, site_json))))),
@@ -622,19 +632,30 @@ lineage_lines <- function(src, nm, indent = "    ") {
   out
 }
 
+# --source NAME: the map narrowed to the sources whose key contains NAME (a
+# file name, "cached schema", a target, a parameter), without the sinks, the
+# notes and the asserted frames, which are not sources; NULL when no source
+# matches (colmap_no_source says so). The text map and the JSON share it.
+colmap_select <- function(map, sources) {
+  keep <- vapply(map$sources, function(s) any(vapply(sources, function(q) grepl(q, s$key, fixed = TRUE), TRUE)), TRUE)
+  if (!any(keep)) return(NULL)
+  map$sources <- map$sources[keep]
+  map$sinks <- list()
+  map$notes <- list()
+  map$asserted <- list()
+  map
+}
+colmap_no_source <- function(map, sources) sprintf("No source matches %s. Sources: %s", paste(sources, collapse = ", "),
+                                                    paste(vapply(map$sources, `[[`, "", "key"), collapse = "; "))
+
 colmap_format <- function(map, names = NULL, sources = NULL) {
   what <- c(if (length(names)) paste("around", paste(names, collapse = ", ")), if (length(sources)) paste("source", paste(sources, collapse = ", ")))
   out <- colmap_header(map, if (length(what)) paste(what, collapse = ", ") else NULL)
   if (!length(map$sources)) return(c(out, "", "No frame with known columns: nothing to map."))
   if (length(sources)) {
-    # --source NAME: the sources whose key contains NAME (a file name, "cached schema", a target, a parameter)
-    keep <- vapply(map$sources, function(s) any(vapply(sources, function(q) grepl(q, s$key, fixed = TRUE), TRUE)), TRUE)
-    if (!any(keep)) return(c(out, "", sprintf("No source matches %s. Sources: %s", paste(sources, collapse = ", "),
-                                              paste(vapply(map$sources, `[[`, "", "key"), collapse = "; "))))
-    map$sources <- map$sources[keep]
-    map$sinks <- list()
-    map$notes <- list()
-    map$asserted <- list()
+    selected <- colmap_select(map, sources)
+    if (is.null(selected)) return(c(out, "", colmap_no_source(map, sources)))
+    map <- selected
   }
   if (!length(data_sources(map)) && !length(names)) out <- c(out, "", "No data source with known columns: nothing to map from the data.")
   if (length(names)) {
@@ -706,7 +727,7 @@ colmap_format <- function(map, names = NULL, sources = NULL) {
 # The files and tables the code writes, as entries of the same list as the
 # sources (kind "written", `files` the readers), so a consumer walks one list.
 colmap_sinks_json <- function(map) {
-  lapply(map$sinks, function(w) list(source = if (w$table) paste("table", w$path) else w$path, kind = "written", first = w$loc,
+  lapply(map$sinks, function(w) list(source = if (w$table) paste("table", w$path) else w$path, id = w$id, kind = "written", first = w$loc,
                                      files = I(w$read_by), path = w$path, table = w$table, file = sub(":[0-9]+$", "", w$loc),
                                      line = as.integer(sub("^.*:", "", w$loc)), writer = w$fn,
                                      columns = if (is.null(w$columns)) NULL else I(w$columns), open = w$open, read_by = I(w$read_by)))
@@ -721,10 +742,14 @@ colmap_json <- function(map, names = NULL) {
     out
   }
   fate_json <- function(f) list(kind = f$kind, fn = f$fn, file = sub(":[0-9]+$", "", f$loc), line = as.integer(sub("^.*:", "", f$loc)), call = f$call)
-  lapply(unname(map$sources), function(src) {
+  # the whole map lists the asserted frames after the sources (kind
+  # "asserted"), as the text map does; a column lookup reads the sources only
+  entries <- if (length(names)) map$sources else c(map$sources, map$asserted)
+  # `id` is what the map keys the source by (two literals on one line share a label, not an id)
+  lapply(unname(entries), function(src) {
     cols <- if (length(names)) intersect(names, c(src$origin, names(src$sites))) else union(src$origin, names(src$sites))
     if (length(names) && !length(cols)) return(NULL)
-    list(source = src$key, kind = src$kind, first = src$first, files = I(src$files), columns = I(src$origin),
+    list(source = src$key, id = src$id, kind = src$kind, first = src$first, files = I(src$files), columns = I(src$origin),
          unused = I(setdiff(src$origin, names(src$sites))),
          uses = lapply(cols, function(cn) list(column = cn, in_data = cn %in% src$origin,
                                                 derived_from = I(derived_from(src$sites[[cn]] %||% list())),
