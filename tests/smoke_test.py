@@ -865,6 +865,23 @@ def scenario_callmap_cli(s):
         f.write("\nSome more prose about the package.\n")
     d = subprocess.run([tool, "--root", root, "--diff"], capture_output=True, text=True, timeout=120).stdout
     check("Top-level code changed" not in d, f"a prose edit in an Rmd was reported as top-level code:\n{d}")
+    # An edited target is a changed definition, not a new one, and a removed
+    # target is listed as gone: old_definitions() collects targets too.
+    git("commit", "-qam", "prose")
+    targets = os.path.join(root, "_targets.R")
+    with open(targets, "w") as f:
+        f.write("list(\n  tar_target(raw, read.csv(\"data.csv\")),\n  tar_target(clean, flag_missing(raw)),\n  tar_target(out, summary(clean))\n)\n")
+    git("add", "-A")
+    git("commit", "-qm", "targets")
+    with open(targets, "w") as f:
+        f.write("list(\n  tar_target(raw, read.csv(\"data.csv\")),\n  tar_target(clean, flag_missing(raw) + 1),\n  tar_target(out, summary(clean))\n)\n")
+    d = subprocess.run([tool, "--root", root, "--diff"], capture_output=True, text=True, timeout=120).stdout
+    check("target clean   _targets.R:3   [body changed]" in d and "[new]" not in d, f"an edited target was not reported as a body change:\n{d}")
+    with open(targets, "w") as f:
+        f.write("list(\n  tar_target(raw, read.csv(\"data.csv\")),\n  tar_target(out, summary(raw))\n)\n")
+    d = subprocess.run([tool, "--root", root, "--diff"], capture_output=True, text=True, timeout=120).stdout
+    check("Definitions no longer in the project:" in d and "  target clean   was _targets.R:3" in d,
+          f"a removed target was not listed as gone:\n{d}")
 
 
 def scenario_colmap(s):
@@ -1157,6 +1174,15 @@ def scenario_colcheck_cache(s):
     check([c["name"] for c in cache["holdings/latest"]["columns"]] == ["fund_id", "security", "weight"],
           f"cache entry wrong: {cache.get('holdings/latest')}")
     check(list(cache) == sorted(cache), "cache keys are not sorted")
+    # A --source inside the project is recorded relative to the root (as
+    # `learn --all` records it), also when typed from the root, where the
+    # wrapper makes it absolute: a committed cache refreshes in any checkout.
+    check(cache["holdings/latest"].get("sources") == ["R/loaders.R"], f"--source not recorded relative to the root: {cache['holdings/latest'].get('sources')}")
+    relearned = subprocess.run([tool, "learn", "holdings/latest", 's3_read("holdings/latest")', "--source", os.path.join(root, "R", "loaders.R")],
+                               cwd=root, capture_output=True, text=True, timeout=120)
+    check(relearned.returncode == 0, f"learn with an absolute --source failed:\n{relearned.stdout}\n{relearned.stderr}")
+    with open(os.path.join(root, ".colcheck", "schemas.json")) as f:
+        check(json.load(f)["holdings/latest"].get("sources") == ["R/loaders.R"], "an absolute --source under the root was not recorded relative to it")
     out, columns, notes = run_check()
     check(columns == bad | later, f"after learn expected {sorted(bad | later)}, got {sorted(columns)}:\n{out}")
     check(not notes, f"unresolved note persists after learn:\n{out}")
@@ -1635,6 +1661,29 @@ def scenario_lint_fallback(s):
           f"a .github/linters/.lintr was not treated as the winning config:\n{ctx}")
     shutil.rmtree(os.path.join(root, ".github"))
     check(run_hook(hook, payload, env=env).strip() == "", "hook kept running the bug linters after the config was removed")
+
+    # Project definitions: a top-level `name = value` in another file counts,
+    # a line-leading named argument inside a call (whatever its value) does not.
+    rlint = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-lint")
+    with open(os.path.join(root, "R", "eqdefs.R"), "w") as f:
+        f.write("sq = Vectorize(function(x) x^2)\nres <- lapply(1:3,\n  callback = function(x) x\n)\n")
+    probe2 = os.path.join(root, "R", "probe2.R")
+    with open(probe2, "w") as f:
+        f.write("a <- sq(2)\nb <- callback(2)\n")
+    r = subprocess.run([rlint, "R/probe2.R"], cwd=root, capture_output=True, text=True, timeout=120)
+    check(r.returncode == 1 and 'R/probe2.R:2:6: could not find function "callback"' in r.stdout and '"sq"' not in r.stdout,
+          f"r-lint on `=` definitions unexpected:\n{r.stdout}{r.stderr}")
+    # r-lint loads the profile itself: a foreign R_USER_CONFIG_DIR does not
+    # switch it off, and the off message names the variable that is set.
+    foreign = dict(os.environ, R_USER_CONFIG_DIR=os.path.join(s.scratch, "other-r-config"))
+    r2 = subprocess.run([rlint, "R/probe2.R"], cwd=root, capture_output=True, text=True, timeout=120, env=foreign)
+    check(r2.returncode == 1 and r2.stdout == r.stdout and "profile is off" not in r2.stderr,
+          f"r-lint under a foreign R_USER_CONFIG_DIR did not lint:\n{r2.stdout}{r2.stderr}")
+    r3 = subprocess.run([rlint, "R/probe2.R"], cwd=root, capture_output=True, text=True, timeout=120, env=dict(os.environ, R_LSP_AGENT_LINTERS="no"))
+    check(r3.returncode == 0 and "(R_LSP_AGENT_LINTERS=no)" in r3.stderr, f"r-lint off message unexpected:\n{r3.stdout}{r3.stderr}")
+    started = run_hook(start, {}, env=dict(env, R_USER_CONFIG_DIR=foreign["R_USER_CONFIG_DIR"]), stdin_text="{}")
+    check("Lint profile off (R_USER_CONFIG_DIR=" in started and "R_LSP_AGENT_LINTERS=false" not in started,
+          f"session-start blamed the wrong variable for the profile being off:\n{started}")
 
 
 def scenario_callmap(s):

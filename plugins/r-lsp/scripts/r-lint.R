@@ -33,8 +33,12 @@ if (length(flags) || length(missing) || !length(args)) {
   quit(save = "no", status = 2)
 }
 source(file.path(script_dir, "hook-check-lib.R"), local = TRUE)
-if (lint_profile_off()) {
-  cat("r-lint: the profile is off (R_LSP_AGENT_LINTERS=false); nothing to run\n", file = stderr())
+# Only R_LSP_AGENT_LINTERS switches this tool off: it loads the profile
+# itself, so a foreign R_USER_CONFIG_DIR (which turns the profile off in the
+# language server) changes nothing here.
+off <- agent_linters_off()
+if (!is.null(off)) {
+  cat("r-lint: the profile is off (", off, "); nothing to run\n", sep = "", file = stderr())
   quit(save = "no", status = 0)
 }
 given_root <- if (is.null(root)) NULL else normalizePath(root, mustWork = FALSE)
