@@ -543,6 +543,9 @@ def scenario_colcheck(s):
                                    capture_output=True, text=True, timeout=120).stdout)
     check(set(sj) == {"findings", "steps"} and any(st["line"] == 18 and st["columns"] == ["region"] for st in sj["steps"]),
           f"--json --steps shape unexpected: {list(sj)}")
+    # a rename through select() is lineage, as rename() is
+    check(any(st["call"].startswith("select(reg = region") and st.get("derived") == {"reg": ["region"]} for st in sj["steps"]),
+          f"select(new = old) carries no lineage in --json --steps: {[st for st in sj['steps'] if 'reg' in st['call']]}")
     with open(analysis) as f:
         src = f.read().splitlines()
     bad = {i for i, line in enumerate(src, 1) if line.rstrip().endswith("# bad")}
@@ -679,17 +682,25 @@ def scenario_colcheck(s):
                 "d4 <- sales |> mutate(x = amount + 1, x = year) # bad\n")
     with open(logic, "a") as f:
         f.write("s1 <- sales |> filter(amount > amount) # bad\ns2 <- sales |> mutate(z = amount == amount) # bad\ns3 <- sales |> filter(amount > year)\n")
+    # tally() leaves the groups summarise() would; a second summarise() is the
+    # roll-up drop_last is for (no note); a NULL re-created later is a column
+    with open(logic, "a") as f:
+        f.write("g6 <- sales |> group_by(region, year) |> tally() |> mutate(share = n / sum(n))\n"
+                "g7 <- sales |> group_by(region, year) |> summarise(total = sum(amount)) |> summarise(t = sum(total))\n"
+                "d5 <- sales |> mutate(amount = NULL, amount = year) |> select(amount)\n")
     lg = subprocess.run([tool, logic, "--root", root], capture_output=True, text=True, timeout=120)   # --root anywhere
     lines = [l for l in lg.stdout.splitlines() if l.startswith("R/logic.R:")]
     grouped = {int(l.split(":")[1]) for l in lines if "runs per group" in l}
     findings = {int(l.split(":")[1]) for l in lines if "runs per group" not in l}
-    check(grouped == {3, 6} and "left by summarise() on line 3" in lg.stdout and "so sum() is computed within each group" in lg.stdout,
+    check(grouped == {3, 6, 15} and "left by summarise() on line 3" in lg.stdout and "so sum() is computed within each group" in lg.stdout
+          and "R/logic.R:15: mutate(., share = n/sum(n)) runs per group: the frame is still grouped by region, left by tally() on line 15" in lg.stdout,
           f"grouped-aggregate notes unexpected (lines {sorted(grouped)}):\n{lg.stdout}")
-    check(findings == {8, 9, 11, 12, 13} and "R/logic.R:9: summarise() assigns 'n' twice" in lg.stdout and "R/logic.R:8: 'year' is not a column" in lg.stdout
+    check(findings == {8, 9, 11, 12, 13, 17} and "R/logic.R:9: summarise() assigns 'n' twice" in lg.stdout and "R/logic.R:8: 'year' is not a column" in lg.stdout
           and "R/logic.R:12: 'amount > amount' compares the column with itself (always FALSE" in lg.stdout
-          and "R/logic.R:13: 'amount == amount' compares the column with itself (always TRUE" in lg.stdout,
+          and "R/logic.R:13: 'amount == amount' compares the column with itself (always TRUE" in lg.stdout
+          and "R/logic.R:17: mutate() assigns 'amount' twice" in lg.stdout and "R/logic.R:17: 'amount' is not a column" not in lg.stdout,
           f"logic findings unexpected (lines {sorted(findings)}):\n{lg.stdout}")
-    check(lg.returncode == 1 and "5 finding(s), 2 note(s)" in lg.stderr, f"logic exit status or summary unexpected: {lg.returncode}\n{lg.stderr}")
+    check(lg.returncode == 1 and "6 finding(s), 3 note(s)" in lg.stderr, f"logic exit status or summary unexpected: {lg.returncode}\n{lg.stderr}")
     lsteps = subprocess.run([tool, "--steps", "--root", root, logic], capture_output=True, text=True, timeout=120).stdout
     check("mutate(sales, amount = amount * 2, year = NULL) => region, amount, customer (amount overwritten)" in lsteps,
           f"--steps does not show the overwrite and the NULL drop:\n{lsteps}")

@@ -2629,10 +2629,14 @@ walk_guarded_if <- function(e, ctx) {
   } else if (is.null(saved)) {
     apply_assertion(m, ctx)
   }
+  guarded <- ctx$frames[[nm]]
   walk_expr(e[[3L]], ctx)
   then_out <- list(frames = ctx$frames, unknown = ctx$unknown_frames)
-  # the guarded frame itself is as it was outside the branch
-  then_out$frames[[nm]] <- saved
+  # the guard's own columns hold inside the branch only: a guarded frame the
+  # branch left alone is as it was outside; one the branch reassigned
+  # (`if ("y" %in% names(df)) df <- mutate(df, z = y)`) keeps that result,
+  # merged below with the other outcome as any reassigned frame is
+  if (identical(ctx$frames[[nm]], guarded)) then_out$frames[[nm]] <- saved
   then_out$unknown <- if (nm %in% before_unknown) union(then_out$unknown, nm) else setdiff(then_out$unknown, nm)
   ctx$frames <- before
   ctx$unknown_frames <- before_unknown
@@ -2742,6 +2746,15 @@ selection_names <- function(args, ctx = NULL, cols = NULL, negated = FALSE) {
 
 select_helpers <- c("starts_with", "ends_with", "contains", "matches", "num_range", "everything",
                     "last_col", "any_of")
+
+# Whether a selection argument takes columns away: its first leaf, through
+# `c()`, parentheses and `:`, is a `-` or `!` (`-a`, `!c(a, b)`, `c(-a, -b)`,
+# `-a:-b`, `-(a:b)`), so the names selection_names() gives for it are the
+# ones to remove.
+leading_neg <- function(a) {
+  while (is.call(a) && length(a) >= 2L && call_name(a) %in% c("c", "(", ":")) a <- a[[2L]]
+  is.call(a) && call_name(a) %in% c("-", "!")
+}
 
 # One tidyselect helper expanded against the known columns, as tidyselect
 # would: `ignore.case = TRUE` by default, a vector of prefixes matching any,
@@ -3138,7 +3151,11 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     for (a in call_args(e)) self_comparisons(a)
   }
   # mutate(a = ..., b = a + 1): each argument sees the columns made before it;
-  # the columns an argument reads are what its new column derives from
+  # the columns an argument reads are what its new column derives from. The
+  # input columns any argument reads are also kept as a whole (`input_read`),
+  # for mutate()'s .keep: a name assigned twice keeps only its last reads as
+  # lineage, but dplyr counts the first assignment's columns as used too
+  input_read <- character()
   check_sequential <- function() {
     cur <- cols
     assigned <- character()
@@ -3147,6 +3164,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
       syms <- masked_symbols(args[[i]])
       check_symbols(syms, cur, ctx, fn_arg_symbols(args[[i]]))
       self_comparisons(args[[i]])
+      input_read <<- union(input_read, syms[syms %in% as.character(cols)])
       if (nzchar(nms[[i]])) {
         derive(ctx, nms[[i]], syms[syms %in% as.character(cur)])
         # a column of the incoming frame given a new value: an overwrite (r-colmap lists it)
@@ -3161,21 +3179,27 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
         cur <- unique(c(cur, nms[[i]]))
       }
     }
-    grouped_aggregate_note(fn, args[!dot_args])
+    # a second summarise() rolls the groups up a level, which is what
+    # drop_last is for: no note there
+    if (fn %in% c("mutate", "transmute")) grouped_aggregate_note(fn, args[!dot_args])
   }
   # an aggregate or window function in a step on a frame whose grouping was
-  # left behind by summarise()'s default (.groups = "drop_last"): the value
-  # is computed per group, which is as often meant as not, so this is said,
-  # not reported as a finding
+  # left behind by summarise()'s default (.groups = "drop_last"), or by
+  # tally(), which does the same: the value is computed per group, which is
+  # as often meant as not, so this is said, not reported as a finding
   grouped_aggregate_note <- function(fn, exprs) {
     from <- attr(cols, "groups_from")
     if (is.null(from) || !identical(from$how, "summarise_default") || !length(group_cols) || groups_unknown) return(invisible())
     heads <- unique(unlist(lapply(exprs, call_heads)))
     agg <- intersect(heads, aggregate_fns)
     if (!length(agg)) return(invisible())
+    by_tally <- identical(from$verb, "tally")
+    left_by <- if (by_tally) sprintf("tally() on line %d (it drops only the last grouping column, as summarise() does)", from$line)
+      else sprintf("summarise() on line %d (.groups defaults to \"drop_last\")", from$line)
+    remedy <- if (by_tally) "ungroup() before this step" else "add .groups = \"drop\" to that summarise() or ungroup() before this step"
     report_grouped(ctx, fn, sprintf(
-      "%s runs per group: the frame is still grouped by %s, left by summarise() on line %d (.groups defaults to \"drop_last\"), so %s() is computed within each group. If the whole-table value was meant, add .groups = \"drop\" to that summarise() or ungroup() before this step.",
-      ctx$step_call %||% paste0(fn, "()"), paste(group_cols, collapse = ", "), from$line, agg[[1L]]))
+      "%s runs per group: the frame is still grouped by %s, left by %s, so %s() is computed within each group. If the whole-table value was meant, %s.",
+      ctx$step_call %||% paste0(fn, "()"), paste(group_cols, collapse = ", "), left_by, agg[[1L]], remedy))
   }
   # the same for the named arguments of a verb that are not sequential
   derive_named <- function() for (nm in names(named)) {
@@ -3349,6 +3373,12 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
                 "head", "tail", "collect", "compute", "as_tibble", "as.data.frame")) {
     check_all()
     if (fn %in% c("filter", "slice", "slice_head", "slice_tail", "slice_min", "slice_max")) grouped_aggregate_note(fn, c(pos, named))
+    # ungroup(a) removes only the grouping columns it names; ungroup() all of them
+    if (fn == "ungroup" && length(pos)) {
+      s <- selection_names(pos, ctx, cols)
+      if (is.null(s) || groups_unknown) return(NULL)
+      return(with_groups(cols, setdiff(group_cols, s)))
+    }
     return(with_groups(cols, if (fn == "ungroup") character() else group_cols))
   }
   if (fn == "group_by") {
@@ -3369,14 +3399,26 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     if (fn == "mutate") {
       added <- island_added()
       if (is.null(added)) return(NULL)
-      # mutate(x = NULL) removes x; .keep = "none" keeps the new columns and
-      # the groups, "used"/"unused" the input columns the expressions read or not
-      nulls <- names(named)[vapply(named, is.null, TRUE)]
+      # mutate(x = NULL) removes x, unless a later argument makes x again (it
+      # is then a new column, at the end); .keep = "none" keeps the new
+      # columns and the groups, "used"/"unused" the input columns the
+      # expressions read or not
+      is_null <- vapply(named, is.null, TRUE)
+      nulls <- names(named)[is_null & !duplicated(names(named), fromLast = TRUE)]
       new <- setdiff(names(named), nulls)
       keep <- if (".keep" %in% nms) string_vector(args[[".keep"]], ctx) else "all"
       if (!is.character(keep) || length(keep) != 1L || is.na(keep)) return(NULL)
-      read <- unique(unlist(ctx$derived_now))
-      input <- setdiff(as.character(cols), nulls)   # an overwritten column keeps its place
+      read <- input_read
+      # an across()/pick() island reads its selection and, when it rewrites
+      # those columns in place (no new names), makes them anew: both count
+      # for .keep; a selection the checker cannot read leaves the set unknown
+      if (keep != "all") for (p in pos) {
+        sel <- if (is.symbol(p)) as.character(p) else if (is.call(p)) island_selection(p, ctx, cols) else NULL
+        if (is.null(sel)) return(NULL)
+        read <- union(read, sel)
+        if (is.symbol(p) || !length(across_names(p, ctx, cols))) new <- union(new, sel)
+      }
+      input <- setdiff(as.character(cols), names(named)[is_null])   # an overwritten column keeps its place
       base_cols <- switch(keep, all = input, used = intersect(input, c(read, group_cols, new)), unused = setdiff(input, setdiff(read, c(group_cols, new))),
                           none = intersect(input, c(group_cols, new)), return(NULL))
       res <- with_groups(unique(c(base_cols, new, added)))
@@ -3416,19 +3458,27 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     # every column, a positive argument adds, a negative one removes, and
     # `new = old` renames; dplyr keeps the grouping columns whatever the selection
     known <- as.character(cols)
-    first_neg <- length(args) && !dot_args[[1L]] && is.call(args[[1L]]) && call_name(args[[1L]]) %in% c("-", "!")
+    first_neg <- length(args) && !dot_args[[1L]] && leading_neg(args[[1L]])
     cur <- if (first_neg) known else character()
+    g <- group_cols
     for (i in seq_along(args)) {
       if (dot_args[[i]]) next
       a <- args[[i]]
       nm_i <- selection_names(list(a), ctx, cols)
       if (is.null(nm_i)) return(NULL)
-      if (nzchar(nms[[i]])) { cur <- unique(c(setdiff(cur, nm_i), nms[[i]])); next }
-      cur <- if (is.call(a) && call_name(a) %in% c("-", "!")) setdiff(cur, nm_i) else unique(c(cur, nm_i))
+      if (nzchar(nms[[i]])) {
+        # `new = old` renames: a grouping column too (the frame is then grouped
+        # by the new name), and it is lineage for r-colmap as rename() is
+        derive(ctx, nms[[i]], nm_i)
+        if (!groups_unknown) g[g %in% nm_i] <- nms[[i]]
+        cur <- unique(c(setdiff(cur, nm_i), nms[[i]]))
+        next
+      }
+      cur <- if (leading_neg(a)) setdiff(cur, nm_i) else unique(c(cur, nm_i))
     }
     if (groups_unknown) return(if (first_neg) with_groups(unique(cur)) else NULL)
-    kept <- unique(c(group_cols, cur))
-    return(if (first_neg) with_groups(kept) else closed(with_groups(kept)))
+    kept <- unique(c(g, cur))
+    return(if (first_neg) with_groups(kept, g) else closed(with_groups(kept, g)))
   }
   if (fn == "rename") {
     old <- vapply(named, function(a) if (is.symbol(a) || is.character(a)) as.character(a) else NA_character_, "")
@@ -3437,27 +3487,48 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     for (i in seq_along(old)) derive(ctx, names(named)[[i]], old[[i]])
     g <- group_cols
     if (!groups_unknown && length(g)) { hit <- g %in% old; g[hit] <- names(named)[match(g[hit], old)] }
-    return(with_groups(unique(c(setdiff(cols, old), names(named))), g))
+    # the new name takes the old one's place, so that a:b ranges and
+    # last_col() after it read as dplyr does; a name that is not a column
+    # (reported above) is appended under its new name, as before
+    out <- as.character(cols)
+    found <- old %in% out
+    out[match(old[found], out)] <- names(named)[found]
+    return(with_groups(unique(c(out, names(named)[!found])), g))
   }
   if (fn %in% c("count", "tally", "add_count")) {
     check_all()
     g <- selection_names(pos, ctx, cols)
     if (is.null(g)) return(NULL)
-    nm <- if (!is.null(args[["name"]])) string_vector(args[["name"]], ctx) else "n"
-    if (!is.character(nm) || length(nm) != 1L || is.na(nm)) return(NULL)
     if (fn != "add_count" && groups_unknown) return(NULL)
+    nm <- if (!is.null(args[["name"]])) string_vector(args[["name"]], ctx) else {
+      # the default name is n, or nn, nnn, ... when that is taken: by any
+      # column of the frame for add_count(), by a grouping (counted) column
+      # for count() and tally(), as dplyr's n_name() has it
+      taken <- if (fn == "add_count") as.character(cols) else c(group_cols, g)
+      default <- "n"
+      while (default %in% taken) default <- paste0("n", default)
+      default
+    }
+    if (!is.character(nm) || length(nm) != 1L || is.na(nm)) return(NULL)
+    if (fn == "add_count") return(with_groups(unique(c(cols, nm))))
     # count() and add_count() keep the frame's groups; tally() is a
-    # summarise(), which drops the last one
-    return(if (fn == "add_count") with_groups(unique(c(cols, nm)))
-           else closed(with_groups(unique(c(group_cols, g, nm)), if (fn == "tally") head(group_cols, -1L) else group_cols)))
+    # summarise(), which drops the last one by default and leaves the rest
+    # behind, which a mutate()/filter() aggregate after it is told about
+    if (fn == "count") return(closed(with_groups(unique(c(group_cols, g, nm)))))
+    return(closed(with_groups(unique(c(group_cols, g, nm)), head(group_cols, -1L),
+                              from = list(how = "summarise_default", verb = "tally", line = ctx$line))))
   }
   if (fn == "distinct") {
     check_all()
+    derive_named()
     g <- selection_names(pos, ctx, cols)
     if (is.null(g)) return(NULL)
-    if (!length(g) || isTRUE(args[[".keep_all"]] %||% FALSE)) return(with_groups(cols))
+    # distinct(yr = year) computes a column and keeps it, as group_by() does;
+    # with .keep_all the rest stays too, and distinct() alone keeps everything
+    keep <- c(g, names(named))
+    if (!length(keep) || isTRUE(args[[".keep_all"]] %||% FALSE)) return(with_groups(unique(c(as.character(cols), names(named)))))
     if (groups_unknown) return(NULL)
-    return(closed(with_groups(unique(c(group_cols, g)))))
+    return(closed(with_groups(unique(c(group_cols, keep)))))
   }
   # nest(): the nested columns leave the frame and a list-column takes their
   # place. `nest(data = -id)`, `nest(data = c(a, b))`, several named
@@ -3571,26 +3642,40 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
   NULL
 }
 
-# ggplot chains: ggplot(df, aes(...)) + layer(aes(...)) ...
+# The data argument of a ggplot() call, as an index into the call: the one
+# named `data`, else the first unnamed one (`ggplot(df, aes(...))` and
+# `ggplot(mapping = aes(...), data = df)` alike); NULL when there is none.
+ggplot_data_index <- function(call) {
+  nms <- names(call) %||% rep("", length(call))
+  if ("data" %in% nms) return(match("data", nms))
+  pos <- which(!nzchar(nms))[-1L]   # the head is unnamed too
+  if (length(pos)) pos[[1L]] else NULL
+}
+
+# ggplot chains: ggplot(df, aes(...)) + layer(aes(...)) ... Returns TRUE when
+# the `+` chain is a plot (handled here, whether or not its data is known),
+# FALSE when it is some other sum, which the caller walks itself.
 check_ggplot <- function(e, ctx) {
-  if (!is.call(e) || !identical(call_name(e), "+") || length(e) != 3L) return(invisible())
+  if (!is.call(e) || !identical(call_name(e), "+") || length(e) != 3L) return(invisible(FALSE))
   base <- e[[2L]]
   while (is.call(base) && identical(call_name(base), "+")) base <- base[[2L]]
   # ggplot(df, aes(...)), or df %>% ... %>% ggplot(aes(...)): the frame is the
-  # first argument, or what the pipe brings (its steps are checked on the way)
+  # data argument, or what the pipe brings (its steps are checked on the way)
   data <- NULL
   plot <- NULL
-  if (is.call(base) && identical(call_name(base), "ggplot") && length(base) >= 2L) {
-    data <- base[[2L]]
+  data_i <- NULL
+  if (is.call(base) && identical(call_name(base), "ggplot")) {
     plot <- base
+    data_i <- ggplot_data_index(base)
+    if (!is.null(data_i)) data <- base[[data_i]]
   } else if (is.call(base) && call_name(base) %in% c("%>%", "%<>%", "%T>%") && length(base) == 3L &&
              is.call(base[[3L]]) && identical(call_name(base[[3L]]), "ggplot")) {
     data <- base[[2L]]
     plot <- base[[3L]]
   }
-  if (is.null(plot)) return(invisible())
-  cols <- as_frame(frame_columns(data, ctx, used = TRUE))
-  if (is.null(cols)) return(invisible())
+  if (is.null(plot)) return(invisible(FALSE))
+  cols <- if (is.null(data)) NULL else as_frame(frame_columns(data, ctx, used = TRUE))
+  if (is.null(cols)) return(invisible(TRUE))
   layers <- list()
   node <- e
   while (is.call(node) && identical(call_name(node), "+")) {
@@ -3599,7 +3684,7 @@ check_ggplot <- function(e, ctx) {
   }
   # the plot is a step that reads columns and keeps the frame as it is
   shown <- plot
-  if (identical(plot, base)) { if (length(shown) >= 2L && is.call(shown[[2L]])) shown[[2L]] <- as.name(".") }
+  if (identical(plot, base)) { if (is.call(shown[[data_i]])) shown[[data_i]] <- as.name(".") }
   else shown <- as.call(c(list(as.name("ggplot"), as.name(".")), as.list(plot)[-1L]))
   saved_used <- ctx$used_now
   saved_step <- ctx$step_call
@@ -3612,7 +3697,7 @@ check_ggplot <- function(e, ctx) {
   record_step(ctx, shown, cols, before = cols, used = ctx$used_now)
   ctx$used_now <- saved_used
   ctx$step_call <- saved_step
-  invisible()
+  invisible(TRUE)
 }
 
 # The bare names an aes() reads from the data: ggplot's computed variables
@@ -3841,8 +3926,11 @@ walk_expr <- function(e, ctx) {
     frame_columns(e, ctx)
     return(invisible())
   }
+  # a `+` that is not a plot chain (`nrow(df %>% filter(x > 0)) + 1`,
+  # `df$a + df$b`) is walked like any other call, so the pipelines and the
+  # column accesses on either side of it are checked
   if (!is.na(fn) && fn == "+") {
-    check_ggplot(e, ctx)
+    if (!check_ggplot(e, ctx)) for (p in call_args(e)) if (is.call(p)) walk_expr(p, ctx)
     return(invisible())
   }
   if (!is.na(fn) && fn == "{") return(walk_block(e, ctx))
