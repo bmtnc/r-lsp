@@ -274,9 +274,13 @@ rish_command() { printf '%s' "$1" | sed 's/\\[ntr]/ /g' | grep -qE "$r_lsp_rish_
 # modification time counts too) whose current mtime:size is not in the
 # ledger: one "mtime:size<TAB>path" per line, the key that the ledger will
 # store for the file as it was found (not as it may be after the check).
-# Nothing is walked once the project is remembered as having no R code.
+# A file a hook named as past its per-check limit is in the ledger under
+# "listed:" and its key: for the Bash hook ($4 = bash) it counts as seen,
+# so it does not return at every command; the Stop hook, which has its own
+# budget, still gets it, so the end of the turn checks it. Nothing is
+# walked once the project is remembered as having no R code.
 unchecked_r_files() {
-  local root="$1" sd="$2" mode="${3:-}" stamp ledger f m
+  local root="$1" sd="$2" mode="${3:-}" via="${4:-}" stamp ledger f m
   stamp="$sd/start.stamp"
   ledger="$sd/checked.tsv"
   [ -f "$stamp" ] || return 0
@@ -294,7 +298,10 @@ unchecked_r_files() {
     esac
     m="$(stamp_of "$f")"
     [ -n "$m" ] || continue
-    if [ -f "$ledger" ] && grep -qxF -- "$m$r_lsp_tab$f" "$ledger" 2>/dev/null; then continue; fi
+    if [ -f "$ledger" ]; then
+      if grep -qxF -- "$m$r_lsp_tab$f" "$ledger" 2>/dev/null; then continue; fi
+      if [ "$via" = bash ] && grep -qxF -- "listed:$m$r_lsp_tab$f" "$ledger" 2>/dev/null; then continue; fi
+    fi
     printf '%s\n' "$m$r_lsp_tab$f"
   done
   set +f
@@ -315,7 +322,7 @@ check_unchecked() {
   # a recheck is throttled for its own command alone
   r_lsp_recheck_key=""
   [ "$mode" = recheck ] && r_lsp_recheck_key="$(recheck_key "$(json_field "$input" command)")"
-  files="$(unchecked_r_files "$root" "$sd" "$mode")"
+  files="$(unchecked_r_files "$root" "$sd" "$mode" "$via")"
   [ -n "$files" ] || return 0
   n="$(printf '%s\n' "$files" | grep -c .)"
   # Every path goes to R through a file (paths may hold spaces; a branch

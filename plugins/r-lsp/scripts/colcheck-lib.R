@@ -1234,9 +1234,15 @@ checked_file <- function(f, root = NULL, fresh = FALSE) {
   # not enter it again (project_sinks_for)
   colcheck_process$in_progress <- c(colcheck_process$in_progress, key)
   on.exit(colcheck_process$in_progress <- setdiff(colcheck_process$in_progress, key), add = TRUE)
+  # the file's own stamp is taken before the check: a file rewritten while
+  # it is checked is stored as it was read, so the next look sees a change
+  # (the hooks' ledger makes the same promise)
+  self_stamp <- unname(file_stamp(key))
   res <- colcheck_file(key, root)
   if (!is.null(st) && length(attr(res, "deps"))) {
-    st$entries[[key]] <- list(file = key, deps = file_stamp(attr(res, "deps")), helpers = attr(res, "helpers"),
+    deps <- file_stamp(attr(res, "deps"))
+    if (key %in% names(deps)) deps[[key]] <- self_stamp
+    st$entries[[key]] <- list(file = key, deps = deps, helpers = attr(res, "helpers"),
                               sink_lookups = attr(res, "sink_lookups"), result = res)
     st$dirty <- TRUE
   }
