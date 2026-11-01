@@ -709,7 +709,7 @@ def scenario_colcheck(s):
           f"--steps does not show the overwrite and the NULL drop:\n{lsteps}")
     ctx = hook_context(run_hook(hook, {"tool_name": "Edit", "tool_input": {"file_path": logic}, "cwd": root}, env={"CLAUDE_PROJECT_DIR": root}))
     check("Steps whose result cannot be what the code means" in ctx and "assigns 'n' twice" in ctx
-          and "Steps that run per group because an earlier summarise() left the frame grouped" in ctx, f"hook note lacks the logic sections:\n{ctx}")
+          and "Steps that run per group because an earlier summarise() or tally() left the frame grouped" in ctx, f"hook note lacks the logic sections:\n{ctx}")
 
     # Reader arguments that change the column names (col_select, col_names,
     # header=, id=, skip=, make.names repair, fread select/drop) and base-R
