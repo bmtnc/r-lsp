@@ -12,12 +12,12 @@ case "${1:-}" in
   -h|--help|help)
     echo "usage: r-lsp-status [-n N]   the last N (default 8) index events of this project's R language server"
     exit 0 ;;
-  -n) shift; lines="${1:-}"; shift ;;
-  "") lines="" ;;
+  -n) shift; count="${1:-}"; shift ;;
+  "") count="" ;;
   *[!0-9]*) echo "r-lsp-status: unknown argument '$1' (usage: r-lsp-status [-n N])" >&2; exit 2 ;;
-  *) lines="$1"; shift ;;
+  *) count="$1"; shift ;;
 esac
-case "$lines" in ""|*[!0-9]*) lines=8 ;; esac
+case "$count" in ""|*[!0-9]*) count=8 ;; esac
 shopt -s nullglob
 files=("${R_LSP_STATUS_FILE:-}")
 [ -n "${R_LSP_STATUS_FILE:-}" ] || files=("$HOME"/.claude/plugins/data/*/status.log)
@@ -86,7 +86,7 @@ for f in "${files[@]}"; do
     [ "${#show[@]}" -gt 1 ] && echo "${#show[@]} servers are running for this project (another session's, or a restart's); each one's events:"
   fi
   for p in "${show[@]}"; do
-    printf '%s\n' "$tagged" | awk -F'\t' -v p="$p" '$1 == p { sub(/^[^\t]*\t/, ""); print }' | tail -n "$lines" | sed -e 's/ \[[^]]*\]//'
+    printf '%s\n' "$tagged" | awk -F'\t' -v p="$p" '$1 == p { sub(/^[^\t]*\t/, ""); print }' | tail -n "$count" | sed -e 's/ \[[^]]*\]//'
   done
 done
 if [ "$found" = 0 ]; then

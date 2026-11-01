@@ -835,6 +835,16 @@ writers <- c("write_csv", "write_csv2", "write_tsv", "write_delim", "write_excel
              "dbWriteTable")
 table_writers <- "dbWriteTable"
 table_readers <- c("tbl", "dbReadTable")
+# Every call that consumes a frame without naming its columns: the frame is
+# written out, and that is where it went, recorded as a "written" fate for
+# the data map (the writers above, whose path argument the checker reads,
+# are also sinks a reader of the same path resolves from). The frame keeps
+# its columns past a readr writer; saveRDS() and its kind return nothing.
+sink_calls <- unique(c(writers, table_writers, "saveRDS", "save", "write_rds", "write_ipc_file", "write_dataset", "write_xlsx",
+                       "write.xlsx", "writeData", "write_fst", "write_dta", "write_sav", "write_sas", "write_xpt", "write_json",
+                       "qsave", "dbAppendTable", "copy_to", "s3write_using", "s3saveRDS", "s3save", "write_sf", "st_write", "write_ods"))
+sink_frame_args <- c("x", "object", "value", "data", ".data", "df", "obj", "dataset", "table")
+sink_returns_nothing <- c("saveRDS", "save", "qsave", "s3saveRDS", "s3save")
 
 # The frame and the path (or table name) a writer call carries.
 sink_args <- function(e, fn) {
@@ -883,17 +893,38 @@ same_target <- function(a, b, root) {
 # Record what a writer call writes: the path and the frame's columns (NULL
 # when they are unknown; write.csv() adds a row-name column unless told not
 # to, so its file has at least these). Piped (`df %>% write_csv(p)`) or not.
-record_sink <- function(e, fn, ctx, cols) {
-  if (!is.null(ctx$pkg_scope)) return(invisible())
-  key <- path_literal(sink_args(e, fn)$path, ctx)
-  if (is.null(key) || !nzchar(key)) return(invisible())
+record_sink <- function(e, fn, ctx, cols = NULL, lookup = is.null(cols)) {
+  if (!is.null(ctx$pkg_scope)) return(invisible(as_frame(cols)))
+  # the frame: a writer's data argument, else the first argument (by these
+  # names, then positional) that resolves to a frame (`dbWriteTable(con, "t", df)`)
+  if (lookup) {
+    if (fn %in% writers) {
+      sa <- sink_args(e, fn)
+      if (!is.null(sa$data)) cols <- frame_columns(sa$data, ctx, used = TRUE)
+    } else {
+      args <- call_args(e)
+      nms <- names(args) %||% rep("", length(args))
+      for (a in c(args[nms %in% sink_frame_args], args[!nzchar(nms)])) {
+        if (!(is.symbol(a) || is.call(a))) next
+        if (is.call(a) && identical(call_name(a), "function")) next
+        cols <- as_frame(frame_columns(a, ctx))
+        if (!is.null(cols)) break
+      }
+    }
+  }
   cols <- as_frame(cols)
+  # for the data map: where the frame went
+  if (!is.null(cols) && !is_listed(cols)) record_step(ctx, e, cols, before = cols, fate = "written", fate_fn = fn)
+  # for a reader of the same path or table: what was written there
+  if (!(fn %in% writers)) return(invisible(cols))
+  key <- path_literal(sink_args(e, fn)$path, ctx)
+  if (is.null(key) || !nzchar(key)) return(invisible(cols))
   known <- !is.null(cols) && !is_listed(cols)
   open <- known && (is_open(cols) || (fn %in% c("write.csv", "write.csv2", "write.table") && !isFALSE(as.list(e)[["row.names"]])))
   ctx$sinks[[length(ctx$sinks) + 1L]] <- list(
     file = ctx$file, line = ctx$line, fn = fn, path = key, table = fn %in% table_writers,
     columns = if (known) as.character(cols) else NULL, open = open, call = one_line(e))
-  invisible()
+  invisible(cols)
 }
 
 # The columns a reader gets from a writer of the same path: the one in this
@@ -2032,7 +2063,7 @@ builtin_dataset_lookup <- function(nm, ctx) {
 }
 
 keep_source <- function(cols, template) {
-  for (a in c("source", "source_id", "source_line", "inner", "open", "collect")) attr(cols, a) <- attr(template, a)
+  for (a in c("source", "source_id", "source_line", "source_file", "inner", "open", "collect")) attr(cols, a) <- attr(template, a)
   cols
 }
 
@@ -2042,16 +2073,19 @@ keep_source <- function(cols, template) {
 # with the same text in one file is told apart by its line.
 literal_id <- function(e, ctx) {
   text <- substr(one_line(e), 1L, 120L)
-  if (is.null(ctx$literal_lines)) ctx$literal_lines <- list()
-  seen <- ctx$literal_lines[[text]] %||% integer()
-  line <- ctx$line %||% NA_integer_
   file <- normalizePath(ctx$file, mustWork = FALSE)
-  if (!length(seen) || is.na(line) || line %in% seen) {
-    if (!is.na(line) && !length(seen)) ctx$literal_lines[[text]] <- line
-    return(sprintf("literal:%s:%s", file, text))
-  }
-  ctx$literal_lines[[text]] <- c(seen, line)
-  sprintf("literal:%s:%s@%d", file, text, line)
+  bare <- sprintf("literal:%s:%s", file, text)
+  line <- ctx$line %||% NA_integer_
+  if (is.na(line)) return(bare)
+  if (is.null(ctx$literal_lines)) ctx$literal_lines <- list()
+  k <- paste(file, text)
+  seen <- ctx$literal_lines[[k]] %||% integer()
+  # the first literal with this text owns the bare id, at every visit of its
+  # line (a body is walked more than once); a later one is told apart by its line
+  if (!length(seen)) { ctx$literal_lines[[k]] <- line; return(bare) }
+  if (line == seen[[1L]]) return(bare)
+  if (!(line %in% seen)) ctx$literal_lines[[k]] <- c(seen, line)
+  sprintf("%s@%d", bare, line)
 }
 
 # A frame's source as two attributes: the label a message shows (`source`,
@@ -2114,10 +2148,11 @@ frame_columns <- function(e, ctx, used = FALSE) {
     rhs_def <- lookup_function(rhs, rhs_fn, ctx)
     # `df %>% write_csv(path)`: the frame is written, and comes back out
     # (readr's writers return their input invisibly)
-    if (!is.na(rhs_fn) && rhs_fn %in% writers && is.null(rhs_def)) {
+    if (!is.na(rhs_fn) && rhs_fn %in% sink_calls && is.null(rhs_def)) {
       lhs <- frame_columns(e[[2L]], ctx, used = TRUE)
-      record_sink(rhs, rhs_fn, ctx, lhs)
-      return(lhs)
+      if (!is_not_frame(lhs)) record_sink(pipe_into(rhs, as.name(".")), rhs_fn, ctx, lhs, lookup = FALSE)
+      # readr's writers return their input; saveRDS() and its kind return nothing
+      return(if (rhs_fn %in% sink_returns_nothing) not_frame else lhs)
     }
     # a cache entry for a piped helper, `df %>% clean()`, beats following its
     # code, as it does for the direct call `clean(df)`; verbs never match
@@ -2177,6 +2212,7 @@ frame_columns <- function(e, ctx, used = FALSE) {
     nms <- nms[!(nms %in% options_)]
     cols <- with_source(nms, paste0(fn, "() literal"), literal_id(e, ctx))
     attr(cols, "source_line") <- ctx$line
+    attr(cols, "source_file") <- ctx$file   # a literal in a test, followed into R/, is still named by the test's line
     # data = list(tibble(d = 1, r = 2)): the inner columns of a list-column
     inner <- list()
     for (i in seq_along(nms)) {
@@ -2198,6 +2234,7 @@ frame_columns <- function(e, ctx, used = FALSE) {
     if (!length(cols)) return(NULL)
     cols <- with_source(cols, "tribble() literal", literal_id(e, ctx))
     attr(cols, "source_line") <- ctx$line
+    attr(cols, "source_file") <- ctx$file
     return(cols)
   }
   # a plot built with `+`: its aes() calls are checked against the frame
@@ -2252,12 +2289,12 @@ frame_columns <- function(e, ctx, used = FALSE) {
     if (!is.null(first) && is.null(result)) note_stop(ctx, e, fn, NULL, reason = "its id column is computed")
     return(result)
   }
-  # a writer: the frame it writes is recorded as a sink, and flows on
-  if (fn %in% writers && is.null(lookup_function(e, fn, ctx))) {
-    sa <- sink_args(e, fn)
-    cols <- if (is.null(sa$data)) NULL else frame_columns(sa$data, ctx, used = TRUE)
-    record_sink(e, fn, ctx, cols)
-    return(cols)
+  # a sink: the frame it writes is recorded (where it went; for a writer with
+  # a stated path, what a reader of that path gets) and flows on, except
+  # from saveRDS() and its kind, which return nothing
+  if (fn %in% sink_calls && is.null(lookup_function(e, fn, ctx))) {
+    cols <- record_sink(e, fn, ctx)
+    return(if (fn %in% sink_returns_nothing) not_frame else cols)
   }
   # a targets object: the columns of the target's command
   if (fn %in% c("tar_read", "tar_read_raw") && length(e) >= 2L) return(target_columns(e[[2L]], ctx))
@@ -2841,11 +2878,22 @@ report <- function(ctx, name, cols) {
 # call (fn_arg_symbols); one of those that names a function in scope is a
 # function passed as a value, not a column.
 check_symbols <- function(syms, cols, ctx, fn_args = character()) {
-  if (is_open(cols)) return(invisible(character()))
   syms <- unique(syms)
   bad <- syms[!(syms %in% cols) & !(syms %in% ctx$variables) & !(syms %in% ctx$known_names) &
               !vapply(syms, function(s) exists(s, envir = baseenv()), TRUE)]
   bad <- bad[!(bad %in% fn_args) | !vapply(bad, is_function_name, TRUE, ctx = ctx)]
+  if (is_open(cols)) {
+    # a partly known frame ("at least these"): nothing is reported. For
+    # r-colmap, the known names read here are uses; on a function parameter
+    # every name that is not a variable is one too, since the body states
+    # what it expects of the frame (on a data frame bound with an unknown one
+    # the name may belong to the other, so only the known ones count)
+    if (!is.null(ctx$used_now)) {
+      expected <- if (startsWith(attr(cols, "source_id") %||% "", "parameter:")) bad else character()
+      ctx$used_now <- union(ctx$used_now, c(syms[syms %in% cols], expected))
+    }
+    return(invisible(character()))
+  }
   for (b in bad) report(ctx, b, cols)
   # the names that are columns: what this step reads (for r-colmap)
   if (!is.null(ctx$used_now)) ctx$used_now <- union(ctx$used_now, syms[syms %in% cols])
@@ -2861,17 +2909,19 @@ apply_verb <- function(call, cols, ctx, piped) {
   saved_derived <- ctx$derived_now
   saved_over <- ctx$overwritten_now
   saved_step <- ctx$step_call
+  saved_joined <- ctx$joined_now
   # restored on every exit, an error inside the verb included
-  on.exit({ ctx$used_now <- saved_used; ctx$derived_now <- saved_derived; ctx$overwritten_now <- saved_over; ctx$step_call <- saved_step }, add = TRUE)
+  on.exit({ ctx$used_now <- saved_used; ctx$derived_now <- saved_derived; ctx$overwritten_now <- saved_over; ctx$step_call <- saved_step; ctx$joined_now <- saved_joined }, add = TRUE)
   ctx$used_now <- character()
   ctx$derived_now <- list()
   ctx$overwritten_now <- character()
+  ctx$joined_now <- NULL
   ctx$step_call <- one_line(shown)
   result <- apply_verb_impl(call, cols, ctx, piped)
   used <- ctx$used_now
   # pull(), nrow(): the step is recorded, with no column set, as the end of the frame
   record_step(ctx, shown, if (is_not_frame(result)) NULL else result, before = cols, used = used, derived = ctx$derived_now,
-              overwritten = ctx$overwritten_now, terminal = is_not_frame(result))
+              overwritten = ctx$overwritten_now, terminal = is_not_frame(result), joined = ctx$joined_now)
   result
 }
 
@@ -2917,13 +2967,22 @@ derive <- function(ctx, new, from) {
 # of what the checker knows, the lineage a review can read. With the set
 # before the step, the columns the step read and the columns it derived from
 # which, r-colmap's raw material.
-record_step <- function(ctx, call, cols, before = NULL, used = character(), derived = list(), overwritten = character(), terminal = FALSE) {
+# `fate`: a step that is not a verb but says where the frame went: "written"
+# (a sink such as saveRDS(); `fate_fn` names it) or "returned" (the last
+# expression of a named function; `fate_fn` is the function). The third fate,
+# tracking ended, is a verb step whose `columns` are NULL with a known
+# `before`, and needs no field. `joined`: for a join, the other frame (its
+# source, columns, the keys read from it and the columns it brought into the
+# result), so the data map can attribute those columns to their own source.
+record_step <- function(ctx, call, cols, before = NULL, used = character(), derived = list(), overwritten = character(), terminal = FALSE,
+                        fate = NULL, fate_fn = NULL, joined = NULL, line = ctx$line) {
   if (!is.null(ctx$pkg_scope)) return(invisible())
   groups <- attr(cols, "groups") %||% character()
   groups_before <- attr(before, "groups") %||% character()
   derived <- Filter(length, derived)
   ctx$steps[[length(ctx$steps) + 1L]] <- list(
-    file = ctx$file, line = ctx$line, line_end = ctx$line_end %||% NA_integer_, call = one_line(call),
+    file = ctx$file, line = line, line_end = ctx$line_end %||% NA_integer_, call = if (is.character(call)) call else one_line(call),
+    fate = fate, fate_fn = fate_fn, joined = joined,
     columns = if (is.null(cols)) NULL else as.character(cols),
     before = if (is.null(before)) NULL else as.character(before),
     groups_before = if (anyNA(groups_before)) NULL else as.character(groups_before),
@@ -2937,7 +2996,8 @@ record_step <- function(ctx, call, cols, before = NULL, used = character(), deri
     terminal = isTRUE(terminal),
     source = attr(cols, "source") %||% attr(before, "source") %||% NA_character_,
     source_id = attr(cols, "source_id") %||% attr(before, "source_id") %||% NA_character_,
-    source_line = attr(cols, "source_line") %||% attr(before, "source_line") %||% NA_integer_)
+    source_line = attr(cols, "source_line") %||% attr(before, "source_line") %||% NA_integer_,
+    source_file = attr(cols, "source_file") %||% attr(before, "source_file") %||% NA_character_)
   invisible()
 }
 
@@ -3267,6 +3327,8 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     return(res)
   }
   if (fn %in% terminal_calls) {
+    # deframe() reads its first two columns (names, values) without naming them
+    if (fn == "deframe" && !is.null(ctx$used_now)) ctx$used_now <- union(ctx$used_now, head(as.character(cols), 2L))
     if (fn == "pull") {
       var <- if ("var" %in% nms) args[["var"]] else if (length(pos)) pos[[1L]] else NULL
       sel <- if (is.null(var) || is.numeric(var)) NULL else selection_names(list(var), ctx, cols)
@@ -3397,6 +3459,36 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     if (groups_unknown) return(NULL)
     return(closed(with_groups(unique(c(group_cols, g)))))
   }
+  # nest(): the nested columns leave the frame and a list-column takes their
+  # place. `nest(data = -id)`, `nest(data = c(a, b))`, several named
+  # selections, `nest(.by = id)` (the rest nested under `.key`, "data" by
+  # default), `nest()` on a grouped frame (the groups stay, the rest is
+  # nested). `.by` together with a named selection, a negated selection on a
+  # partly known frame, and `nest()` on an ungrouped frame stay unknown.
+  if (fn == "nest") {
+    by <- if (".by" %in% nms) selection_names(list(args[[".by"]]), ctx, cols) else NULL
+    if (".by" %in% nms && (is.null(by) || length(check_symbols(by, cols, ctx)))) return(NULL)
+    key <- if (".key" %in% nms) string_vector(args[[".key"]], ctx) else "data"
+    if (is.null(key) || length(key) != 1L) return(NULL)
+    if (length(named)) {
+      if (!is.null(by)) return(NULL)
+      nested <- character()
+      for (a in named) {
+        sel <- selection_names(list(a), ctx, cols)
+        if (is.null(sel) || length(check_symbols(sel, cols, ctx))) return(NULL)
+        neg <- is.call(a) && call_name(a) %in% c("-", "!")
+        if (neg && is_open(cols)) return(NULL)
+        nested <- c(nested, if (neg) setdiff(as.character(cols), sel) else sel)
+      }
+      # the nested columns are consumed into the list-column: a use, for r-colmap
+      if (!is.null(ctx$used_now)) ctx$used_now <- union(ctx$used_now, nested)
+      return(with_groups(unique(c(setdiff(as.character(cols), nested), names(named)))))
+    }
+    if (!is.null(ctx$used_now) && !is_open(cols)) ctx$used_now <- union(ctx$used_now, setdiff(as.character(cols), c(by, group_cols)))
+    if (!is.null(by)) return(closed(with_groups(unique(c(by, key)), character())))
+    if (!length(group_cols) || groups_unknown) return(NULL)
+    return(closed(with_groups(unique(c(group_cols, key)))))
+  }
   if (fn == "pivot_longer") {
     spec <- if (length(pos)) pos[[1L]] else args[["cols"]]
     if (is.null(spec)) return(NULL)
@@ -3455,6 +3547,14 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     groups <- if (groups_unknown || is.null(keys)) group_cols else joined[match(group_cols, as.character(cols))]
     joined <- with_groups(joined, groups)
     if (open) attr(joined, "open") <- TRUE
+    # for the data map: the other frame, and the columns it brought into the
+    # result as they are named there (an x column renamed with the x suffix is
+    # not one of them)
+    sfx <- if (!is.null(args[["suffix"]])) string_vector(args[["suffix"]], ctx) else c(".x", ".y")
+    x_suffixed <- if (!is.null(keys) && length(sfx) == 2L) paste0(setdiff(as.character(cols), keys$x), sfx[[1L]]) else character()
+    ctx$joined_now <- list(source = attr(other, "source"), source_id = attr(other, "source_id"), source_line = attr(other, "source_line"),
+                           source_file = attr(other, "source_file"), columns = as.character(other), keys = keys$y %||% character(),
+                           brought = setdiff(setdiff(as.character(joined), as.character(cols)), x_suffixed))
     return(joined)
   }
   if (fn %in% c("pivot_wider")) {
@@ -3527,7 +3627,7 @@ aes_symbols <- function(a) {
 verbs <- c("mutate", "filter", "summarise", "summarize", "select", "arrange", "group_by", "rename",
            "transmute", "distinct", "count", "pivot_longer", "pivot_wider", "ggplot", "slice", "reframe",
            "left_join", "inner_join", "right_join", "full_join", "semi_join", "anti_join", "pull",
-           "unnest", "unnest_wider", "unnest_longer", "hoist")
+           "unnest", "unnest_wider", "unnest_longer", "hoist", "nest")
 
 # Everything apply_verb() understands: a call to one of these is a pipeline
 # step, never a data source.
@@ -3628,10 +3728,13 @@ walk_expr <- function(e, ctx) {
     target <- as.character(e[[2L]])
     ctx$strings[[target]] <- if (is.character(e[[3L]]) || is.call(e[[3L]])) string_vector(e[[3L]], ctx) else NULL
     if (is.call(e[[3L]]) && identical(call_name(e[[3L]]), "function")) {
-      # a named function: check its body now with unknown parameters (its
-      # own loaders and globals resolve); calls with known frames check it again
+      # a named function: check its body now (its own loaders and globals
+      # resolve; a parameter used as a frame is an open set); calls with known
+      # frames check it again
       ctx$variables <- union(ctx$variables, target)
+      ctx$def_name <- target
       walk_expr(e[[3L]], ctx)
+      ctx$def_name <- NULL   # also when the body walk failed before the function branch cleared it
       return(invisible())
     }
     key <- line_annotation(ctx)
@@ -3674,7 +3777,10 @@ walk_expr <- function(e, ctx) {
     return(invisible())
   }
   if (!is.na(fn) && fn == "function") {
+    name <- ctx$def_name
+    ctx$def_name <- NULL
     params <- names(e[[2L]]) %||% character()
+    body <- e[[3L]]
     saved_vars <- ctx$variables
     saved_unknown <- ctx$unknown_frames
     saved_frames <- ctx$frames
@@ -3692,8 +3798,30 @@ walk_expr <- function(e, ctx) {
     ctx$variables <- union(ctx$variables, params)
     ctx$unknown_frames <- union(ctx$unknown_frames, params)
     for (p in params) ctx$frames[[p]] <- NULL   # a parameter shadows a frame of the same name
+    # In a named function, a parameter the body pipes into a verb is a frame
+    # whose columns are not known: an open set ("at least these"), so the
+    # steps on it are followed, the names the body reads and creates are
+    # recorded, and nothing is reported against it. The data map lists it as
+    # a source of its own, "parameter df of f()".
+    if (!is.null(name)) for (p in params) if (param_used_as_frame(body, p)) {
+      ctx$frames[[p]] <- structure(character(), open = TRUE, source = sprintf("parameter %s of %s()", p, name),
+                                   source_id = sprintf("parameter:%s:%s", name, p))
+      ctx$unknown_frames <- setdiff(ctx$unknown_frames, p)
+    }
     ctx$in_function <- TRUE
-    walk_expr(e[[3L]], ctx)
+    if (is.null(name)) walk_expr(body, ctx) else {
+      # the frame a named function returns went to its callers: recorded as a
+      # fate, which the data map reports when no caller is followed from a
+      # known frame
+      result <- as_frame(body_columns(body, ctx))
+      if (!is.null(result) && !is_listed(result) && !is.null(attr(result, "source"))) {
+        srcs <- attr(body, "srcref")
+        last_line <- if (is.call(body) && identical(call_name(body), "{") && !is.null(srcs) && length(srcs) > 1L)
+          as.integer(srcs[[length(srcs)]][[1L]]) else ctx$line
+        record_step(ctx, sprintf("return from %s()", name), result, before = result, fate = "returned",
+                    fate_fn = name, line = last_line)
+      }
+    }
     return(invisible())
   }
   # negative tests pass deliberately wrong frames: do not follow calls inside
@@ -3722,7 +3850,7 @@ walk_expr <- function(e, ctx) {
   if (!is.na(fn) && fn %in% c("if", "for", "while", "repeat")) return(walk_branches(e, fn, ctx))
   if (!is.na(fn) && fn %in% c("tar_target", "tar_target_raw", "tar_file_read")) return(walk_tar_target(e, fn, ctx))
   if (!is.na(fn) && fn %in% c("tar_load", "tar_load_raw")) { load_targets(e, ctx); return(invisible()) }
-  if (!is.na(fn) && fn %in% writers) frame_columns(e, ctx)
+  if (!is.na(fn) && fn %in% sink_calls && is.null(ctx$functions[[fn]])) frame_columns(e, ctx)
   if (!is.na(fn) && fn %in% c("$", "[[", "[", "setnames")) check_access(e, ctx)
   if (!is.na(fn) && !is.null(ctx$functions[[fn]])) check_call_args(e, fn, ctx)
   if (!is.na(fn) && (fn %in% verbs || !is.null(ctx$functions[[fn]]))) frame_columns(e, ctx)
@@ -3957,7 +4085,9 @@ colcheck_file <- function(file, root = NULL) {
     guarded(ctx, NULL, walk_expr(exprs[[i]], ctx))
   }
   # the walker can visit a pipeline twice (assignment and its right-hand side)
-  step_keys <- vapply(ctx$steps, function(s) paste(s$file, s$line, s$call), "")
+  # (the same step reached from a parameter's open frame and from a caller's
+  # known one is two steps: the source tells them apart)
+  step_keys <- vapply(ctx$steps, function(s) paste(s$file, s$line, s$call, s$source, isTRUE(s$open_before)), "")
   sink_keys <- vapply(ctx$sinks, function(s) paste(s$file, s$line, s$path), "")
   seen <- unlist(ctx$stats$seen) %||% character()
   structure(c(ctx$findings, source_notes(ctx), error_findings(ctx)),
@@ -4163,7 +4293,8 @@ colcheck_files <- function(files, root = NULL, fresh = FALSE) {
 # One line per step for `--steps`: file:line, the call, the columns after it.
 steps_format <- function(steps, root = NULL) {
   vapply(steps, function(s) sprintf("%s:%s: %s => %s", relative_path(s$file, root), s$line, s$call,
-    if (isTRUE(s$terminal)) "(not a frame)" else if (is.null(s$columns)) "(unknown)" else paste0(
+    if (!is.null(s$fate)) sprintf("%s %s(): %s", if (s$fate == "written") "written by" else "returned by", s$fate_fn, paste(s$columns, collapse = ", "))
+    else if (isTRUE(s$terminal)) "(not a frame)" else if (is.null(s$columns)) "(unknown)" else paste0(
       if (isTRUE(s$listed)) "each: " else "", if (isTRUE(s$open)) "at least " else "", paste(s$columns, collapse = ", "),
       if (length(s$groups)) sprintf(" [grouped by %s]", paste(s$groups, collapse = ", ")) else "",
       if (length(s$overwritten)) sprintf(" (%s overwritten)", paste(s$overwritten, collapse = ", ")) else "")), "")

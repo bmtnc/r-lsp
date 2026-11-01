@@ -19,8 +19,15 @@ hooks_off() {
 # the same text (a cat of a JSON file), so the first match is the field and a
 # later one is data.
 json_field() {
-  printf '%s' "$1" | grep -o -m1 -E "\"$2\" *: *\"(\\\\.|[^\"\\\\])*\"" 2>/dev/null | head -1 \
-    | sed -e 's/^"[^"]*" *: *"//' -e 's/"$//' -e 's/\\"/"/g' -e 's/\\\\/\\/g'
+  local rest
+  # everything up to and including the first "key" goes (the shortest
+  # prefix), then the value is read from the start of what is left, so no
+  # regex engine has to pick the leftmost of several matches
+  rest="${1#*\"$2\"}"
+  [ "$rest" != "$1" ] || return 0
+  printf '%s' "$rest" | head -1 \
+    | sed -E -n 's/^[[:space:]]*:[[:space:]]*"((\\.|[^"\\])*)".*$/\1/p' \
+    | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g'
 }
 
 data_base() { printf '%s' "${CLAUDE_PLUGIN_DATA:-${TMPDIR:-/tmp}/r-lsp-hooks}"; }

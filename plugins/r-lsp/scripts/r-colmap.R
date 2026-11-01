@@ -13,13 +13,18 @@ usage <- function(status = 0) {
       "       r-colmap [--root DIR] --at FILE:LINE               the column set at a line: before and after each step there\n",
       "Prints a map of the data: every data source the project's code reads (a file, a cached\n",
       "schema, a literal), its columns, and for each column where the code uses it (which\n",
-      "verb, file:line), drops it, or creates it and from which columns, plus the columns never\n",
-      "used. With COLUMN, every site that touches that column in any source, what it derives\n",
-      "from and what is computed from it. --source NAME shows the sources whose name contains\n",
-      "NAME (a file, a cached schema key, a target). --diff lists the columns the changed lines use, create\n",
-      "or drop, where else each is used, the columns the changed files no longer create, and the\n",
-      "checker's findings on the changed lines. --file limits the files read.\n",
-      "Static: r-colcheck's tracking, so frames it cannot follow are not here. Exits 0; 2 on a bad argument.\n",
+      "verb, file:line), drops it, overwrites it, creates it (and from which columns), or joins it in\n",
+      "from another source; then each function parameter a body uses as a frame, with the columns it\n",
+      "reads and adds; then the files and tables the code writes and who reads them. A column no\n",
+      "followed step reads says where its frame went (returned by a function, written by a sink,\n",
+      "tracking ended, no later step carries it). With COLUMN, every site that touches that column in\n",
+      "any source, what it derives from, what is computed from it and where the frame then went.\n",
+      "--source NAME shows the sources whose name contains NAME (a file, a cached schema key, a target).\n",
+      "--diff lists the columns the changed lines use, create or drop, where else each is used, the columns\n",
+      "the changed files no longer create, and the checker's findings on the changed lines. --file limits\n",
+      "the files read. Static: r-colcheck's tracking, so a frame it cannot follow is not here, and 'no use\n",
+      "seen' means none in the steps followed (the header counts them). `r-colcheck --steps FILE` shows each\n",
+      "step. Exits 0; 2 on a bad argument.\n",
       sep = "", file = if (status) stderr() else stdout())
   quit(save = "no", status = status)
 }
@@ -81,9 +86,10 @@ if (mode == "diff") {
 }
 if (as_json) {
   message(paste(colmap_header(map), collapse = "\n"))
-  # the sources as before; the files the code writes under a "written" key when nothing is asked by name
+  # one list: the sources (kind "data" or "parameter") and, when nothing is
+  # asked by name, the files and tables the code writes (kind "written")
   out <- Filter(Negate(is.null), colmap_json(map, names))
-  if (!length(names) && length(map$sinks)) out <- list(sources = out, written = colmap_sinks_json(map))
+  if (!length(names)) out <- c(out, colmap_sinks_json(map))
   cat(jsonlite::toJSON(out, auto_unbox = TRUE, pretty = TRUE, null = "null"), "\n")
 } else {
   cat(colmap_format(map, names, srcs), sep = "\n")

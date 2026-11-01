@@ -79,7 +79,7 @@ n_defs <- if (have_callmap && length(rfiles) <= 500L) tryCatch({
 cat(sprintf(paste("`r-callmap` prints a static call map of%s (what calls what, tests, scripts and Rmd/qmd chunks included);",
                   "run it, or `r-callmap NAME`, before a refactor and open only the files it names; `r-callmap --diff` lists what",
                   "the working tree's changes touch and the tests that reach them. Also on PATH: `r-colmap` (every data source, its",
-                  "columns and where each is used), `r-colcheck` (`discover`, `learn --all` for data that is not a local file),",
+                  "columns, where each is used and where its frame went), `r-colcheck` (`discover`, `learn --all` for data that is not a local file),",
                   "`r-lint FILE` (the bug profile), `r-lsp-status`. The r-refactor, r-review and r-data skills give the order of",
                   "operations; the r-lsp skill is the reference.\n"),
             if (is.na(n_defs)) " the project's functions" else sprintf(" all %d functions", n_defs)))
@@ -93,12 +93,13 @@ data_line <- if (have_callmap) tryCatch({
   st <- cache_state(root)
   cold <- sum(!vapply(files, function(f) { e <- st$entries[[f]]; !is.null(e) && entry_valid(e, st) }, TRUE))
   map <- if (length(files) && cold <= 3L && cache_enabled()) quiet(colmap_build(root, files)) else NULL
-  if (is.null(map) || !length(map$sources)) NULL else {
-    n_read <- length(unique(unlist(lapply(map$sources, `[[`, "files"))))
-    top <- vapply(map$sources, `[[`, "", "key")[order(-vapply(map$sources, function(x) length(x$files), 1L))]
+  srcs <- if (is.null(map)) list() else Filter(function(e) identical(e$kind %||% "data", "data"), map$sources)   # not the function parameters
+  if (!length(srcs)) NULL else {
+    n_read <- length(unique(unlist(lapply(srcs, `[[`, "files"))))
+    top <- vapply(srcs, `[[`, "", "key")[order(-vapply(srcs, function(x) length(x$files), 1L))]
     sprintf(paste("Data: %d source%s read by %d file%s (%s%s), %d written by the code. `r-colmap` maps every column and where it is",
                   "used, `r-colmap --diff` what a change touches, `r-colmap --at FILE:LINE` the columns at a line.\n"),
-            length(map$sources), if (length(map$sources) == 1L) "" else "s", n_read, if (n_read == 1L) "" else "s",
+            length(srcs), if (length(srcs) == 1L) "" else "s", n_read, if (n_read == 1L) "" else "s",
             paste(head(top, 3L), collapse = ", "), if (length(top) > 3L) ", ..." else "", length(map$sinks))
   }
 }, error = function(e) NULL) else NULL

@@ -26,18 +26,22 @@
 `%||%` <- function(a, b) if (is.null(a)) b else a
 # Project library first (renv, through the .Rprofile this script runs with),
 # the global libraries after it, so jsonlite is found when renv does not have
-# it: R's own site and default libraries and the user library, the paths a
-# --vanilla session would have.
+# it. renv rewrites R_LIBS_USER and friends for this process (and for any
+# child it starts), so the paths a plain R session sees come from the shell
+# wrapper, which read them before renv ran (R_LSP_GLOBAL_LIBS); R's own site
+# and default libraries and the environment as it stands are added after.
 env_libs <- function(v) strsplit(Sys.getenv(v), .Platform$path.sep, fixed = TRUE)[[1L]]
-global_libs <- c(env_libs("R_LIBS_USER"), env_libs("R_LIBS_SITE"), env_libs("R_LIBS"), .Library.site, .Library,
-                 file.path(R.home(), "site-library"), file.path(R.home(), "library"))
+global_libs <- c(env_libs("R_LSP_GLOBAL_LIBS"), env_libs("R_LIBS_USER"), env_libs("R_LIBS_SITE"), env_libs("R_LIBS"),
+                 .Library.site, .Library, file.path(R.home(), "site-library"), file.path(R.home(), "library"))
 global_libs <- unique(global_libs[nzchar(global_libs) & dir.exists(global_libs)])
 if (length(global_libs)) .libPaths(c(.libPaths(), global_libs))
-# renv's sandbox hides the site library from this process: a plain R says where it is
+# run by hand without the wrapper: a plain R says where its libraries are
+# (with renv's rewritten variables cleared, so it answers for the shell)
 if (!requireNamespace("jsonlite", quietly = TRUE)) {
-  vanilla <- suppressWarnings(tryCatch(system2("Rscript", c("--vanilla", "-e", shQuote("cat(.libPaths(), sep = ':')")), stdout = TRUE, stderr = FALSE),
+  vanilla <- suppressWarnings(tryCatch(system2("Rscript", c("--vanilla", "-e", shQuote("cat(.libPaths(), sep = .Platform$path.sep)")),
+                                               env = c("R_LIBS_USER=", "R_LIBS_SITE=", "R_LIBS=", "RENV_PROJECT="), stdout = TRUE, stderr = FALSE),
                                        error = function(e) character()))
-  vanilla <- strsplit(paste(vanilla, collapse = ""), ":", fixed = TRUE)[[1L]]
+  vanilla <- strsplit(paste(vanilla, collapse = ""), .Platform$path.sep, fixed = TRUE)[[1L]]
   vanilla <- vanilla[nzchar(vanilla) & dir.exists(vanilla)]
   if (length(vanilla)) .libPaths(c(.libPaths(), vanilla))
 }

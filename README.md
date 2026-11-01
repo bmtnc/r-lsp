@@ -72,7 +72,7 @@ Nothing to do: the skill tells Claude when to use the LSP tool and what each ans
 
 - `r-colcheck path/to/file.R` — column names in tidyverse code vs the data the file reads (also runs after every `.R` edit). `r-colcheck learn KEY 'EXPR'` caches the column names of data the checker cannot open (S3, databases) so those pipelines are checked too.
 - `r-callmap` — the project's call map in one listing: every function with its file:line, what it calls and what calls it, including tests and scripts. `r-callmap NAME` shows one function's callers and callees. Useful before a refactor.
-- `r-colmap` — the data map: every source the code reads, its columns, and where each is used, dropped or created; `r-colmap COLUMN` for one column.
+- `r-colmap` — the data map: every source the code reads, its columns, where each is used, dropped, created or joined in, and where a column no step reads was last seen; `r-colmap COLUMN` for one column.
 - `r-lint FILE...` — the bug profile on any file, the same linters the hooks' note runs.
 - `r-lsp-status` — recent index events for this project.
 
@@ -96,7 +96,7 @@ r-lsp/
 │       │   ├── r-lsp-server.R  # The server with the plugin's patches
 │       │   ├── r-colcheck      # Column names vs the data a script reads; `learn`, `discover` fill the schema cache
 │       │   ├── r-callmap       # Static call map; `--diff` impact of the working tree, `--tests` the tests that reach a function
-│       │   ├── r-colmap        # Data map: every source, its columns, where each is used, dropped or created
+│       │   ├── r-colmap        # Data map: every source, its columns, where each is used, dropped, created or joined in
 │       │   ├── r-lint          # The bug profile on the files given (what the hooks' note runs)
 │       │   └── r-lsp-status    # Recent index events for this project
 │       ├── hooks/              # Session and subagent context, checks after Edit/Write and Bash, the stop safety net, post-LSP notes
@@ -225,7 +225,9 @@ Measured on that 90-file package with a planning task (a function two levels bel
 
 ## The data map
 
-`r-colmap` is the data-side counterpart of the call map, built from the column checker's step records: every data source the project's code reads (a file, a cached schema, a built-in dataset, a `tibble()` literal, a file another script writes, a target), the columns it has, and for each column where the code uses it (file:line and verb), overwrites it, drops it, or creates it and from which columns, plus the columns the data has that no code uses and the columns the code creates that nothing reads afterwards; then the files and tables the code writes, with their columns and the scripts that read them. Each source is keyed by what it is (the file's path, the cache key, a literal's text), so two files with one name are two sources and a literal keeps its identity when lines move; a column assertion on a frame the checker could not open is listed apart, as what the code asserts, not as data. A name the checker reports as a mistake is left out of the map at the step that reports it.
+`r-colmap` is the data-side counterpart of the call map, built from the column checker's step records: every data source the project's code reads (a file, a cached schema, a built-in dataset, a `tibble()` literal, a file another script writes, a target), the columns it has, and for each column where the code uses it (file:line and verb), overwrites it, drops it, creates it and from which columns, or joins it in from another source, plus the columns the data has that no code names and the columns the code creates; then every function parameter a body uses as a frame (`parameter df of make_panel()`), each with the columns the body reads of it, what it adds, and where the result goes: what the function expects of a frame, with no caller followed; then the files and tables the code writes, with their columns and the scripts that read them. A join's other frame keeps its own source in the map: its keys are used at the join, its other columns are "carried into" the result, and the result lists them as "joined from users.csv". Each source is keyed by what it is (the file's path, the cache key, a literal's text and line), so two files with one name are two sources and a literal keeps its identity when lines move; a column assertion on a frame the checker could not open is listed apart, as what the code asserts, not as data. A name the checker reports as a mistake is left out of the map at the step that reports it. `--file PATH` limits the files read, `--json` gives the sources with their uses, lineage and fates.
+
+The map never calls a column unused. A created column that no followed step reads says where the frame carrying it was last seen: `returned by make_panel() at R/panel.R:4` (the callers have it; `r-callmap make_panel` lists them, and when the checker followed a caller from a known frame the line says `used N times` instead), `written by saveRDS() at R/panel.R:9` (a sink: `saveRDS()`, `write_csv()`, `write_parquet()`, `dbWriteTable()`, `s3write_using()` and the rest), `tracking ended at R/more.R:25 (pivot_wider)` (the checker lost the frame there; `r-colcheck --steps` shows the step), or `no later step carries it` (the one case that is a candidate for removal, still to be confirmed against dynamic access such as `df[[name]]`). A data column no code names says `never named by the code` and where it was carried. The header counts the pipeline steps followed, and every verdict is about those steps, not the codebase: a low ratio means sources to learn (`r-colcheck discover`). It has the checker's tracking and its limits otherwise: a frame from a source the checker cannot open and has no schema for is not in the map. A name the checker reports as a mistake is left out of the map at the step that reports it. Read it before adding to a pipeline (the names and the conventions are there), before renaming or removing a column (who else reads it), and after a refactor (the columns the code creates that no later step carries).
 
 ```
 sales.csv   first used at R/analysis.R:10   4 columns: region, year, amount, customer
@@ -251,7 +253,7 @@ Written by the code:
 - **Workspace symbol search**: every R file in the project.
 - **After each change to an R file**, through `Edit`, `Write` or a `Bash` command, in the main conversation or a subagent: the column-name check (`r-colcheck`) for tidyverse code, the argument-name check for calls to the project's own functions, and the bug linters where the server does not report. A file no check has seen is caught at the end of the turn.
 - **A call map**: `r-callmap` lists every function with what it calls and what calls it, for planning a refactor from one listing; `r-callmap --diff` lists what the working tree's changes touch, their callers and the tests that reach them.
-- **A data map**: `r-colmap` lists every data source the code reads, its columns, and where each is used, dropped or created.
+- **A data map**: `r-colmap` lists every data source the code reads, its columns, where each is used, dropped, created or joined in, and the function parameters used as frames with what each body reads of them; a column no followed step reads says where its frame went (returned, written, tracking ended).
 - **At session start, and at a subagent's start**: the project's shape and index state, as context.
 
 Claude Code's LSP tool has no completion, rename or code-action operations, so the server's support for those is unused.
@@ -443,4 +445,13 @@ python3 tests/smoke_test.py -k renv    # scenarios whose name contains "renv"
 
 CI runs it on every push and weekly, because a new `languageserver` release can break the wrapper's patches without any change here. Set `R_LSP_WRAPPER` to test a different wrapper script.
 
-A release bumps the version in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (the suite checks they agree), adds its entry to `CHANGELOG.md`, and is a commit whose subject starts with the version; the maintainer tags it `vX.Y.Z` (`git tag -a v1.8.1 <commit> && git push origin --tags`; the cloud session's credentials push branches, not tags).
+### Releasing
+
+A release bumps the version in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (the suite checks they agree), adds its entry to `CHANGELOG.md`, and is a commit whose subject starts with the version. The maintainer then tags that commit `vX.Y.Z`, with the commit subject as the tag message, and pushes the tag (the cloud session's credentials push branches, not tags):
+
+```bash
+git tag -a v1.8.1 <commit> -m "$(git log -1 --format=%s <commit>)"
+git push origin v1.8.1
+```
+
+Every release since 1.5.1 is tagged this way, so `git describe --tags` names the release a checkout is on.

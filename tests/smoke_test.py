@@ -890,8 +890,9 @@ def scenario_colmap(s):
     check("  customer             used 1 time: R/analysis.R:73 (select)" in full, f"last_col() use of customer missing:\n{full[:2500]}")
     check("  region               used " in full and "dropped at R/analysis.R:23 (summarise)" in full, f"region line unexpected:\n{full[:2500]}")
     check("created by the code:" in full and "  total                at R/analysis.R:10 (summarise), from amount; used 1 time" in full
-          and "  big                  at R/analysis.R:12 (mutate), from amt; never used afterwards" in full
+          and "  big                  at R/analysis.R:12 (mutate), from amt; no use seen in the steps followed; no later step carries it" in full
           and "  amt                  at R/analysis.R:12 (rename), from amount; used 1 time" in full, f"created columns (with their lineage) unexpected:\n{full}")
+    check("never used afterwards" not in full, "the map must not claim a column is never used; it says where the frame was last seen")
     for wrong in ("regoin", "amuont", "yaer"):
         check(f"  {wrong} " not in full, f"a reported mistake ({wrong}) is listed as a column the code creates:\n{full}")
     check("datasets::mtcars" in full and "tibble() literal at R/analysis.R:" in full, f"other sources missing:\n{full}")
@@ -919,7 +920,67 @@ def scenario_colmap(s):
     check('cached schema "returns/monthly"   first used at R/report.R:10   3 columns: date, fund_id, ret' in s3
           and "Not mapped: 2 frames from sources the checker cannot open" in s3, f"colmap on the cache fixture unexpected:\n{s3}")
     empty = s.make_project("colmap_empty", {"R/x.R": os.path.join(FIXTURES, "bugs", "bugs.R")})
-    check("No frame with known columns: nothing to map." in run("--root", empty, cwd=empty), "colmap with nothing to map should say so")
+    none = run("--root", empty, cwd=empty)
+    check("No data source with known columns: nothing to map from the data." in none and "parameter df of g()   at R/x.R:17   reads 1 column: x" in none,
+          f"colmap with no data source should say so and still list the parameters:\n{none}")
+
+    # Where a frame was last seen, on a package whose functions take frames as
+    # parameters and whose callers are not all followed.
+    fates_root = os.path.join(FIXTURES, "colmap")
+    fates = run(cwd=fates_root)
+    head = fates.splitlines()[0]
+    check("r-colmap: 10 data sources read by 9 files" in head and "function parameters used as frames" in head
+          and "\"no use seen\" means none in the steps followed" in fates.splitlines()[1], f"colmap fates header unexpected:\n{fates[:600]}")
+    # created in a callee, read in a caller the checker followed: a use, across files
+    check("  rolling_12m_value_add at R/panel.R:3 (dplyr::mutate), from value; used 1 time" in fates, f"cross-function use missing:\n{fates}")
+    # a sink, and a return to callers the checker never reached
+    check("  trailing_value_add   at R/panel.R:8 (dplyr::mutate), from value; no use seen in the steps followed; written by saveRDS() at R/panel.R:9" in fates
+          and "  self_loaded_created  at R/selfload.R:4 (dplyr::mutate), from value; no use seen in the steps followed; returned by build_panel() at R/selfload.R:4" in fates,
+          f"fates unexpected:\n{fates}")
+    # a join's other frame keeps its own source; its columns are carried in, not created
+    check("users.csv   first used at R/load.R:5   3 columns: id, userLastName, region" in fates
+          and "  userLastName         carried into parameter df of with_users() and panel.csv at R/panel.R:13 (dplyr::left_join)" in fates
+          and "  id                   used 1 time: R/panel.R:13 (dplyr::left_join)" in fates
+          and "  userLastName         at R/panel.R:13" not in fates, f"join source unexpected:\n{fates}")
+    # a parameter used as a frame: what the body reads of it and adds to it
+    check("parameter df of with_users()   at R/panel.R:13   reads 1 column: id" in fates
+          and "  joined from users.csv at R/panel.R:13 (dplyr::left_join):\n  userLastName         no use seen in the steps followed; returned by with_users() at R/panel.R:13" in fates
+          and "parameter panel of assemble_report()   at R/report.R:2   reads 1 column: rolling_12m_value_add" in fates,
+          f"parameter sources unexpected:\n{fates}")
+    # deframe() reads two columns; nest() consumes what it nests and is followed; a step the checker cannot follow ends tracking
+    check("R/panel.R:17 (tibble::deframe)" in fates and "  nst                  at R/more.R:25 (dplyr::mutate), from value; used 1 time" in fates
+          and "tracking ended at R/more.R:25 (tidyr::nest)" in fates, f"verb handling unexpected:\n{fates}")
+    # (issue 1) a join of two parameters where y went through a verb first: no crash, the carried column under its own source
+    check("parameter orders of f()   at R/params_join.R:4   reads 1 column: user_id" in fates
+          and "  joined from parameter users of f() at R/params_join.R:4 (dplyr::left_join):\n  status               no use seen in the steps followed; returned by f() at R/params_join.R:4" in fates
+          and "could not be listed" not in fates, f"join of two parameters unexpected:\n{fates}")
+    # (issue 2) a literal keeps its line past the first verb: no location-less source, the sink and the return land on the literal
+    check("tribble() literal   first used" not in fates
+          and "  total                at R/literals.R:2 (dplyr::mutate), from a, b; no use seen in the steps followed; written by saveRDS() at R/literals.R:7" in fates
+          and "  total                at R/literals.R:11 (dplyr::mutate), from a, b; no use seen in the steps followed; returned by return_totals() at R/literals.R:11" in fates
+          and "  amount               never named by the code; returned by join_users() at R/literal_join.R:10" in fates
+          and "  joined from tribble() literal at R/literal_join.R:6 at R/literal_join.R:10 (dplyr::left_join):\n  user_name            used 1 time" in fates,
+          f"literal sources unexpected:\n{fates}")
+    # (issue 3) a column made on the y side before a join is carried, not dead; a test's literal is named by the test's line
+    check("  score                at R/yside.R:2 (dplyr::mutate), from nested; carried into tribble() literal at R/yside.R:4 at R/yside.R:5 (dplyr::left_join)" in fates
+          and "tribble() literal at tests/testthat/test-rename_join.R:1   first used at R/rename_join.R:2   2 columns: user_id, name" in fates
+          and "  user_name            at R/rename_join.R:2 (dplyr::rename), from name; carried into tribble() literal at tests/testthat/test-rename_join.R:9 at R/rename_join.R:4 (dplyr::left_join)" in fates
+          and "tribble() literal at R/rename_join.R" not in fates, f"y-side and test-literal handling unexpected:\n{fates}")
+    one = run("userLastName", cwd=fates_root)
+    check("carried into another frame at R/panel.R:13" in one and "then returned by with_users() at R/panel.R:13" in one,
+          f"column lookup with fates unexpected:\n{one}")
+    data = json.loads(run("--json", cwd=fates_root))
+    kinds = {d["source"]: d["kind"] for d in data}
+    panel = next(d for d in data if d["source"] == "panel.csv")
+    tva = next(u for u in panel["uses"] if u["column"] == "trailing_value_add")
+    check(kinds.get("panel.csv") == "data" and kinds.get("parameter df of make_panel()") == "parameter"
+          and tva["fates"] and tva["fates"][0]["kind"] == "written" and tva["fates"][0]["fn"] == "saveRDS",
+          f"colmap JSON fates unexpected:\n{json.dumps(data)[:1500]}")
+    colcheck = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-colcheck")
+    steps = subprocess.run([colcheck, "--steps", "R/selfload.R", "R/panel.R"], cwd=fates_root, capture_output=True, text=True, timeout=180)
+    check("R/selfload.R:4: return from build_panel() => returned by build_panel(): id, value, date, self_loaded_created" in steps.stdout
+          and 'R/panel.R:9: saveRDS(result, "output.rds") => written by saveRDS(): trailing_value_add' in steps.stdout,
+          f"--steps fate lines unexpected:\n{steps.stdout}")
 
     # --diff: the data side of a change. A copy of the fixture under git; the
     # working tree stops creating `big` (which another file still reads and
@@ -967,7 +1028,7 @@ def scenario_colmap(s):
     check("against HEAD" in against.splitlines()[0] and "big" in against, "colmap --diff REF unexpected")
     # --source NAME: one dataset; an overwrite is a site of its own
     one_src = run("--source", "sales.csv", "--file", "R/verbs.R")
-    check("source sales.csv" in one_src.splitlines()[0] and "sales.csv   first used at R/verbs.R" in one_src and "tibble() literal" not in one_src,
+    check("source sales.csv" in one_src.splitlines()[0] and "sales.csv   first used at R/verbs.R" in one_src and one_src.count("   first used at ") == 1,
           f"colmap --source unexpected:\n{one_src}")
     check("No source matches nothing." in run("--source", "nothing", "--file", "R/verbs.R"), "colmap --source with no match should say so")
     with open(os.path.join(repo, "R", "over.R"), "w") as f:
@@ -2208,9 +2269,10 @@ def scenario_colcheck_flow(s):
           and "data/clean.rds (written by R/01_clean.R:4)   first used at R/02_report.R:3   3 columns: region, year, big" in cm,
           f"colmap's written-data section unexpected:\n{cm}")
     cj = json.loads(subprocess.run([colmap, "--json", "--root", root], cwd=root, capture_output=True, text=True, timeout=180).stdout)
-    check(set(cj) == {"sources", "written"} and [w["path"] for w in cj["written"]] == ["data/clean.rds", "out/clean.csv", "out/clean_base.csv", "clean_tbl"]
-          and cj["written"][3]["table"] is True and cj["written"][0]["read_by"] == ["R/02_report.R"] and cj["written"][2]["open"] is True,
-          f"colmap JSON written section unexpected:\n{json.dumps(cj)[:800]}")
+    written = [w for w in cj if w["kind"] == "written"]
+    check({d["kind"] for d in cj} == {"data", "written"} and [w["path"] for w in written] == ["data/clean.rds", "out/clean.csv", "out/clean_base.csv", "clean_tbl"]
+          and written[3]["table"] is True and written[0]["read_by"] == ["R/02_report.R"] and written[2]["open"] is True,
+          f"colmap JSON written entries unexpected:\n{json.dumps(cj)[:800]}")
     # a targets pipeline
     write("_targets.R", "library(targets)\nlist(\n  tar_target(raw, readr::read_csv(\"data/sales.csv\")),\n"
           "  tar_target(summed, raw |> group_by(region) |> summarise(total = sum(amount))),\n"
@@ -2271,8 +2333,8 @@ def scenario_results_cache(s):
 
     first = run(colmap)
     check("from the cache" not in first.splitlines()[0], f"a cold run claims the cache:\n{first[:300]}")
-    files = [f for f in os.listdir(cache_dir)] if os.path.isdir(cache_dir) else []
-    check(len(files) == 1 and files[0].startswith("results_cache-") and files[0].endswith(".rds"), f"cache file not written under R_USER_CACHE_DIR: {files}")
+    files = [f for f in os.listdir(cache_dir) if f.startswith("results_cache-") and f.endswith(".rds")] if os.path.isdir(cache_dir) else []
+    check(len(files) == 1, f"cache file not written under R_USER_CACHE_DIR: {files}")
     cache_file = os.path.join(cache_dir, files[0])
     second = run(colmap)
     check("(4 of 4 files unchanged since the last run, from the cache)" in second.splitlines()[0], f"a warm run does not say so:\n{second[:300]}")

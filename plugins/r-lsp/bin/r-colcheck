@@ -42,6 +42,11 @@ case "${1:-}" in
     # the project root: where .Rprofile (renv) and relative paths in EXPR live
     [ -n "$root" ] || root="$(project_root "$PWD")"
     export R_LSP_INVOKE_DIR="$PWD"
+    # the libraries a plain R session sees here, read before renv's .Rprofile
+    # rewrites R_LIBS_USER and friends for the learn process: jsonlite (for
+    # the cache file) is found there when the project library lacks it
+    R_LSP_GLOBAL_LIBS="$(Rscript --vanilla -e 'cat(.libPaths(), sep = .Platform$path.sep)' 2>/dev/null)"
+    export R_LSP_GLOBAL_LIBS
     cd "$root" || exit 1
     exec Rscript "$here/../scripts/colcheck-learn.R" "$cmd" "${rest[@]}"
     ;;
