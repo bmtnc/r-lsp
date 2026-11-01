@@ -8,11 +8,17 @@ case "$input" in
   *'"file_path"'*) ;;
   *) exit 0 ;;
 esac
-printf '%s' "$input" | grep -qE '"file_path": *"[^"]*\.(R|r|Rmd|rmd|Rmarkdown|qmd|Rnw|rnw)"' || exit 0
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
 . "$here/hook-lib.sh"
 hooks_off && exit 0
+# the path as json_field reads it, escapes resolved, so a quote in a file's
+# name is no obstacle (a pattern over the raw JSON stopped at the \" and
+# left such a file unchecked)
 file="$(json_field "$input" file_path)"
+case "$file" in
+  *.R|*.r|*.Rmd|*.rmd|*.Rmarkdown|*.qmd|*.Rnw|*.rnw) ;;
+  *) exit 0 ;;
+esac
 # Quarto is not R's alone: a .qmd counts only when it has an R chunk
 case "$file" in
   *.qmd) grep -q -m1 -E '^[[:space:]]*(```+|~~~+)[[:space:]]*\{[[:space:]]*[rR]([ ,}]|$)' "$file" 2>/dev/null || exit 0 ;;
@@ -35,7 +41,7 @@ if [ "$rc" -ne 0 ]; then
   # R itself failed (a broken library, a missing package, a bug in the
   # checker) and its stderr goes nowhere: say so, since silence means
   # checked and clean. The file path is the one string put into the JSON.
-  shown="$(printf '%s' "$file" | sed 's/[\\"]/\\&/g')"
+  shown="$(json_text "$file")"
   printf '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"r-lsp plugin: the post-edit check did not run on %s (Rscript exited with status %s before it could report), so the file is unchecked. Run `r-colcheck %s` yourself; it prints the error."}}\n' "$shown" "$rc" "$shown"
 elif [ -n "$out" ]; then
   printf '%s\n' "$out"

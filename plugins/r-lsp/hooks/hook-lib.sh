@@ -30,6 +30,13 @@ json_field() {
     | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g'
 }
 
+# $1 as the inside of a JSON string: backslashes, quotes and tabs escaped,
+# any other control character dropped, so a note that names a file is valid
+# JSON whatever the file is called.
+json_text() {
+  printf '%s' "$1" | sed -e 's/[\\"]/\\&/g' -e "s/$r_lsp_tab/\\\\t/g" | tr -d '\000-\037'
+}
+
 data_base() { printf '%s' "${CLAUDE_PLUGIN_DATA:-${TMPDIR:-/tmp}/r-lsp-hooks}"; }
 
 # $CLAUDE_PLUGIN_DATA/sessions/<session id>, created on demand; empty when
@@ -100,15 +107,25 @@ Pods .yarn .pnpm-store coverage .Rproj.user .colcheck site-library *-gnu-library
 r_lsp_skip_paths="*/inst/doc */lib/R */lib64/R */share/R"
 # The find expression that prunes them, to expand unquoted with globbing off
 # (set -f: the patterns are find's, not the shell's):
-# ( -name a -o -name b ... -o -path */inst/doc ... ) -prune -o
+# -mindepth 1 ( -name a -o -name b ... -o -path */inst/doc ... -o -name .?* -type d ) -prune -o
+# The root itself is never pruned (-mindepth 1 keeps every test off it), so
+# a project checked out as build/, dist/ or vendor/ is walked like any
+# other, and the paths printed are the root's as given plus what lies
+# under it, the form the ledger keys on. Every hidden directory is pruned,
+# in the list or not: the editor servers and package managers under $HOME
+# (.vscode-server, .emacs.d, .local, .cargo) hold R files that are nobody's
+# project, and a session started there must stay dormant; an R file under
+# .github/ or the like is still reached by the edit hook, which walks
+# nothing.
 prune_expr() {
   local d sep='('
+  printf '%s' '-mindepth 1 '
   for d in $r_lsp_skip_dirs; do
     printf '%s -name %s' "$sep" "$d"
     sep=' -o'
   done
   for d in $r_lsp_skip_paths; do printf ' -o -path %s' "$d"; done
-  printf ' ) -prune -o'
+  printf ' -o -name .?* -type d ) -prune -o'
 }
 
 # Is there R code under $1 within $2 levels? An R, R Markdown or Sweave file,
@@ -140,14 +157,24 @@ r_files_under() {
 # directory has none). $3 is yes or no.
 remember_r_project() {
   local root="$1" sd="$2" pd
+  # nothing is known about no directory, and an empty marker would count
+  # for every root (marker_for)
+  [ -n "$root" ] || return 1
   pd="$(project_dir "$root")" || pd=""
   if [ "$3" = yes ]; then
     [ -n "$sd" ] && { printf '%s' "$root" > "$sd/r-project"; rm -f "$sd/no-r-project"; } 2>/dev/null
     [ -n "$pd" ] && rm -f "$pd/no-r-project" 2>/dev/null
   else
     [ -n "$sd" ] && printf '%s' "$root" > "$sd/no-r-project" 2>/dev/null
-    [ -n "$pd" ] && touch "$pd/no-r-project" 2>/dev/null
+    # the day's memory names its directory too: its key is a checksum of
+    # the path, which two paths can share
+    [ -n "$pd" ] && printf '%s' "$root" > "$pd/no-r-project" 2>/dev/null
+    # the weekly sweep in session-start.sh reads each directory's own time,
+    # which rewriting a file inside does not move: a memory refreshed
+    # today is in use
+    [ -n "$pd" ] && touch "$pd" 2>/dev/null
   fi
+  [ -n "$sd" ] && touch "$sd" 2>/dev/null
   return 0
 }
 
@@ -168,7 +195,9 @@ marker_for() {
 #   start    a resume, a compaction, a subagent, the monitor: the session's
 #            memory, else the day's;
 #   recheck  a Bash command that could have brought R code in: walk, unless
-#            a recheck walked within the last minute;
+#            a recheck for the same command walked within the last minute
+#            (the throttle is for a repeated command in a tree too big to
+#            walk, not for the second command of a `curl` then `tar`);
 #   (none)   the Bash, Stop and LSP hooks: the session's memory for ten
 #            minutes, then one walk, so R code that arrived by a route no
 #            hook sees is found within ten minutes.
@@ -178,12 +207,15 @@ marker_for() {
 # an R package nested in a monorepo, a script under analysis/2024/q3/).
 r_project() {
   local root="$1" sd="$2" depth="${3:-6}" mode="${4:-}" pd
+  # no root (a cwd that is gone and no CLAUDE_PROJECT_DIR): no answer, and
+  # no marker, since an empty one would count for every root
+  [ -n "$root" ] || return 1
   if [ -n "$sd" ]; then
     marker_for "$sd/r-project" "$root" && return 0
     if marker_for "$sd/no-r-project" "$root"; then
       case "$mode" in
         fresh) ;;
-        recheck) younger_than "$sd/last-recheck" 1 && return 1 ;;
+        recheck) younger_than "$sd/last-recheck" 1 && [ "$(cat "$sd/last-recheck" 2>/dev/null)" = "$r_lsp_recheck_key" ] && return 1 ;;
         start) return 1 ;;
         *) younger_than "$sd/no-r-project" 10 && return 1 ;;
       esac
@@ -192,13 +224,13 @@ r_project() {
   fi
   if [ "$mode" = start ]; then
     pd="$(project_dir "$root")" || pd=""
-    if [ -n "$pd" ] && younger_than "$pd/no-r-project" 1440; then
+    if [ -n "$pd" ] && marker_for "$pd/no-r-project" "$root" && younger_than "$pd/no-r-project" 1440; then
       [ -n "$sd" ] && printf '%s' "$root" > "$sd/no-r-project" 2>/dev/null
       return 1
     fi
   fi
   [ -n "$sd" ] && touch "$sd/walk-started" 2>/dev/null
-  [ -n "$sd" ] && [ "$mode" = recheck ] && touch "$sd/last-recheck" 2>/dev/null
+  [ -n "$sd" ] && [ "$mode" = recheck ] && printf '%s' "$r_lsp_recheck_key" > "$sd/last-recheck" 2>/dev/null
   if r_files_under "$root" "$depth"; then
     [ -n "$sd" ] && rm -f "$sd/walk-started" 2>/dev/null
     remember_r_project "$root" "$sd" yes
@@ -209,16 +241,31 @@ r_project() {
   return 1
 }
 
+# The command a recheck is for, as its checksum (cksum of
+# tool_input.command), set by check_unchecked() before the walk and kept by
+# r_project() in last-recheck with the time of that walk: the one-minute
+# throttle then holds for the same command again (a loop of `git pull`s in
+# a tree too big to walk in a hook's time) and never for a second command
+# that could have brought R code in (`curl`, then `tar`). A variable, not an
+# argument, because the walk functions between the two take no command.
+r_lsp_recheck_key=""
+recheck_key() { printf '%s' "$1" | cksum 2>/dev/null | cut -d' ' -f1; }
+
 # A Bash command that could bring R code into a project that had none: it
-# names an R file (a glob too), runs an R tool (by name or by path), or
-# fetches, unpacks, copies or switches files (git with options before the
-# subcommand, gh, svn, hg, scp, tar, 7z). Matched against tool_input.command
-# alone (never the output), the tool names as whole words. A generator the
-# list does not know (`python3 scaffold.py`) is caught by the Stop hook's
-# ten-minute look, by an Edit of an R file, or by the next new session.
-r_lsp_rish_command='[A-Za-z0-9_./*-][.](R|r|Rmd|rmd|Rmarkdown|qmd|Rnw|rnw)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])(Rscript|renv|rmarkdown|quarto|devtools|usethis|pak|remotes|cp|mv|tar|bsdtar|7z|rsync|scp|curl|wget|unzip|gunzip)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])git +([^|;&]* +)?(checkout|switch|pull|merge|stash|clone|rebase|cherry-pick|reset|worktree|restore|apply|am|submodule)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])(gh +(repo +clone|pr +checkout)|svn +(checkout|co|update|up|switch)|hg +(clone|pull|update|checkout))([^A-Za-z0-9_]|$)'
-# rish_command COMMAND: true when the command matches the pattern above
-rish_command() { printf '%s' "$1" | grep -qE "$r_lsp_rish_command"; }
+# names an R file (a glob too) or one of the marker files the walk looks
+# for (DESCRIPTION, renv.lock, an .Rproj), runs an R tool (by name or by
+# path; R itself with an option or as `R CMD`), or fetches, unpacks, copies,
+# links or switches files (git with options before the subcommand, gh, svn,
+# hg, scp, tar, 7z, ln). Matched against tool_input.command alone (never the
+# output), the tool names as whole words. A generator the list does not
+# know (`python3 scaffold.py`) is caught by the Stop hook's ten-minute look,
+# by an Edit of an R file, or by the next new session.
+r_lsp_rish_command='[A-Za-z0-9_./*-][.](R|r|Rmd|rmd|Rmarkdown|qmd|Rnw|rnw)([^A-Za-z0-9_]|$)|[.]Rproj([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])(DESCRIPTION|renv[.]lock)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])R +(-|CMD)|(^|[^A-Za-z0-9_])(Rscript|renv|rmarkdown|quarto|devtools|usethis|pak|remotes|cp|mv|ln|tar|bsdtar|7z|rsync|scp|curl|wget|unzip|gunzip)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])git +([^|;&]* +)?(checkout|switch|pull|merge|stash|clone|rebase|cherry-pick|reset|worktree|restore|apply|am|submodule)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])(gh +(repo +clone|pr +checkout)|svn +(checkout|co|update|up|switch)|hg +(clone|pull|update|checkout))([^A-Za-z0-9_]|$)'
+# rish_command COMMAND: true when the command matches the pattern above.
+# json_field leaves the JSON escapes \n, \t and \r between the lines of a
+# multi-line command as they are; they become spaces first, so a tool named
+# at the start of a later line is still a whole word.
+rish_command() { printf '%s' "$1" | sed 's/\\[ntr]/ /g' | grep -qE "$r_lsp_rish_command"; }
 
 # R files under $1 that arrived or changed since the session's stamp in $2
 # (by inode change time, so a file copied or moved in with an old
@@ -238,6 +285,11 @@ unchecked_r_files() {
        -type f -cnewer "$stamp" \( -name '*.R' -o -name '*.r' -o -name '*.Rmd' -o -name '*.rmd' -o -name '*.Rmarkdown' \
        -o -name '*.qmd' -o -name '*.Rnw' -o -name '*.rnw' \) -print 2>/dev/null |
   while IFS= read -r f; do
+    # Quarto is not R's alone: a .qmd counts only with an R chunk (the test
+    # post-edit.sh and r_files_under apply)
+    case "$f" in
+      *.qmd) grep -q -m1 -E '^[[:space:]]*(```+|~~~+)[[:space:]]*\{[[:space:]]*[rR]([ ,}]|$)' "$f" 2>/dev/null || continue ;;
+    esac
     m="$(stamp_of "$f")"
     [ -n "$m" ] || continue
     if [ -f "$ledger" ] && grep -qxF -- "$m$r_lsp_tab$f" "$ledger" 2>/dev/null; then continue; fi
@@ -258,6 +310,9 @@ check_unchecked() {
   sd="$(session_dir "$input")" || return 0
   [ -f "$sd/start.stamp" ] || return 0
   root="$(physical_root "$input")" || return 0
+  # a recheck is throttled for its own command alone
+  r_lsp_recheck_key=""
+  [ "$mode" = recheck ] && r_lsp_recheck_key="$(recheck_key "$(json_field "$input" command)")"
   files="$(unchecked_r_files "$root" "$sd" "$mode")"
   [ -n "$files" ] || return 0
   n="$(printf '%s\n' "$files" | grep -c .)"
@@ -267,6 +322,9 @@ check_unchecked() {
   local list out rc
   list="$(mktemp "${TMPDIR:-/tmp}/r-lsp-hook.XXXXXX")" || return 0
   printf '%s\n' "$files" > "$list"
+  # the ledger R appends to is memory in use: the directory's own time, which
+  # the weekly sweep in session-start.sh reads, says so
+  touch "$sd" 2>/dev/null
   out="$(printf '%s' "$input" | R_LSP_HOOK_VIA="$via" R_LSP_HOOK_ROOT="$root" R_LSP_HOOK_SESSION="$sd" R_LSP_HOOK_LIST="$list" \
     Rscript --vanilla "$here/../scripts/hook-post-bash.R" 2>/dev/null)"
   rc=$?
@@ -274,9 +332,14 @@ check_unchecked() {
   if [ "$rc" -ne 0 ]; then
     # R itself failed and its stderr goes nowhere: say so (the ledger was
     # not written, so the files come back at the next hook). Paths are the
-    # one string put into the JSON; quotes and backslashes are escaped.
-    local shown
-    shown="$(printf '%s\n' "$files" | cut -f2- | head -5 | sed 's/[\\"]/\\&/g' | paste -sd ',' - | sed 's/,/, /g')"
+    # one string put into the JSON: each is escaped on its own (json_text)
+    # and they are joined here, so a comma in a name stays as it is.
+    local shown="" f
+    while IFS= read -r f; do
+      shown="$shown${shown:+, }$(json_text "$f")"
+    done <<EOF
+$(printf '%s\n' "$files" | cut -f2- | head -5)
+EOF
     if [ "$via" = stop ]; then
       printf '{"systemMessage":"r-lsp plugin: %s R file(s) changed in this session could not be checked (Rscript exited with status %s): %s. Run `r-colcheck FILE` on them yourself; it prints the error."}\n' "$n" "$rc" "$shown"
     else

@@ -23,9 +23,11 @@ if sd="$(session_dir "$input")"; then
     compact) [ -f "$sd/start.stamp" ] || touch "$sd/start.stamp" 2>/dev/null ;;
     *) touch "$sd/start.stamp" 2>/dev/null ;;
   esac
-  # the directory's own time says "in use", so the sweep below spares it;
-  # ledgers of sessions a week idle, and what was remembered about a
-  # directory a week ago, are of no use to anyone
+  # the directory's own time says "in use", so the sweep below spares it
+  # (remember_r_project and check_unchecked move it too, when the memory is
+  # refreshed or the ledger written mid-session); ledgers of sessions a week
+  # idle, and what was remembered about a directory a week ago, are of no
+  # use to anyone
   touch "$sd" 2>/dev/null
   find "$(dirname "$sd")" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null
   find "$(data_base)/projects" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null
