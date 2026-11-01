@@ -83,6 +83,26 @@ cat(sprintf(paste("`r-callmap` prints a static call map of%s (what calls what, t
                   "`r-lint FILE` (the bug profile), `r-lsp-status`. The r-refactor, r-review and r-data skills give the order of",
                   "operations; the r-lsp skill is the reference.\n"),
             if (is.na(n_defs)) " the project's functions" else sprintf(" all %d functions", n_defs)))
+# The data side, from the cache r-colcheck keeps (a file's result holds while
+# everything it depended on is unchanged): one line when the cache covers
+# the project, since a cold build reads every file and the background
+# pre-warm (prewarm-index.R) does that for the next session.
+data_line <- if (have_callmap) tryCatch({
+  source(file.path(script_dir, "colmap-lib.R"), local = TRUE)
+  files <- normalizePath(c(found$r, found$rmd), mustWork = FALSE)
+  st <- cache_state(root)
+  cold <- sum(!vapply(files, function(f) { e <- st$entries[[f]]; !is.null(e) && entry_valid(e, st) }, TRUE))
+  map <- if (length(files) && cold <= 3L && cache_enabled()) quiet(colmap_build(root, files)) else NULL
+  if (is.null(map) || !length(map$sources)) NULL else {
+    n_read <- length(unique(unlist(lapply(map$sources, `[[`, "files"))))
+    top <- vapply(map$sources, `[[`, "", "key")[order(-vapply(map$sources, function(x) length(x$files), 1L))]
+    sprintf(paste("Data: %d source%s read by %d file%s (%s%s), %d written by the code. `r-colmap` maps every column and where it is",
+                  "used, `r-colmap --diff` what a change touches, `r-colmap --at FILE:LINE` the columns at a line.\n"),
+            length(map$sources), if (length(map$sources) == 1L) "" else "s", n_read, if (n_read == 1L) "" else "s",
+            paste(head(top, 3L), collapse = ", "), if (length(top) > 3L) ", ..." else "", length(map$sinks))
+  }
+}, error = function(e) NULL) else NULL
+if (!is.null(data_line)) cat(data_line)
 text <- paste(out, collapse = "")
 subagent_json <- function(lines) {
   jsonlite::toJSON(list(hookSpecificOutput = list(hookEventName = "SubagentStart", additionalContext = sub("\n$", "", paste(lines, collapse = "")))),

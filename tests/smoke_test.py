@@ -2238,6 +2238,101 @@ def scenario_colcheck_flow(s):
     check(subprocess.run([colmap, "--root", root, "--at", "nope"], cwd=root, capture_output=True, text=True, timeout=60).returncode == 2, "colmap --at without FILE:LINE should exit 2")
 
 
+def scenario_results_cache(s):
+    """r-colcheck's results cache: a file's result is kept across processes while
+    everything it depended on is unchanged (the file, the data it reads, the
+    helper it follows, the writers that resolve its readers), so a second
+    r-colmap costs a stat per file and says so; a change to any of those is
+    seen; R_LSP_COLCHECK_CACHE=off reads and writes nothing; a corrupt cache is
+    ignored; and the edit hook checks the files that depend on the edited one
+    and reports what the edit broke there, once."""
+    root = s.make_project("results_cache", {"data/sales.csv": os.path.join(FIXTURES, "columns", "data", "sales.csv")})
+    colcheck = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-colcheck")
+    colmap = os.path.join(REPO, "plugins", "r-lsp", "bin", "r-colmap")
+    hooks = os.path.join(REPO, "plugins", "r-lsp", "hooks")
+    os.makedirs(os.path.join(root, "R"))
+
+    def write(rel, text):
+        with open(os.path.join(root, rel), "w") as f:
+            f.write(text)
+
+    def run(tool, *args, env=None):
+        out = subprocess.run([tool, "--root", root, *args], cwd=root, capture_output=True, text=True, timeout=180,
+                             env=dict(os.environ, **(env or {})))
+        check(out.returncode in (0, 1), f"{os.path.basename(tool)} {' '.join(args)} exited {out.returncode}:\n{out.stderr}")
+        return out.stdout
+
+    write("R/helpers.R", "prep <- function(d) d |> dplyr::mutate(big = amount > 5) |> dplyr::select(region, year, big)\n")
+    write("R/01_clean.R", 'library(dplyr)\nsource("R/helpers.R")\nsales <- readr::read_csv("data/sales.csv")\nclean <- prep(sales)\n'
+          'readr::write_csv(clean, "out/clean.csv")\nclean |> select(customer)\n')
+    write("R/02_report.R", 'library(dplyr)\nback <- readr::read_csv("out/clean.csv")\nback |> select(region, big)\nback |> select(nope)\n')
+    write("R/03_other.R", 'library(dplyr)\nx <- readr::read_csv("data/other.csv") |> select(a)\n')
+    cache_dir = os.path.join(os.environ["R_USER_CACHE_DIR"], "R", "r-lsp", "colcheck")
+
+    first = run(colmap)
+    check("from the cache" not in first.splitlines()[0], f"a cold run claims the cache:\n{first[:300]}")
+    files = [f for f in os.listdir(cache_dir)] if os.path.isdir(cache_dir) else []
+    check(len(files) == 1 and files[0].startswith("results_cache-") and files[0].endswith(".rds"), f"cache file not written under R_USER_CACHE_DIR: {files}")
+    cache_file = os.path.join(cache_dir, files[0])
+    second = run(colmap)
+    check("(4 of 4 files unchanged since the last run, from the cache)" in second.splitlines()[0], f"a warm run does not say so:\n{second[:300]}")
+    check(first.splitlines()[1:] == second.splitlines()[1:], f"the cached map differs from the fresh one:\n{first}\n---\n{second}")
+    report = run(colcheck, "R/02_report.R")
+    check("R/02_report.R:4: 'nope' is not a column" in report and "written by R/01_clean.R:5" in report, f"reader of a written file unexpected:\n{report}")
+
+    # the data file changes: its readers are checked again, the others served
+    sales = os.path.join(root, "data", "sales.csv")
+    with open(sales) as f:
+        original = f.read()
+    with open(sales, "w") as f:
+        f.write(original.replace("customer", "cust", 1))
+    third = run(colmap)
+    hdr = third.splitlines()[0]
+    check("from the cache" in hdr and "(4 of 4" not in hdr, f"a changed data file must re-check its readers: {hdr}")
+    check("4 columns: region, year, amount, cust\n" in third or "region, year, amount, cust" in third, f"the new header is not in the map:\n{third}")
+    with open(sales, "w") as f:
+        f.write(original)
+    # the helper changes: the file that follows it is checked again (its finding goes), and so is the reader of what it writes
+    write("R/helpers.R", "prep <- function(d) d |> dplyr::mutate(big = amount > 5) |> dplyr::select(region, year, big, customer)\n")
+    fourth = run(colmap)
+    check("4 columns: region, year, big, customer" in fourth and "'customer' is not a column" not in run(colcheck, "R/01_clean.R"),
+          f"a changed helper must re-check its callers:\n{fourth}")
+    # a writer appears in a new file for a path a reader could not resolve: the reader is checked again
+    write("R/00_make.R", 'library(dplyr)\nreadr::read_csv("data/sales.csv") |> select(region) |> readr::write_csv("data/other.csv")\n')
+    fifth = run(colmap)
+    check("data/other.csv (written by R/00_make.R:2)" in fifth and "(3 of 5 files unchanged since the last run, from the cache)" in fifth.splitlines()[0],
+          f"a new writer must re-check the readers of its path and nothing else:\n{fifth[:600]}")
+    # off: the same map, no cache note, the cache file untouched
+    before = os.stat(cache_file).st_mtime
+    off = run(colmap, env={"R_LSP_COLCHECK_CACHE": "off"})
+    check("from the cache" not in off.splitlines()[0] and off.splitlines()[1:] == fifth.splitlines()[1:] and os.stat(cache_file).st_mtime == before,
+          f"R_LSP_COLCHECK_CACHE=off must neither read nor write the cache:\n{off[:300]}")
+    # a corrupt cache file is ignored and rewritten
+    with open(cache_file, "w") as f:
+        f.write("not an rds")
+    sixth = run(colmap)
+    check(sixth.splitlines()[1:] == fifth.splitlines()[1:] and "from the cache" not in sixth.splitlines()[0], f"a corrupt cache must be ignored:\n{sixth[:300]}")
+    check("(5 of 5 files unchanged" in run(colmap).splitlines()[0], "the cache was not rewritten after a corrupt file")
+
+    # the edit hook: 01_clean.R stops writing `big`, which 02_report.R selects
+    data_dir = os.path.join(s.scratch, "results_cache_data")
+    env = {"CLAUDE_PROJECT_DIR": root, "CLAUDE_PLUGIN_DATA": data_dir}
+    rfile = os.path.join(root, "R", "01_clean.R")
+    payload = {"session_id": "sess-results-cache", "cwd": root, "tool_name": "Edit", "tool_input": {"file_path": rfile}}
+    write("R/01_clean.R", 'library(dplyr)\nsource("R/helpers.R")\nsales <- readr::read_csv("data/sales.csv")\nclean <- prep(sales) |> select(-big)\n'
+          'readr::write_csv(clean, "out/clean.csv")\nclean |> select(customer)\n')
+    ctx = hook_context(run_hook(os.path.join(hooks, "post-edit.sh"), payload, env=env))
+    check("Elsewhere, after this change to R/01_clean.R" in ctx and "R/02_report.R (reads out/clean.csv):" in ctx
+          and "R/02_report.R:3: 'big' is not a column" in ctx, f"the edit hook does not report what the edit broke elsewhere:\n{ctx}")
+    check("'nope'" not in ctx, f"a finding the reader had before the edit is not the edit's doing:\n{ctx}")
+    ctx2 = hook_context(run_hook(os.path.join(hooks, "post-edit.sh"), payload, env=env))
+    check("Elsewhere" not in ctx2, f"the same state reported twice:\n{ctx2}")
+    # the session start says what the data side is, from the warm cache
+    out = run_hook(os.path.join(hooks, "session-start.sh"), {"session_id": "sess-results-cache", "cwd": root, "source": "startup"}, env=env)
+    check("Data: 3 sources read by 5 files (sales.csv, out/clean.csv (written by R/01_clean.R:5), data/other.csv (written by R/00_make.R:2)), 2 written by the code." in out
+          and "`r-colmap --diff` what a change touches" in out, f"session-start Data line unexpected:\n{out}")
+
+
 def scenario_hooks_dormant(s):
     """In a directory without R code the plugin is dormant: session start
     remembers the answer (for the session, and for the directory for a day),
@@ -2444,7 +2539,8 @@ SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,
              scenario_renv_old_lintr, scenario_renv_old_purrr,
              scenario_complete_answers, scenario_cold_hover, scenario_shared_scope, scenario_stale_files, scenario_other_repository,
              scenario_colcheck, scenario_colcheck_cache, scenario_colcheck_packages, scenario_lint_fallback, scenario_callmap, scenario_colmap,
-             scenario_hooks, scenario_hooks_changes, scenario_hooks_dormant, scenario_colcheck_flow, scenario_callmap_cli]
+             scenario_hooks, scenario_hooks_changes, scenario_hooks_dormant, scenario_colcheck_flow, scenario_callmap_cli,
+             scenario_results_cache]
 
 
 def check_manifests():

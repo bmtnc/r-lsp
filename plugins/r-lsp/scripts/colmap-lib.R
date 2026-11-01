@@ -360,12 +360,14 @@ colmap_limits <- paste(
 
 colmap_header <- function(map, what = NULL) {
   st <- map$stats
-  c(sprintf("r-colmap: %d data source%s read by %d file%s of %s%s; %d of %d pipeline steps followed.",
+  cached <- st$cached %||% 0L
+  c(sprintf("r-colmap: %d data source%s read by %d file%s of %s%s; %d of %d pipeline steps followed%s.",
             length(map$sources), if (length(map$sources) == 1L) "" else "s",
             length(unique(unlist(lapply(map$sources, `[[`, "files")))),
             if (length(unique(unlist(lapply(map$sources, `[[`, "files")))) == 1L) "" else "s",
             map$root, if (is.null(what)) "" else paste0(", ", what),
-            st$checked + st$partial, st$checked + st$partial + st$skipped),
+            st$checked + st$partial, st$checked + st$partial + st$skipped,
+            if (cached > 0L) sprintf(" (%d of %d files unchanged since the last run, from the cache)", cached, st$files) else ""),
     colmap_limits)
 }
 

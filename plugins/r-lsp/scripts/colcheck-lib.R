@@ -38,6 +38,8 @@
 #
 # Entry points: colcheck_files(files, root) -> list of findings (kind "column"
 #               or "note"); colcheck_format(findings, root) -> character lines.
+# A file's result is kept across processes while everything it depended on
+# is unchanged (see "results cache"); R_LSP_COLCHECK_CACHE=off turns that off.
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 # Arguments of a call without empty ones (`x[, 1]`): the empty symbol cannot
@@ -914,87 +916,339 @@ written_columns <- function(path_arg, ctx, table = FALSE) {
   if (length(found)) from_sink(found[[length(found)]], ctx) else NULL
 }
 
-# Every writer of `key` in the project's other files. The project's files
-# are parsed once per process for writer calls with a stated path (the
-# index: path -> the files that write it); only those files are then
-# checked, each once per process, whichever reader asks. A writer's own
-# readers may ask too: two levels deep at most.
+# Every writer of `key` in the project's other files, found through the
+# project index (sink_index); each writer file is checked once per process,
+# whichever reader asks. A writer's own readers may ask too: two levels deep
+# at most. The reader's check then depends on the writers' files and on
+# whatever they depend on, and on the set of writers itself (a new writer
+# of the same path in another file changes the answer).
 project_sinks_for <- function(key, ctx, table = FALSE) {
   root <- normalizePath(ctx$root, mustWork = FALSE)
-  memo_key <- paste(root, if (table) "table" else "path", key)
-  memo <- colcheck_process$sinks[[memo_key]]
-  if (!is.null(memo)) return(if (identical(memo, FALSE)) list() else memo)
-  depth <- colcheck_process$sink_depth %||% 0L
-  if (depth >= 2L) return(list())
   self <- normalizePath(ctx$file, mustWork = FALSE)
+  memo_key <- paste(root, if (table) "table" else "path", key, self)
+  memo <- colcheck_process$sinks[[memo_key]]
+  if (is.null(memo)) {
+    depth <- colcheck_process$sink_depth %||% 0L
+    if (depth >= 2L) return(list())
+    writers_of <- sink_writers_of(key, table, root, self)
+    sinks <- list()
+    deps <- character()
+    colcheck_process$sink_depth <- depth + 1L
+    on.exit(colcheck_process$sink_depth <- depth, add = TRUE)
+    for (f in writers_of) {
+      res <- quiet(checked_file(f, root))
+      deps <- union(deps, c(f, attr(res, "deps")))
+      for (s in attr(res, "sinks") %||% list()) {
+        if (identical(s$table, table) && !is.null(s$columns) && (if (table) identical(s$path, key) else same_target(s$path, key, root))) sinks[[length(sinks) + 1L]] <- s
+      }
+    }
+    memo <- list(sinks = sinks, writers = writers_of, deps = deps)
+    if (is.null(colcheck_process$sinks)) colcheck_process$sinks <- list()
+    colcheck_process$sinks[[memo_key]] <- memo
+  }
+  dep_on(ctx, memo$deps)
+  ctx$sink_lookups[[length(ctx$sink_lookups) + 1L]] <- list(key = key, table = table, writers = memo$writers)
+  memo$sinks
+}
+
+# The files that hold a writer of `key` (a stated path, or a table name),
+# other than `self`.
+sink_writers_of <- function(key, table, root, self) {
   idx <- sink_index(root)
   writers_of <- character()
   for (k in names(idx)) {
-    hit <- if (table) identical(sub("^table:", "", k), key) && startsWith(k, "table:")
+    hit <- if (table) startsWith(k, "table:") && identical(sub("^table:", "", k), key)
       else startsWith(k, "path:") && same_target(sub("^path:", "", k), key, root)
     if (hit) writers_of <- union(writers_of, idx[[k]])
   }
-  writers_of <- setdiff(writers_of, self)
-  sinks <- list()
-  colcheck_process$sink_depth <- depth + 1L
-  on.exit(colcheck_process$sink_depth <- depth, add = TRUE)
-  for (f in writers_of) {
-    res <- checked_file(f, root)
-    for (s in attr(res, "sinks") %||% list()) {
-      if (identical(s$table, table) && !is.null(s$columns) && (if (table) identical(s$path, key) else same_target(s$path, key, root))) sinks[[length(sinks) + 1L]] <- s
-    }
-  }
-  if (is.null(colcheck_process$sinks)) colcheck_process$sinks <- list()
-  colcheck_process$sinks[[memo_key]] <- if (length(sinks)) sinks else FALSE
-  sinks
-}
-
-# A file's check, once per process (the sink lookup and the map share it).
-checked_file <- function(f, root) {
-  key <- normalizePath(f, mustWork = FALSE)
-  hit <- colcheck_process$results[[key]]
-  if (!is.null(hit)) return(hit)
-  res <- quiet(colcheck_file(f, root))
-  if (is.null(colcheck_process$results)) colcheck_process$results <- list()
-  colcheck_process$results[[key]] <- res %||% list()
-  res
+  setdiff(writers_of, self)
 }
 
 # path:<stated path> or table:<name> -> the project files holding a writer
-# call with that literal (a variable bound to a literal at top level counts).
-# Built from a parse of every project file, no check.
+# call with that literal (a variable bound to a literal at top level counts),
+# from the files' facts: a parse of the files that changed since the cache
+# was written, a stat of the rest.
 sink_index <- function(root) {
+  root <- normalizePath(root, mustWork = FALSE)
   memo <- colcheck_process$sink_index[[root]]
   if (!is.null(memo)) return(memo)
+  st <- cache_state(root)
   found <- project_r_files(root)
   idx <- list()
   for (f in c(found$r, found$rmd)) {
-    parsed <- quiet(parse_r_source(f))
-    if (is.null(parsed)) next
-    strings <- new.env()
-    note <- function(e) {
-      if (!is.call(e)) return(invisible())
-      fn <- call_name(e)
-      if (!is.na(fn) && fn %in% c("<-", "=") && length(e) == 3L && is.symbol(e[[2L]]) && is.character(e[[3L]]) && length(e[[3L]]) == 1L) {
-        assign(as.character(e[[2L]]), e[[3L]], envir = strings)
-      }
-      if (!is.na(fn) && fn %in% writers) {
-        p <- sink_args(e, fn)$path
-        lit <- if (is.character(p) && length(p) == 1L) p
-          else if (is.symbol(p)) get0(as.character(p), envir = strings, inherits = FALSE)
-          else if (is.call(p)) path_literal(p, list(strings = as.list(strings)))
-        if (is.character(lit) && length(lit) == 1L && nzchar(lit)) {
-          k <- paste0(if (fn %in% table_writers) "table:" else "path:", lit)
-          idx[[k]] <<- union(idx[[k]], normalizePath(f, mustWork = FALSE))
-        }
-      }
-      for (a in call_args(e)) note(a)
-    }
-    for (e in parsed$exprs) note(e)
+    fx <- file_facts(f, st)
+    for (k in fx$writers) idx[[k]] <- union(idx[[k]], fx$file)
   }
   if (is.null(colcheck_process$sink_index)) colcheck_process$sink_index <- list()
   colcheck_process$sink_index[[root]] <- idx
   idx
+}
+
+# --- results cache ------------------------------------------------------------
+# A file's check depends on files: itself; the project's .colcheck.json,
+# .colcheck/schemas.json, DESCRIPTION, renv.lock and _targets.R; the data
+# files it reads; the helper files whose functions it follows, and the names
+# every helper file defines (a new definition anywhere can resolve a call
+# that was not followed); the files whose writers resolve its readers, and
+# which files those are; the DESCRIPTION of each installed package whose code
+# it reads. The walk notes each one (dep_on()) and the result is stored
+# with their modification times and sizes; checked_file() serves it again
+# while all of them hold (entry_valid()), else checks the file again. One
+# file per project root under tools::R_user_dir("r-lsp", "cache")
+# (R_USER_CACHE_DIR moves it), written whole and atomically at the end of
+# colcheck_files(), dropped whole when this library's own text, R's version
+# or R_LSP_COLCHECK_PACKAGES changes. R_LSP_COLCHECK_CACHE=off reads and
+# writes nothing. The same file keeps the facts of each project file that
+# the project-wide indexes need (the functions it defines, the paths it
+# writes and reads, the targets it loads and defines, the names it calls),
+# so an index over a hundred files costs a stat per file, not a parse.
+
+cache_enabled <- function() !(tolower(Sys.getenv("R_LSP_COLCHECK_CACHE", "on")) %in% c("off", "0", "false", "no"))
+
+# this library's own file, for the version stamp (every entry script defines
+# script_dir before sourcing it)
+colcheck_lib_path <- local({
+  d <- get0("script_dir", inherits = TRUE)
+  if (is.character(d) && length(d) == 1L && file.exists(file.path(d, "colcheck-lib.R"))) normalizePath(file.path(d, "colcheck-lib.R")) else NA_character_
+})
+cache_version <- function() {
+  v <- colcheck_process$cache_version
+  if (!is.null(v)) return(v)
+  md5 <- if (is.na(colcheck_lib_path)) NA_character_ else unname(quiet(tools::md5sum(colcheck_lib_path), NA_character_))
+  v <- if (is.na(md5)) NA_character_ else paste(md5, R.version$major, R.version$minor, Sys.getenv("R_LSP_COLCHECK_PACKAGES", "true"))
+  colcheck_process$cache_version <- v
+  v
+}
+
+# a short hash of a string (djb2, 31 bits) for the cache file's name; the
+# root is stored in the file and checked on load, so a collision costs a
+# re-check, never a wrong answer
+str_hash <- function(s) {
+  h <- 5381
+  for (b in utf8ToInt(enc2utf8(s))) h <- (h * 33 + b) %% 2147483647
+  sprintf("%08x", as.integer(h))
+}
+cache_file <- function(root) {
+  dir <- quiet(tools::R_user_dir("r-lsp", "cache"))
+  if (!is.character(dir) || length(dir) != 1L || !nzchar(dir)) return(NULL)
+  file.path(dir, "colcheck", sprintf("%s-%s.rds", substr(gsub("[^A-Za-z0-9._-]", "_", basename(root)), 1L, 40L), str_hash(root)))
+}
+
+# "mtime:size" per path, named by path ("mtime:d" for a directory, "missing"
+# when nothing is there: a file that appears later is a change too)
+file_stamp <- function(paths) {
+  paths <- as.character(paths)
+  if (!length(paths)) return(setNames(character(), character()))
+  info <- file.info(paths, extra_cols = FALSE)
+  m <- as.numeric(info$mtime)
+  isdir <- info$isdir %in% TRUE
+  out <- ifelse(is.na(m), "missing", ifelse(isdir, sprintf("%.6f:d", m), sprintf("%.6f:%.0f", m, info$size)))
+  names(out) <- paths
+  out
+}
+
+# The cache of one project root, loaded once per process: entries (path ->
+# deps, helpers, sink_lookups, result) and facts (path -> file_facts()).
+cache_state <- function(root) {
+  root <- normalizePath(root, mustWork = FALSE)
+  st <- colcheck_process$cache[[root]]
+  if (!is.null(st)) return(st)
+  st <- new.env(parent = emptyenv())
+  st$root <- root
+  st$path <- cache_file(root)
+  st$entries <- list()
+  st$facts <- list()
+  st$dirty <- FALSE
+  if (cache_enabled() && !is.null(st$path) && !is.na(cache_version()) && file.exists(st$path)) {
+    saved <- quiet(readRDS(st$path))
+    if (is.list(saved) && identical(saved$version, cache_version()) && identical(saved$root, root)) {
+      if (is.list(saved$entries)) st$entries <- saved$entries
+      if (is.list(saved$facts)) st$facts <- saved$facts
+    }
+  }
+  if (is.null(colcheck_process$cache)) colcheck_process$cache <- list()
+  colcheck_process$cache[[root]] <- st
+  st
+}
+
+# Write what changed, one file per root, whole and atomically (two processes
+# writing at once: the later one's file stands, the other's additions are
+# checked again next time). Entries of files that are gone are dropped.
+cache_flush <- function() {
+  if (!cache_enabled() || is.na(cache_version())) return(invisible())
+  for (st in colcheck_process$cache %||% list()) {
+    if (!isTRUE(st$dirty) || is.null(st$path)) next
+    st$entries <- st$entries[file.exists(names(st$entries) %||% character())]
+    st$facts <- st$facts[file.exists(names(st$facts) %||% character())]
+    quiet({
+      dir.create(dirname(st$path), recursive = TRUE, showWarnings = FALSE)
+      tmp <- tempfile(pattern = "colcheck-", tmpdir = dirname(st$path), fileext = ".rds")
+      saveRDS(list(version = cache_version(), root = st$root, saved = Sys.time(), entries = st$entries, facts = st$facts), tmp)
+      if (!file.rename(tmp, st$path)) unlink(tmp)
+    })
+    st$dirty <- FALSE
+  }
+  invisible()
+}
+
+# Note files the current check depends on.
+dep_on <- function(ctx, paths) {
+  paths <- as.character(paths)
+  paths <- paths[!is.na(paths) & nzchar(paths)]
+  if (length(paths)) ctx$deps <- union(ctx$deps, normalizePath(paths, mustWork = FALSE))
+  invisible()
+}
+
+# The helper files a check follows functions from: R/ of a package (listed
+# afresh, so a new file counts) and the files it source()s (fixed while the
+# file itself is unchanged), and the names each defines.
+helper_files <- function(pkg, sourced, root, self) {
+  files <- c(if (isTRUE(pkg)) list.files(file.path(root, "R"), pattern = "[.][rR]$", full.names = TRUE), sourced)
+  setdiff(unique(normalizePath(files, mustWork = FALSE)), self)
+}
+helper_signature <- function(files, st) {
+  files <- sort(files)
+  key <- paste(files, collapse = "\n")   # once per helper set per process (a package: every file shares one)
+  hit <- st$sig_memo[[key]]
+  if (!is.null(hit)) return(hit)
+  sig <- paste(vapply(files, function(f) paste0(f, "=", paste(file_facts(f, st)$defs, collapse = ",")), ""), collapse = ";")
+  if (is.null(st$sig_memo)) st$sig_memo <- list()
+  st$sig_memo[[key]] <- sig
+  sig
+}
+
+# A stored result still holds: every file it depended on is as it was, the
+# helper files define the same names, and the same files write what it reads.
+entry_valid <- function(entry, st) {
+  deps <- entry$deps %||% character()
+  if (!length(deps) || !identical(unname(file_stamp(names(deps))), unname(deps))) return(FALSE)
+  h <- entry$helpers
+  if (!is.null(h) && !identical(helper_signature(helper_files(h$pkg, h$sourced, st$root, entry$file), st), h$sig)) return(FALSE)
+  for (s in entry$sink_lookups %||% list()) {
+    if (!identical(sort(sink_writers_of(s$key, s$table, st$root, entry$file)), sort(s$writers))) return(FALSE)
+  }
+  TRUE
+}
+
+# A file's check: the process memo first, then the cache while the files the
+# check depended on are unchanged, else colcheck_file(). An error in the
+# check propagates (colcheck_files() turns it into a finding) and nothing is
+# stored. `fresh` checks this file whatever the cache holds (the lookups its
+# check makes still use the cache) and stores the new result.
+checked_file <- function(f, root = NULL, fresh = FALSE) {
+  key <- normalizePath(f, mustWork = FALSE)
+  hit <- colcheck_process$results[[key]]
+  if (!is.null(hit) && !(fresh && isTRUE(attr(hit, "from_cache")))) return(hit)
+  root <- normalizePath(root %||% colcheck_root(f), mustWork = FALSE)
+  st <- if (cache_enabled() && !is.na(cache_version())) cache_state(root) else NULL
+  if (is.null(colcheck_process$results)) colcheck_process$results <- list()
+  if (!fresh && !is.null(st)) {
+    entry <- st$entries[[key]]
+    if (!is.null(entry) && entry_valid(entry, st)) {
+      res <- entry$result
+      attr(res, "from_cache") <- TRUE
+      colcheck_process$results[[key]] <- res
+      return(res)
+    }
+  }
+  # checked under its normalized path, so the stored result (its findings'
+  # and sinks' file fields) reads the same whichever spelling asked for it
+  res <- colcheck_file(key, root)
+  if (!is.null(st) && length(attr(res, "deps"))) {
+    st$entries[[key]] <- list(file = key, deps = file_stamp(attr(res, "deps")), helpers = attr(res, "helpers"),
+                              sink_lookups = attr(res, "sink_lookups"), result = res)
+    st$dirty <- TRUE
+  }
+  colcheck_process$results[[key]] <- res
+  res
+}
+
+# What a project file states, for the indexes: the functions it defines, the
+# paths and tables it writes (as sink_index keys) and reads, the targets it
+# loads (tar_read, tar_load) and defines (tar_target), the names it calls.
+# From a parse alone, no check; kept with the file's stamp.
+file_facts <- function(f, st) {
+  f <- normalizePath(f, mustWork = FALSE)
+  stamp <- unname(file_stamp(f))
+  hit <- st$facts[[f]]
+  if (!is.null(hit) && identical(hit$stamp, stamp)) return(hit)
+  fx <- list(file = f, stamp = stamp, defs = character(), writers = character(), readers = character(),
+             targets = character(), tar_defs = character(), calls = character())
+  parsed <- quiet(parse_r_source(f))
+  if (!is.null(parsed)) {
+    fx$defs <- names(function_defs(parsed$exprs, f)) %||% character()
+    strings <- new.env(parent = emptyenv())
+    lit <- function(p) {
+      if (is.character(p) && length(p) == 1L) p
+      else if (is.symbol(p)) get0(as.character(p), envir = strings, inherits = FALSE)
+      else if (is.call(p)) path_literal(p, list(strings = as.list(strings)))
+      else NULL
+    }
+    add <- function(what, v) if (is.character(v) && length(v) == 1L && nzchar(v)) fx[[what]] <<- c(fx[[what]], v)
+    note <- function(e) {
+      if (!is.call(e)) return(invisible())
+      fn <- call_name(e)
+      if (!is.na(fn)) {
+        if (fn %in% c("<-", "=") && length(e) == 3L && is.symbol(e[[2L]]) && is.character(e[[3L]]) && length(e[[3L]]) == 1L) {
+          assign(as.character(e[[2L]]), e[[3L]], envir = strings)
+        }
+        if (grepl("^[A-Za-z.][A-Za-z0-9._]*$", fn)) fx$calls <<- c(fx$calls, fn)
+        if (fn %in% writers) {
+          p <- lit(sink_args(e, fn)$path)
+          if (is.character(p) && length(p) == 1L && nzchar(p)) add("writers", paste0(if (fn %in% table_writers) "table:" else "path:", p))
+        }
+        if (fn %in% readers) {
+          p <- lit(reader_path_arg(e))
+          if (is.character(p) && length(p) == 1L && nzchar(p)) add("readers", paste0("path:", p))
+        }
+        if (fn %in% table_readers && length(e) >= 3L) {
+          p <- lit(e[[3L]])
+          if (is.character(p) && length(p) == 1L && nzchar(p)) add("readers", paste0("table:", p))
+        }
+        if (fn %in% c("tar_read", "tar_read_raw", "tar_load", "tar_load_raw") && length(e) >= 2L) {
+          spec <- e[[2L]]
+          nms <- if (is.call(spec) && identical(call_name(spec), "c")) lapply(call_args(spec), target_name) else list(target_name(spec))
+          for (nm in nms) add("targets", nm)
+        }
+        if (fn %in% c("tar_target", "tar_target_raw", "tar_file_read") && length(e) >= 2L) add("tar_defs", target_name(e[[2L]]))
+      }
+      for (a in call_args(e)) note(a)
+    }
+    for (e in parsed$exprs) note(e)
+    for (k in c("writers", "readers", "targets", "tar_defs", "calls")) fx[[k]] <- unique(fx[[k]])
+  }
+  st$facts[[f]] <- fx
+  st$dirty <- TRUE
+  fx
+}
+
+# The project files that depend on `file`: they call a function it defines,
+# read a path or table it writes, or load a target it defines (the hooks
+# check these after an edit, for what the edit broke elsewhere). From the
+# facts, so a parse of the changed files only. Named by file, each with
+# the reasons.
+dependents_of <- function(file, root) {
+  root <- normalizePath(root, mustWork = FALSE)
+  self <- normalizePath(file, mustWork = FALSE)
+  st <- cache_state(root)
+  own <- file_facts(self, st)
+  if (!length(own$defs) && !length(own$writers) && !length(own$tar_defs)) return(list())
+  found <- project_r_files(root)
+  out <- list()
+  for (f in setdiff(normalizePath(c(found$r, found$rmd), mustWork = FALSE), self)) {
+    fx <- file_facts(f, st)
+    why <- character()
+    calls <- intersect(fx$calls, own$defs)
+    if (length(calls)) why <- c(why, sprintf("calls %s()", calls))
+    for (w in own$writers) for (r in fx$readers) {
+      same <- if (startsWith(w, "table:")) identical(w, r) else startsWith(r, "path:") && same_target(sub("^path:", "", w), sub("^path:", "", r), root)
+      if (same) why <- c(why, sprintf("reads %s", sub("^(path|table):", "", w)))
+    }
+    t <- intersect(fx$targets, own$tar_defs)
+    if (length(t)) why <- c(why, sprintf("loads target %s", t))
+    if (length(why)) out[[f]] <- unique(why)
+  }
+  out
 }
 
 # --- targets pipelines ---------------------------------------------------------
@@ -1055,16 +1309,22 @@ target_columns <- function(x, ctx) {
   if (is.null(memo)) {
     tf <- file.path(root, "_targets.R")
     self <- normalizePath(ctx$file, mustWork = FALSE)
-    memo <- if (file.exists(tf) && !identical(normalizePath(tf), self) && !isTRUE(colcheck_process$in_targets)) {
+    if (!file.exists(tf)) {
+      memo <- list(targets = list(), deps = character())
+    } else if (identical(normalizePath(tf), self) || isTRUE(colcheck_process$in_targets)) {
+      return(NULL)   # _targets.R itself, or a file its commands read: nothing to memoise
+    } else {
       colcheck_process$in_targets <- TRUE
       on.exit(colcheck_process$in_targets <- FALSE, add = TRUE)
-      res <- checked_file(tf, root)
-      attr(res, "targets") %||% list()
-    } else list()
+      res <- quiet(checked_file(tf, root))
+      memo <- list(targets = attr(res, "targets") %||% list(), deps = c(tf, attr(res, "deps")))
+    }
     if (is.null(colcheck_process$targets)) colcheck_process$targets <- list()
     colcheck_process$targets[[root]] <- memo
   }
-  t <- memo[[nm]]
+  # the reader's check depends on _targets.R and on what its commands read
+  dep_on(ctx, memo$deps)
+  t <- memo$targets[[nm]]
   if (is.null(t) || is.null(t$columns)) return(NULL)
   cols <- with_source(t$columns, sprintf("target %s (%s:%d)", nm, relative_path(t$file, ctx$root), t$line), paste0("target:", nm))
   if (isTRUE(t$open)) attr(cols, "open") <- TRUE
@@ -1125,19 +1385,20 @@ source_calls <- function(e, acc = character()) {
 
 project_functions <- function(file, exprs, ctx) {
   self <- normalizePath(file, mustWork = FALSE)
-  others <- character()
-  if (file.exists(file.path(ctx$root, "DESCRIPTION"))) {
-    others <- list.files(file.path(ctx$root, "R"), pattern = "[.][rR]$", full.names = TRUE)
-  }
+  pkg <- file.exists(file.path(ctx$root, "DESCRIPTION"))
+  sourced <- character()
   for (e in exprs) for (s in source_calls(e)) {
     p <- resolve_path(s, ctx)
-    if (!is.null(p)) others <- c(others, p)
+    if (!is.null(p)) sourced <- c(sourced, p)
   }
+  files <- helper_files(pkg, sourced, ctx$root, self)
   defs <- list()
-  for (f in setdiff(unique(normalizePath(others, mustWork = FALSE)), self)) {
+  for (f in files) {
     fd <- helper_defs(f)
     defs[names(fd)] <- fd
   }
+  # for the results cache: which files were looked at and the names they define
+  ctx$helpers <- list(pkg = pkg, sourced = unique(normalizePath(sourced, mustWork = FALSE)), sig = helper_signature(files, cache_state(ctx$root)))
   own <- function_defs(exprs, file)
   defs[names(own)] <- own
   defs
@@ -1237,6 +1498,7 @@ package_function <- function(pkg, fn, ctx, exported_only = TRUE) {
     if (is.function(f) && !is.primitive(f)) {
       def <- list(fn = as.call(list(as.name("function"), formals(f), body(f))),
                   file = paste0(pkg, "::", fn), pkg = pkg)
+      dep_on(ctx, file.path(quiet(find.package(pkg, quiet = TRUE), character()), "DESCRIPTION"))
     }
   }
   ctx$package_defs[[key]] <- def %||% FALSE
@@ -1265,7 +1527,11 @@ lookup_function <- function(e, fn, ctx) {
     return(package_function(as.character(head[[2L]]), fn, ctx, exported_only = identical(as.character(head[[1L]]), "::")))
   }
   if (!is.null(ctx$pkg_scope)) return(package_function(ctx$pkg_scope, fn, ctx, exported_only = FALSE))
-  if (!is.null(ctx$functions[[fn]])) return(ctx$functions[[fn]])
+  if (!is.null(ctx$functions[[fn]])) {
+    def <- ctx$functions[[fn]]
+    if (is.null(def$pkg)) dep_on(ctx, def$file)   # the helper file whose code is followed
+    return(def)
+  }
   for (pkg in ctx$packages) {
     def <- package_function(pkg, fn, ctx)
     if (!is.null(def)) return(def)
@@ -1603,6 +1869,7 @@ reader_columns <- function(path, e, fn, ctx) {
       if ((is.character(v) || (nm == "sheet" && is.numeric(v))) && length(v) == 1L) opts[[nm]] <- v else return(give_up(nm))
     }
   }
+  dep_on(ctx, path)
   cols <- columns_of_file(path, fn, opts)
   if (is.null(cols)) return(NULL)
   cols <- with_source(cols, basename(path), paste0("file:", path))
@@ -3658,6 +3925,10 @@ colcheck_file <- function(file, root = NULL) {
   ctx$follow_known <- logical()
   ctx$sinks <- list()
   ctx$targets <- list()
+  # what the result depends on besides the file (see "results cache")
+  ctx$deps <- normalizePath(c(file, file.path(ctx$root, c(".colcheck.json", file.path(".colcheck", "schemas.json"), "DESCRIPTION", "renv.lock", "_targets.R"))), mustWork = FALSE)
+  ctx$helpers <- NULL
+  ctx$sink_lookups <- list()
   ctx$pkg_name <- if (file.exists(file.path(ctx$root, "DESCRIPTION")))
     quiet(unname(read.dcf(file.path(ctx$root, "DESCRIPTION"), fields = "Package")[1L, 1L])) else NULL
   ctx$imports <- description_imports(ctx$root)
@@ -3666,7 +3937,7 @@ colcheck_file <- function(file, root = NULL) {
                        "desc", "n", "everything", "where", "across", "pi", "letters", "LETTERS",
                        "month.name", "month.abb", "self", "private")
   parsed <- tryCatch(suppressWarnings(parse_r_source(file)), error = function(err) err)
-  if (inherits(parsed, "error")) return(syntax_finding(file, parsed))
+  if (inherits(parsed, "error")) return(structure(syntax_finding(file, parsed), deps = ctx$deps))
   exprs <- parsed$exprs
   src <- attr(exprs, "srcref")
   # A chunk of a literate file that does not parse: said in its own finding;
@@ -3691,7 +3962,8 @@ colcheck_file <- function(file, root = NULL) {
   seen <- unlist(ctx$stats$seen) %||% character()
   structure(c(ctx$findings, source_notes(ctx), error_findings(ctx)),
             stats = list(checked = sum(seen == "checked"), partial = sum(seen == "partial"), skipped = sum(seen == "skipped")),
-            steps = ctx$steps[!duplicated(step_keys)], sinks = ctx$sinks[!duplicated(sink_keys)], targets = ctx$targets)
+            steps = ctx$steps[!duplicated(step_keys)], sinks = ctx$sinks[!duplicated(sink_keys)], targets = ctx$targets,
+            deps = unique(ctx$deps), helpers = ctx$helpers, sink_lookups = ctx$sink_lookups)
 }
 
 # A file that does not parse: said in its own finding, on the line the parser
@@ -3858,14 +4130,14 @@ discover_format <- function(d) {
 
 # Findings for FILES, with a "stats" attribute: pipeline steps checked
 # against known columns, steps skipped (columns unknowable), files read.
-colcheck_files <- function(files, root = NULL) {
+colcheck_files <- function(files, root = NULL, fresh = FALSE) {
   all <- list()
   steps <- list()
   sinks <- list()
-  stats <- list(checked = 0L, partial = 0L, skipped = 0L, files = 0L, errors = 0L, unparsed = 0L)
+  stats <- list(checked = 0L, partial = 0L, skipped = 0L, files = 0L, errors = 0L, unparsed = 0L, cached = 0L)
   for (f in files) {
     if (!file.exists(f)) next
-    res <- tryCatch(colcheck_file(f, root), error = function(err) list(list(
+    res <- tryCatch(checked_file(f, root, fresh = fresh), error = function(err) list(list(
       kind = "error", file = f, line = 1L, name = NA_character_, source = NA_character_, columns = character(),
       message = sprintf("r-colcheck could not check this file at all (%s). This is a checker bug worth reporting.",
                         conditionMessage(err)))))
@@ -3874,12 +4146,14 @@ colcheck_files <- function(files, root = NULL) {
     steps <- c(steps, attr(res, "steps"))
     sinks <- c(sinks, attr(res, "sinks"))
     stats$files <- stats$files + 1L
+    if (isTRUE(attr(res, "from_cache"))) stats$cached <- stats$cached + 1L
     stats$checked <- stats$checked + (st$checked %||% 0L)
     stats$partial <- stats$partial + (st$partial %||% 0L)
     stats$skipped <- stats$skipped + (st$skipped %||% 0L)
     stats$errors <- stats$errors + sum(vapply(res, function(x) identical(x$kind, "error"), TRUE))
     stats$unparsed <- stats$unparsed + (st$unparsed %||% 0L)
   }
+  cache_flush()
   # The walker can visit a pipeline twice (assignment and its right-hand side).
   keys <- vapply(all, function(x) paste(x$file, x$line, x$kind %||% "column", x$name, x$source,
                                         if (identical(x$kind %||% "column", "column")) "" else x$message), "")

@@ -46,7 +46,8 @@ if (length(flags) || length(missing) || !length(args)) {
   usage(stderr())
   quit(save = "no", status = 2)
 }
-findings <- colcheck_files(args, root)
+# the files named are checked afresh; the writers, helpers and targets their check reaches come from the cache
+findings <- colcheck_files(args, root, fresh = TRUE)
 st <- attr(findings, "stats")
 kinds <- vapply(findings, function(x) x$kind %||% "column", "")
 steps <- attr(findings, "steps")

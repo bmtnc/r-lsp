@@ -126,7 +126,64 @@ collapse_columns <- function(columns, root) {
   lines
 }
 
-check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_subagent = FALSE, session_dir = NULL) {
+# What a change to `file` broke elsewhere. The project files that read what
+# it writes, call its functions or load its targets (dependents_of(), from
+# the facts r-colcheck's cache keeps of every file) are checked again, and
+# the column, logic and argument findings they did not have before are
+# reported: the result the cache held for each is the "before", so a second
+# edit reports only what it adds; with no cached result, every such finding
+# is said once per session. Data flow first (readers, targets), then callers;
+# `max_files` files and `budget` seconds at most, the rest named. Silent when
+# nothing new turned up: `r-colmap --diff` is the complete account.
+impact_lines <- function(file, root, session_dir = NULL, max_files = 6L, budget = 6) {
+  deps <- tryCatch(dependents_of(file, root), error = function(e) list())
+  if (!length(deps)) return(list(lines = character(), blocking = FALSE))
+  started <- Sys.time()
+  st <- cache_state(root)
+  # a finding's identity: where and what, not its wording (the column list in
+  # the message changes with the edit)
+  key_of <- function(x) paste(x$file, x$line, x$kind %||% "column", if (is.na(x$name %||% NA_character_)) x$message else x$name)
+  reportable <- function(res) Filter(function(x) (x$kind %||% "column") %in% c("column", "logic", "argument"), unclass(res))
+  flow <- vapply(deps, function(w) any(grepl("^(reads|loads) ", w)), TRUE)
+  files <- c(names(deps)[flow], names(deps)[!flow])
+  out <- character()
+  fixed <- 0L
+  n_new <- 0L
+  checked <- character()
+  for (f in files) {
+    if (length(checked) >= max_files || as.numeric(Sys.time() - started, units = "secs") > budget) break
+    old <- st$entries[[f]]$result
+    new <- tryCatch(checked_file(f, root), error = function(e) NULL)
+    checked <- c(checked, f)
+    if (is.null(new)) next
+    new_f <- reportable(new)
+    new_keys <- vapply(new_f, key_of, "")
+    if (!is.null(old)) {
+      old_keys <- vapply(reportable(old), key_of, "")
+      fresh <- new_f[!(new_keys %in% old_keys)]
+      fixed <- fixed + sum(!(old_keys %in% new_keys))
+    } else {
+      fresh <- new_f[vapply(new_keys, function(k) once(session_dir, paste0("impact-", str_hash(k))), TRUE)]
+    }
+    if (length(fresh)) {
+      n_new <- n_new + length(fresh)
+      out <- c(out, sprintf("  %s (%s):", relative_path(f, root), paste(deps[[f]], collapse = "; ")), paste0("    ", colcheck_format(fresh, root)))
+    }
+  }
+  cache_flush()
+  if (n_new == 0L && fixed == 0L) return(list(lines = character(), blocking = FALSE))
+  rest <- setdiff(files, checked)
+  lines <- c(sprintf("Elsewhere, after this change to %s, in the files that read what it writes, call its functions or load its targets (%d checked again):",
+                     relative_path(file, root), length(checked)),
+             out,
+             if (fixed > 0L) sprintf("  %d earlier finding%s in those files no longer appl%s.", fixed, if (fixed == 1L) "" else "s", if (fixed == 1L) "ies" else "y"),
+             if (length(rest)) sprintf("  Not checked again (%s): %s; `r-colmap --diff` covers them.",
+                                       if (length(checked) >= max_files) "over the limit" else "the time ran out",
+                                       paste(vapply(rest, relative_path, "", root = root), collapse = ", ")))
+  list(lines = lines, blocking = n_new > 0L)
+}
+
+check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_subagent = FALSE, session_dir = NULL, impact = TRUE) {
   lint <- match.arg(lint)
   # The file's own project, not the session's: a file in another repository
   # (opened after /add-dir, or edited by a subagent) or in a package nested
@@ -142,8 +199,10 @@ check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_sub
   lint_winner <- tryCatch(lint_config_file(file), error = function(e) NULL)
   run_lint <- !lint_profile_off() && (lint == "always" || (lint == "auto" && !is.null(lint_winner)))
   lints <- if (run_lint) lint_file(file, root) else list(lines = character(), failure = NULL)
+  imp <- if (impact) tryCatch(impact_lines(file, root, session_dir), error = function(e) list(lines = character(), blocking = FALSE))
+    else list(lines = character(), blocking = FALSE)
 
-  if (!length(findings) && !length(lints$lines) && is.null(lints$failure)) return(list(lines = character(), any = FALSE, blocking = FALSE))
+  if (!length(findings) && !length(lints$lines) && is.null(lints$failure) && !length(imp$lines)) return(list(lines = character(), any = FALSE, blocking = FALSE))
   kinds <- vapply(findings, function(x) x$kind %||% "column", "")
   columns <- findings[kinds == "column"]
   arguments <- findings[kinds == "argument"]
@@ -180,6 +239,7 @@ check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_sub
       "Steps that run per group because an earlier summarise() left the frame grouped (as often meant as not; nothing to do if the per-group value is the one wanted):",
       clip(colcheck_format(grouped, root), 5))
   }
+  if (length(imp$lines)) parts <- c(parts, imp$lines)
   if (length(notes)) {
     # the full note the first time a source or a stop is met in the session; one line after
     note_lines <- vapply(notes, function(x) {
@@ -212,7 +272,8 @@ check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_sub
   # what is worth holding a turn for: a defect in the code (a parse error, a
   # column or argument name, a lint), not a source the checker cannot open,
   # a checker bug or a linter that could not run
-  list(lines = parts, any = TRUE, blocking = length(syntax) + length(columns) + length(arguments) + length(logic) + length(lints$lines) > 0L)
+  list(lines = parts, any = TRUE,
+       blocking = length(syntax) + length(columns) + length(arguments) + length(logic) + length(lints$lines) > 0L || isTRUE(imp$blocking))
 }
 
 # Check several files within a time budget; the ones not reached are listed,
