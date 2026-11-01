@@ -14,9 +14,12 @@ if [ -n "$file" ]; then
     *) exit 0 ;;
   esac
 else
-  # no file in the request (a workspace symbol search): an R project's, or not ours
+  # no file in the request (a workspace symbol search): an R project's, or
+  # not ours; a root that cannot be found (a cwd that is gone) is not ours
+  # either, and leaves no memory behind
   sd="$(session_dir "$input")" || sd=""
-  r_project "$(physical_root "$input")" "$sd" || exit 0
+  root="$(physical_root "$input")" || exit 0
+  r_project "$root" "$sd" || exit 0
 fi
 command -v Rscript >/dev/null 2>&1 || exit 0
 printf '%s' "$input" | Rscript --vanilla "$here/../scripts/hook-post-lsp.R" 2>/dev/null

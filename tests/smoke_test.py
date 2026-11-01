@@ -2532,8 +2532,10 @@ def scenario_hooks_dormant(s):
     the Bash, Stop, subagent and LSP hooks exit without walking the tree or
     starting R, a command that could have brought R code in looks again, an
     edit of an R file wakes the session up, R_LSP_HOOKS=off silences every
-    hook, and a payload whose command output carries a "session_id" field
-    cannot send the ledger to another session's directory."""
+    hook, a payload whose command output carries a "session_id" field
+    cannot send the ledger to another session's directory, a root named
+    like a skipped directory or holding only an editor's hidden R files is
+    judged right, and the memory names its directory and stays in use."""
     hooks = os.path.join(REPO, "plugins", "r-lsp", "hooks")
     root = os.path.join(s.scratch, "dormant_py")
     os.makedirs(os.path.join(root, "src"))
@@ -2587,8 +2589,23 @@ def scenario_hooks_dormant(s):
     os.remove(os.path.join(sdir, "r-project"))
     with open(os.path.join(sdir, "no-r-project"), "w") as f:
         f.write(root)
-    check(not hook("post-bash.sh", tool_name="Bash", tool_input={"command": "git checkout feature"}).strip(),
-          "post-bash looked again within a minute of the last look")
+    check(not hook("post-bash.sh", tool_name="Bash", tool_input={"command": "git -C . checkout feature"}).strip()
+          and not os.path.exists(os.path.join(sdir, "r-project")),
+          "post-bash looked again within a minute of the last look for the same command")
+    # the throttle holds for that command alone: another command that could have brought R code in
+    # looks again at once, its tool named on a later line of the command or not
+    hook("post-bash.sh", tool_name="Bash", tool_input={"command": "cd src\ntar xzf ../pkg.tar.gz"})
+    check(os.path.exists(os.path.join(sdir, "r-project")),
+          "a different command within a minute of the last look (its tool on a second line) did not look again")
+    # so does one that can make the files the walk looks for (R CMD, a DESCRIPTION, an .Rproj, ln)
+    os.remove(os.path.join(sdir, "r-project"))
+    with open(os.path.join(sdir, "no-r-project"), "w") as f:
+        f.write(root)
+    hook("post-bash.sh", tool_name="Bash", tool_input={"command": "R CMD INSTALL ../pkg"})
+    check(os.path.exists(os.path.join(sdir, "r-project")), "post-bash did not look again after `R CMD INSTALL`")
+    os.remove(os.path.join(sdir, "r-project"))
+    with open(os.path.join(sdir, "no-r-project"), "w") as f:
+        f.write(root)
     old = time.time() - 120
     os.utime(os.path.join(sdir, "last-recheck"), (old, old))
     time.sleep(1.1)
@@ -2624,6 +2641,12 @@ def scenario_hooks_dormant(s):
     ctx = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": new_r}))
     check("'zz' is not a column" in ctx and os.path.exists(os.path.join(sdir, "r-project")) and not os.path.exists(os.path.join(sdir, "no-r-project")),
           f"an edit of an R file did not wake the session up:\n{ctx}")
+    # a double quote in the file's name (escaped in the JSON) is no obstacle to the edit hook
+    weird = os.path.join(root, "src", 'we"ird.R')
+    with open(weird, "w") as f:
+        f.write("library(dplyr)\nx <- tibble::tibble(a = 1)\nx %>% select(zz)\n")
+    ctx = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": weird}))
+    check("'zz' is not a column" in ctx, f"post-edit was silent for a file with a double quote in its name:\n{ctx}")
     elsewhere = os.path.join(s.scratch, "dormant_elsewhere.R")
     with open(elsewhere, "w") as f:
         f.write("x <- 1\n")
@@ -2644,6 +2667,18 @@ def scenario_hooks_dormant(s):
         f.write("x <- 1\n")
     check(not run_hook(os.path.join(hooks, "session-start.sh"), {"session_id": "fresh-b", "cwd": fresh_dir, "source": "resume"}, env=fenv).strip(),
           "a resumed session did not trust the day's memory")
+    # the day's memory names its directory (its key is a checksum, which two paths can share): one about another directory is not trusted
+    projects = os.path.join(data_dir, "projects")
+
+    def day_memory(d):
+        return [os.path.join(projects, p) for p in os.listdir(projects) if os.path.exists(os.path.join(projects, p, "no-r-project"))
+                and open(os.path.join(projects, p, "no-r-project")).read() == os.path.realpath(d)]
+    fresh_pd = day_memory(fresh_dir)
+    check(len(fresh_pd) == 1, "the day's memory does not name its directory")
+    with open(os.path.join(fresh_pd[0], "no-r-project"), "w") as f:
+        f.write("/somewhere/else")
+    check("R LSP plugin:" in run_hook(os.path.join(hooks, "session-start.sh"), {"session_id": "fresh-b2", "cwd": fresh_dir, "source": "resume"}, env=fenv),
+          "a day's memory written for another directory was trusted")
     check("R LSP plugin:" in run_hook(os.path.join(hooks, "session-start.sh"), {"session_id": "fresh-c", "cwd": fresh_dir, "source": "clear"}, env=fenv),
           "/clear did not take a fresh look at a directory that gained R code")
     # the monitor keeps its memory where the hooks do
@@ -2652,9 +2687,16 @@ def scenario_hooks_dormant(s):
     os.makedirs(mon_dir)
     mon_env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_DATA"}
     idle = subprocess.run(["bash", monitor, data_dir], cwd=mon_dir, env=mon_env, capture_output=True, text=True, timeout=5)
-    projects = os.path.join(data_dir, "projects")
-    check(idle.returncode == 0 and any(open(os.path.join(projects, d, "no-r-project")).read() == "" for d in os.listdir(projects)
-                                       if os.path.exists(os.path.join(projects, d, "no-r-project"))), "the monitor did not write its memory under the plugin data directory")
+    check(idle.returncode == 0 and len(day_memory(mon_dir)) == 1, "the monitor did not write its memory under the plugin data directory")
+    # the weekly sweep reads each directory's own time, which a marker rewritten inside does not move:
+    # refreshing the day's memory moves it, so a memory refreshed today survives however old its directory
+    mon_hooks_env = {"CLAUDE_PROJECT_DIR": mon_dir, "CLAUDE_PLUGIN_DATA": data_dir}
+    run_hook(os.path.join(hooks, "session-start.sh"), {"session_id": "mon-session", "cwd": mon_dir, "source": "startup"}, env=mon_hooks_env)
+    week_ago = time.time() - 8 * 86400
+    os.utime(day_memory(mon_dir)[0], (week_ago, week_ago))
+    run_hook(os.path.join(hooks, "post-bash.sh"), {"session_id": "mon-session", "cwd": mon_dir, "tool_name": "Bash", "tool_input": {"command": "curl -LO pkg.tar.gz"}},
+             env=mon_hooks_env)
+    check(time.time() - os.stat(day_memory(mon_dir)[0]).st_mtime < 3600, "refreshing the day's memory did not mark its directory as in use")
     # an edit of a .qmd without an R chunk neither wakes the session nor starts R
     py_qmd = os.path.join(root, "src", "notes.qmd")
     with open(py_qmd, "w") as f:
@@ -2680,6 +2722,37 @@ def scenario_hooks_dormant(s):
         f.write("\n```{r}\n1 + 1\n```\n")
     check("R LSP plugin:" in run_hook(os.path.join(hooks, "session-start.sh"), {"session_id": "qmd-r", "cwd": qmd, "source": "startup"}, env=qenv),
           "a Quarto project with an R chunk was not taken for an R project")
+    # a project checked out under a name the walk skips below the root (build, vendor, ...) is an R project
+    # all the same, and the files a command changes under it are found
+    build_dir = os.path.join(s.scratch, "dormant_skipname", "build")
+    os.makedirs(os.path.join(build_dir, "R"))
+    with open(os.path.join(build_dir, "R", "a.R"), "w") as f:
+        f.write("x <- 1\n")
+    benv = {"CLAUDE_PROJECT_DIR": build_dir, "CLAUDE_PLUGIN_DATA": data_dir}
+    check("R LSP plugin:" in run_hook(os.path.join(hooks, "session-start.sh"), {"session_id": "build-session", "cwd": build_dir, "source": "startup"}, env=benv),
+          "a project root named build was pruned as a whole")
+    time.sleep(1.1)
+    with open(os.path.join(build_dir, "R", "b.R"), "w") as f:
+        f.write("y <- 2\n")
+    ctx = hook_context(run_hook(os.path.join(hooks, "post-bash.sh"), {"session_id": "build-session", "cwd": build_dir, "tool_name": "Bash", "tool_input": {"command": "ls"}}, env=benv))
+    check("this command changed 1 R file (R/b.R)" in ctx, f"a file changed under a root named build was not found:\n{ctx}")
+    # a home directory: an editor server's R files under a hidden directory are nobody's project
+    home_dir = os.path.join(s.scratch, "dormant_home")
+    vsc = os.path.join(home_dir, ".vscode-server", "extensions", "reditorsupport.r-2.8.0", "R", "session")
+    os.makedirs(vsc)
+    with open(os.path.join(vsc, "vsc.R"), "w") as f:
+        f.write("x <- 1\n")
+    henv = {"CLAUDE_PROJECT_DIR": home_dir, "CLAUDE_PLUGIN_DATA": data_dir}
+    check(not run_hook(os.path.join(hooks, "session-start.sh"), {"session_id": "home-session", "cwd": home_dir, "source": "startup"}, env=henv).strip()
+          and os.path.exists(os.path.join(data_dir, "sessions", "home-session", "no-r-project")),
+          "a home directory with an editor's R files under a hidden directory was taken for an R project")
+    # a root that cannot be found (the directory is gone) leaves no memory: an empty marker would count for every root
+    gone = os.path.join(s.scratch, "dormant_gone")
+    genv = {"CLAUDE_PROJECT_DIR": gone, "CLAUDE_PLUGIN_DATA": data_dir}
+    out = run_hook(os.path.join(hooks, "post-lsp.sh"), {"session_id": "gone-session", "cwd": gone, "tool_name": "LSP",
+                                                        "tool_input": {"operation": "workspaceSymbol", "query": "x"}, "tool_response": "none"}, env=genv)
+    check(not out.strip() and not os.path.exists(os.path.join(data_dir, "sessions", "gone-session", "no-r-project")),
+          f"a root that cannot be found wrote a no-r-project marker:\n{out}")
     # the post-LSP hook still speaks for an R file (the index is not running: an empty answer is said to be one)
     lsp_r = hook("post-lsp.sh", tool_name="LSP", tool_input={"operation": "findReferences", "filePath": new_r, "line": 2, "character": 1},
                  tool_response="No references found")
@@ -2720,12 +2793,33 @@ def scenario_hooks_dormant(s):
         f.write("y <- 1\n")
     payload = {"session_id": sid, "cwd": root, "tool_name": "Bash", "tool_input": {"command": "cat state.json"},
                "tool_response": {"stdout": '{"session_id": "evil", "cwd": "/nowhere"}', "stderr": ""}}
+    os.utime(sdir, (week_ago, week_ago))
     ctx = hook_context(run_hook(os.path.join(hooks, "post-bash.sh"), payload, env=env))
     check("src/second.R" in ctx, f"post-bash did not check the new file:\n{ctx}")
+    check("notes.qmd" not in ctx, f"a .qmd without an R chunk was counted as a changed R file:\n{ctx}")
+    check(time.time() - os.stat(sdir).st_mtime < 3600, "a check that wrote the ledger did not mark the session as in use")
     with open(os.path.join(sdir, "checked.tsv")) as f:
         ledger = f.read()
     check("second.R" in ledger and not os.path.exists(os.path.join(data_dir, "sessions", "evil")),
           "a session_id inside the command's output hijacked the session directory")
+    # when R itself fails, the note is valid JSON naming the files as they are, commas and tabs included
+    fail = os.path.join(s.scratch, "dormant_fail")
+    os.makedirs(fail, exist_ok=True)
+    with open(os.path.join(fail, "Rscript"), "w") as f:
+        f.write("#!/bin/sh\nexit 3\n")
+    os.chmod(os.path.join(fail, "Rscript"), 0o755)
+    time.sleep(1.1)
+    for name in ("odd,name.R", "tab\tname.R"):
+        with open(os.path.join(root, "src", name), "w") as f:
+            f.write("z <- 1\n")
+    out = run_hook(os.path.join(hooks, "post-bash.sh"), dict({"session_id": sid, "cwd": root}, tool_name="Bash", tool_input={"command": "ls"}),
+                   env=dict(env, PATH=fail + os.pathsep + os.environ.get("PATH", "")))
+    try:
+        note = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    except (ValueError, KeyError):
+        note = ""
+    check("Rscript exited with status 3" in note and "src/odd,name.R" in note and "src/tab\tname.R" in note,
+          f"the note about a check R could not run is not valid JSON naming the files as they are:\n{out}")
 
 
 SCENARIOS = [scenario_bugs, scenario_tidyverse, scenario_renv,
