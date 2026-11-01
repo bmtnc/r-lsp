@@ -2149,6 +2149,77 @@ def scenario_hooks_changes(s):
     check("bug linters" not in ctx and "'regoin' is not a column" in ctx,
           f"post-edit in the main conversation ran the bug linters without a .lintr (the server reports there):\n{ctx}")
     check(not hook("post-bash.sh", tool_name="Bash", tool_input={"command": "ls"}).strip(), "post-bash re-checked a file the edit hook had checked")
+    sdir = os.path.join(data_dir, "sessions", sid)
+
+    def ledger_lines():
+        with open(os.path.join(sdir, "checked.tsv"), encoding="utf-8") as f:
+            return [l for l in f.read().splitlines() if l]
+
+    # A note the Stop hook shows to the user alone (a systemMessage: nothing
+    # worth holding the turn for) is not said to Claude: the once-per-session
+    # markers are set only when the text reaches it (additionalContext, a
+    # block reason), so the next edit still gives the full remedy.
+    time.sleep(1.1)
+    stopped = os.path.join(root, "R", "stopped.R")
+    with open(stopped, "w") as f:
+        f.write("library(dplyr)\nsales <- readr::read_csv('data/sales.csv')\nshuffle_cols <- function(d) d[, sample(names(d))]\n"
+                "w <- shuffle_cols(sales)\nz <- w %>% filter(amount > 1)\n")
+    out = hook("stop-check.sh", stop_hook_active=False)
+    check("systemMessage" in out and "cache it once by name" in out and "decision" not in out, f"stop hook on a note-only file unexpected:\n{out}")
+    check(not os.path.exists(os.path.join(sdir, "said-note-w_4")), "a systemMessage, which Claude never sees, set the once-per-session marker")
+    ctx = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": stopped}))
+    check("cache it once by name" in ctx and "said in full earlier" not in ctx, f"post-edit gave the short form of a note Claude never saw in full:\n{ctx}")
+    check(os.path.exists(os.path.join(sdir, "said-note-w_4")), "additionalContext did not set the once-per-session marker")
+    ctx = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": stopped}))
+    check("R/stopped.R:4: 'w' is known up to shuffle_cols(sales) on line 4; nothing downstream is checked (said in full earlier this session)" in ctx,
+          f"the second edit should give the short form:\n{ctx}")
+
+    # Only the notes shown take their once-per-session turn: of seven
+    # unresolved sources five are said in full and the two clipped stay
+    # unsaid, so they are not later given in the short form unseen.
+    many = os.path.join(root, "R", "many.R")
+    with open(many, "w") as f:
+        f.write("library(dplyr)\n" + "".join(f'd{i} <- readr::read_csv("data/none{i}.csv") %>% filter(x > 1)\n' for i in range(1, 8)))
+    ctx = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": many}))
+    check("... and 2 more" in ctx and 'r-colcheck learn "data/none5.csv"' in ctx, f"post-edit note for seven sources unexpected:\n{ctx}")
+    check(all(os.path.exists(os.path.join(sdir, f"said-note-data_none{i}.csv")) for i in range(1, 6))
+          and not any(os.path.exists(os.path.join(sdir, f"said-note-data_none{i}.csv")) for i in (6, 7)),
+          f"clipped notes were marked as said: {sorted(os.listdir(sdir))}")
+
+    # In a C locale a file whose name has non-ASCII characters is still
+    # checked: the shell hands R the path as bytes (R_LSP_HOOK_FILE), where
+    # the JSON's UTF-8 string would not translate and the file would go
+    # unchecked in silence. The payload carries the name raw, as Claude Code
+    # writes it.
+    accented = os.path.join(root, "R", "\u00e9\u00e9.R")
+    with open(accented, "w") as f:
+        f.write("library(dplyr)\nsales <- readr::read_csv('data/sales.csv')\nout <- sales %>% filter(regoin == 'A')\n")
+    c_env = dict(env, LANG="C", LC_ALL="C")
+    ctx = hook_context(run_hook(os.path.join(hooks, "post-edit.sh"), None, env=c_env,
+                                stdin_text=json.dumps(payload(tool_name="Edit", tool_input={"file_path": accented}), ensure_ascii=False)))
+    check("'regoin' is not a column" in ctx, f"post-edit in a C locale missed a file with a non-ASCII name:\n{ctx}")
+    check(any(l.endswith("\t" + os.path.realpath(accented)) for l in ledger_lines()), "the file with a non-ASCII name was not ledgered")
+    check(not run_hook(os.path.join(hooks, "post-bash.sh"), payload(tool_name="Bash", tool_input={"command": "ls"}), env=c_env).strip(),
+          "post-bash re-checked the file with a non-ASCII name")
+
+    # A file rewritten while the edit hook's check ran is ledgered as it was
+    # checked, so the new content comes back at the Stop hook. (r-colcheck's
+    # results cache is off for that Stop: it keys a result on the file as it
+    # is after the check, so it would serve the pre-rewrite result.)
+    time.sleep(1.1)
+    race = os.path.join(root, "R", "race.R")
+    with open(race, "w") as f:
+        f.write("library(dplyr)\nsales <- readr::read_csv('data/sales.csv')\nok <- sales %>% filter(region == 'A')\n")
+    before = os.stat(race)
+    appender = subprocess.Popen(["sh", "-c", "sleep 0.8; printf '%s\\n' \"bad <- sales %>% select(amuont)\" >> \"$0\"", race])
+    ctx = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": race}))
+    appender.wait(timeout=30)
+    stamps = [l.split("\t")[0] for l in ledger_lines() if l.endswith("\t" + os.path.realpath(race))]
+    check(stamps and (stamps[-1] == f"{int(before.st_mtime)}:{before.st_size}" or "'amuont'" in ctx),
+          f"the edit hook ledgered a file rewritten during its check under the new content's stamp ({stamps}, checked {int(before.st_mtime)}:{before.st_size}):\n{ctx}")
+    out = run_hook(os.path.join(hooks, "stop-check.sh"), payload(stop_hook_active=False), env=dict(env, R_LSP_COLCHECK_CACHE="off"))
+    check("'amuont'" in ctx or ("'amuont' is not a column" in out and json.loads(out)["decision"] == "block"),
+          f"the content written during the edit hook's check was never reported:\n{ctx}\n{out}")
 
     # Many files at once (a git checkout): the newest ten are checked, the rest listed.
     time.sleep(1.1)
@@ -2158,7 +2229,16 @@ def scenario_hooks_changes(s):
     ctx = hook_context(hook("post-bash.sh", tool_name="Bash", tool_input={"command": "git checkout other"}))
     check("this command changed 12 R files" in ctx and "and 2 more" in ctx and "Not checked (over the limit of 10 per command)" in ctx
           and "Checked (10 files): no column, argument or parse findings" in ctx, f"post-bash note for many files unexpected:\n{ctx}")
+    # The two past the limit are ledgered as listed: the Bash hook does not
+    # bring them back at every command, the Stop hook (its own budget) checks
+    # them at the end of the turn, as the README promises, and not again.
+    listed = [l.split("\t")[1] for l in ledger_lines() if l.startswith("listed:") and "/gen_" in l]
+    check(len(listed) == 2, f"the files past the limit are not ledgered as listed:\n{ledger_lines()}")
     check(not hook("post-bash.sh", tool_name="Bash", tool_input={"command": "ls"}).strip(), "post-bash re-checked files it had listed")
+    check(not hook("stop-check.sh", stop_hook_active=False).strip(), "stop hook spoke for clean files past the Bash hook's limit")
+    seen = {l.split("\t")[1] for l in ledger_lines() if not l.startswith("listed:")}
+    check(all(p in seen for p in listed), f"the stop hook did not check the files the Bash hook listed past its limit:\n{ledger_lines()}")
+    check(not hook("stop-check.sh", stop_hook_active=False).strip(), "stop hook came back for files it had checked")
 
     # Outside an R project nothing runs.
     other = os.path.join(s.scratch, "hooks_changes_other")
@@ -2187,6 +2267,33 @@ def scenario_hooks_changes(s):
                                  "tool_input": {"file_path": os.path.join(mono, "pkgs", "a", "R", "pipeline.R")}},
                                 env={"CLAUDE_PROJECT_DIR": mono, "CLAUDE_PLUGIN_DATA": data_dir}))
     check("R/pipeline.R:5: 'amout' is not a column" in ctx, f"post-edit on a package nested under the session root missed the finding:\n{ctx}")
+
+    # The short form of a note (the second time it is met in the session)
+    # fits the note's shape: a stale-cache note has no "known up to" wording
+    # and is said in full rather than garbled into one.
+    stale = os.path.join(s.scratch, "hooks_changes_stale")
+    shutil.copytree(os.path.join(FIXTURES, "s3columns"), stale)
+    report = os.path.join(stale, "R", "report.R")
+    first = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": report}))
+    check("rely on a cached schema" in first and "(observed 2025-01-15)" in first, f"the stale-cache note is missing:\n{first}")
+    again = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": report}))
+    check('R/report.R:9: the findings above for "returns/monthly" rely on a cached schema' in again and "is known up to the findings above" not in again
+          and "R/report.R:17: 'holdings' from s3_read(\"holdings/latest\") cannot be opened; nothing downstream is checked (r-colcheck learn" in again,
+          f"the short form of the notes is wrong:\n{again}")
+
+    # hook-post-bash.R's bare-path form (a line or argument without a
+    # "mtime:size<TAB>" key, as its header accepts) records the file as it
+    # is, like the edit hook, so it does not come back at every command.
+    bare = os.path.join(root, "R", "bare.R")
+    with open(bare, "w") as f:
+        f.write("y <- 2\n")
+    out = subprocess.run(["Rscript", "--vanilla", os.path.join(REPO, "plugins", "r-lsp", "scripts", "hook-post-bash.R"), bare],
+                         input=json.dumps(payload()), capture_output=True, text=True, timeout=120,
+                         env=dict(os.environ, **env, R_LSP_HOOK_VIA="bash", R_LSP_HOOK_ROOT=root, R_LSP_HOOK_SESSION=sdir))
+    st = os.stat(bare)
+    check(out.returncode == 0 and f"{int(st.st_mtime)}:{st.st_size}\t{os.path.realpath(bare)}" in ledger_lines(),
+          f"a bare path was not recorded in the ledger:\n{out.stdout}{out.stderr}\n{ledger_lines()}")
+    check(not hook("post-bash.sh", tool_name="Bash", tool_input={"command": "ls"}).strip(), "post-bash re-checked a file recorded from a bare path")
 
     # R itself failing (a broken library) is said, not swallowed with its
     # stderr: silence means checked and clean. A fake Rscript stands in.

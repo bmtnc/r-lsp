@@ -29,7 +29,10 @@ if sd="$(session_dir "$input")"; then
   fi
 fi
 command -v Rscript >/dev/null 2>&1 || exit 0
-out="$(printf '%s' "$input" | R_LSP_HOOK_SESSION="${sd:-}" Rscript --vanilla "$here/../scripts/hook-post-edit.R" 2>/dev/null)"
+# The path goes to R as the shell holds it too (R_LSP_HOOK_FILE): in a C
+# locale R cannot translate the JSON's UTF-8 path to a file name, and a
+# name with non-ASCII characters would go unchecked in silence.
+out="$(printf '%s' "$input" | R_LSP_HOOK_SESSION="${sd:-}" R_LSP_HOOK_FILE="$file" Rscript --vanilla "$here/../scripts/hook-post-edit.R" 2>/dev/null)"
 rc=$?
 if [ "$rc" -ne 0 ]; then
   # R itself failed (a broken library, a missing package, a bug in the

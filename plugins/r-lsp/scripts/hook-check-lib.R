@@ -31,30 +31,33 @@ hook_session_dir <- function(input) {
 
 # "mtime:size<TAB>path": whole seconds, as `stat` prints them, so the shell
 # can compare; the size tells a rewrite within the same second apart. The
-# Bash and Stop hooks pass the keys they found the files under (`stamps`),
-# so a file rewritten while the check ran is recorded as it was checked and
-# comes back at the next hook; the edit hook records the file as it is.
-record_checked <- function(files, session_dir, stamps = NULL) {
+# hooks pass the keys they found the files under (`stamps`), so a file
+# rewritten while the check ran is recorded as it was checked and comes back
+# at the next hook; a file without a key (a bare path) is recorded as it is.
+# `listed` marks files the hook named as past its per-check limit instead of
+# checking them: their key gets a "listed:" prefix, which the Bash hook
+# counts as seen (they do not return at every command) and the Stop hook
+# does not, so the check at the end of the turn takes them up.
+record_checked <- function(files, session_dir, stamps = NULL, listed = FALSE) {
   if (is.null(session_dir) || !length(files)) return(invisible())
   files <- normalizePath(files, mustWork = FALSE)
-  if (!is.null(stamps) && length(stamps) == length(files)) {
-    ok <- !is.na(stamps) & nzchar(stamps)
-    keys <- sprintf("%s\t%s", stamps[ok], files[ok])
-  } else {
-    info <- file.info(files)
-    m <- floor(as.numeric(info$mtime))
-    ok <- !is.na(m)
-    keys <- sprintf("%.0f:%.0f\t%s", m[ok], info$size[ok], files[ok])
-  }
+  info <- file.info(files)
+  m <- floor(as.numeric(info$mtime))
+  now <- ifelse(is.na(m), NA_character_, sprintf("%.0f:%.0f", m, info$size))
+  use <- if (!is.null(stamps) && length(stamps) == length(files)) ifelse(!is.na(stamps) & nzchar(stamps), stamps, now) else now
+  ok <- !is.na(use)
+  keys <- sprintf("%s%s\t%s", if (listed) "listed:" else "", use[ok], files[ok])
   if (!length(keys)) return(invisible())
   tryCatch(cat(keys, file = file.path(session_dir, "checked.tsv"), sep = "\n", append = TRUE), error = function(e) NULL)
   invisible()
 }
 
-clip <- function(lines, n = 15) {
+# `total` is the number of items the lines stand for, when the caller already
+# cut the list down to the ones it will show.
+clip <- function(lines, n = 15, total = length(lines)) {
   shown <- head(lines, n)
   paste0(paste(shown, collapse = "\n"),
-         if (length(lines) > length(shown)) sprintf("\n... and %d more", length(lines) - length(shown)) else "")
+         if (total > length(shown)) sprintf("\n... and %d more", total - length(shown)) else "")
 }
 
 # The bug linters, loaded once per process: lintr from the global library,
@@ -99,13 +102,25 @@ lint_file <- function(file, root) {
 # note's lines (none when the file is clean) and whether anything was found.
 # Said once per session (a marker in the session directory): the sentences
 # that explain how to read a finding, and the long remedy of a note about a
-# data source, which repeats on every edit of the file otherwise.
+# data source, which repeats on every edit of the file otherwise. once()
+# only notes the intent; the markers are written by commit_once(), which the
+# callers run once the text has reached Claude (additionalContext, a block
+# reason). A note the Stop hook shows to the user alone (a systemMessage),
+# or one never printed, leaves the markers unset, so Claude still gets the
+# full text the first time it is said to it.
+once_state <- new.env()
 once <- function(session_dir, what) {
   if (is.null(session_dir)) return(TRUE)
   marker <- file.path(session_dir, paste0("said-", gsub("[^A-Za-z0-9._-]", "_", what)))
-  if (file.exists(marker)) return(FALSE)
-  tryCatch(file.create(marker), error = function(e) NULL)
+  if (file.exists(marker) || !is.null(once_state[[marker]])) return(FALSE)
+  once_state[[marker]] <- TRUE
   TRUE
+}
+commit_once <- function() {
+  markers <- ls(once_state, all.names = TRUE)
+  for (marker in markers) tryCatch(file.create(marker), error = function(e) NULL)
+  rm(list = markers, envir = once_state)
+  invisible()
 }
 
 # Column findings for one name, over several lines, as one line: a typo
@@ -241,16 +256,25 @@ check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_sub
   }
   if (length(imp$lines)) parts <- c(parts, imp$lines)
   if (length(notes)) {
-    # the full note the first time a source or a stop is met in the session; one line after
-    note_lines <- vapply(notes, function(x) {
+    # The full note the first time a source or a stop is met in the session;
+    # one line after. Only the five notes shown take their turn: a note the
+    # clip drops is still unsaid. The short form fits the note's shape: the
+    # learn command when the note has one, the expression a frame is known
+    # up to when it stopped at a call; a note of another shape (a stale cache,
+    # several cached datasets) has no shorter wording and is said in full.
+    shown <- head(notes, 5)
+    note_lines <- vapply(shown, function(x) {
       key <- x$key %||% paste(x$name, x$line)
-      if (once(session_dir, paste0("note-", key))) return(sprintf("%s:%s: %s", relative_path(x$file, root), x$line, x$message))
-      if (!is.null(x$command)) sprintf("%s:%s: '%s' from %s cannot be opened; nothing downstream is checked (%s)", relative_path(x$file, root), x$line, x$name, x$expr %||% "its source", x$command)
-      else sprintf("%s:%s: '%s' is known up to %s; nothing downstream is checked (said in full earlier this session)", relative_path(x$file, root), x$line, x$name, sub("^'[^']*' is known up to ([^,]*),.*$", "\\1", x$message))
+      where <- sprintf("%s:%s", relative_path(x$file, root), x$line)
+      if (once(session_dir, paste0("note-", key))) return(sprintf("%s: %s", where, x$message))
+      upto <- regmatches(x$message, regexec("^'[^']*' is known up to ([^,]*),", x$message))[[1L]]
+      if (!is.null(x$command)) sprintf("%s: '%s' from %s cannot be opened; nothing downstream is checked (%s)", where, x$name, x$expr %||% "its source", x$command)
+      else if (length(upto) == 2L) sprintf("%s: '%s' is known up to %s; nothing downstream is checked (said in full earlier this session)", where, x$name, upto[[2L]])
+      else sprintf("%s: %s", where, x$message)
     }, "")
     parts <- c(parts,
       "Data sources the checker cannot open (nothing downstream of these is checked):",
-      clip(note_lines, 5),
+      clip(note_lines, 5, total = length(notes)),
       if (once(session_dir, "learn-advice"))
         "Run the learn command once per dataset (--source names the file that defines the loader), or `r-colcheck discover` for every uncached source in the project and `r-colcheck learn --all` to learn them in one run; never from a hook.")
   }
@@ -300,7 +324,9 @@ check_r_files <- function(files, root, lint, budget = 40, session_dir = NULL) {
   list(lines = out, any = any, blocking = blocking)
 }
 
+# additionalContext reaches Claude, so the sentences it says once are now said.
 hook_json <- function(text) {
   cat(jsonlite::toJSON(list(hookSpecificOutput = list(hookEventName = "PostToolUse", additionalContext = text)),
                        auto_unbox = TRUE), "\n")
+  commit_once()
 }
