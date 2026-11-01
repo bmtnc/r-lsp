@@ -2298,6 +2298,74 @@ def scenario_colcheck_flow(s):
     check("No pipeline step with known columns covers R/01_clean.R:1" in subprocess.run([colmap, "--root", root, "--at", "R/01_clean.R:1"], cwd=root, capture_output=True, text=True, timeout=180).stdout,
           "colmap --at on a line outside every pipeline should say so")
     check(subprocess.run([colmap, "--root", root, "--at", "nope"], cwd=root, capture_output=True, text=True, timeout=60).returncode == 2, "colmap --at without FILE:LINE should exit 2")
+    # A chain of scripts, each reading the previous one's output, resolves end
+    # to end whichever file is checked first and however long it is.
+    write("R/11_chain.R", 'library(dplyr)\ns <- readr::read_csv("out/clean.csv") |> mutate(a2 = 1)\nreadr::write_csv(s, "out/c2.csv")\n')
+    write("R/12_chain.R", 'library(dplyr)\ns <- readr::read_csv("out/c2.csv") |> mutate(a3 = 1)\nreadr::write_csv(s, "out/c3.csv")\n')
+    write("R/13_chain.R", 'library(dplyr)\ns <- readr::read_csv("out/c3.csv") |> select(regoin)\n')
+    for order in (["R/13_chain.R", "R/12_chain.R"], ["R/12_chain.R", "R/13_chain.R"], ["R/13_chain.R"]):
+        out = subprocess.run([tool, "--root", root] + [os.path.join(root, f) for f in order], capture_output=True, text=True, timeout=120).stdout
+        check("R/13_chain.R:2: 'regoin' is not a column at this point (columns: region, year, big, a2, a3; data from out/c3.csv (written by R/12_chain.R:3))" in out
+              and "cannot open" not in out, f"a chain of writers checked as {order} did not resolve end to end:\n{out}")
+    # Writers: one from an installed package (vroom_write, direct and piped),
+    # a named data argument with the path positional, row.names = F,
+    # write.table() (its readers get the frame's columns exactly), a dataset
+    # directory read with a trailing slash, and a writer of an unknown frame.
+    # Readers of written paths apply their own arguments to the writer's
+    # columns (col_select, fread's drop).
+    write("R/14_writers.R", 'library(dplyr); library(readr)\nclean <- read_csv("data/sales.csv") |> select(region, year, amount)\n'
+          'vroom::vroom_write(clean, "out/w1.tsv")\nclean %>% vroom::vroom_write("out/w2.tsv")\nwrite_csv(x = clean, "out/w3.csv")\n'
+          'write.csv(clean, "out/w4.csv", row.names = F)\nwrite.table(clean, "out/w5.txt")\narrow::write_dataset(clean, "out/w6")\n'
+          'write_csv(clean, "out/w7.csv")\nwrite_csv(mystery(), "out/w8.csv")\n')
+    write("R/15_readers.R", 'library(dplyr); library(readr)\n'
+          'a <- vroom::vroom("out/w1.tsv") |> select(nope1)\n'
+          'b <- vroom::vroom("out/w2.tsv") |> select(nope2)\n'
+          'c <- read_csv("out/w3.csv") |> select(nope3)\n'
+          'd <- read.csv("out/w4.csv") |> select(nope4)\n'
+          'e <- read.table("out/w5.txt", header = TRUE) |> select(nope5)\n'
+          'f <- arrow::open_dataset("out/w6/") |> select(nope6)\n'
+          'g <- read_csv("out/w7.csv", col_select = c(region)) |> select(year)\n'
+          'h <- read_csv("out/w7.csv", col_select = c(region, year)) |> select(year)\n'
+          'i <- data.table::fread("out/w7.csv", drop = "year") |> select(year)\n'
+          'j <- read_csv("out/w8.csv") |> select(z)\n')
+    out = subprocess.run([tool, "--root", root, os.path.join(root, "R", "15_readers.R")], capture_output=True, text=True, timeout=120).stdout
+    got = {(int(l.split(":")[1]), l.split("'")[1]) for l in out.splitlines() if l.startswith("R/15_readers.R:") and "is not a column" in l}
+    check(got == {(2, "nope1"), (3, "nope2"), (4, "nope3"), (5, "nope4"), (6, "nope5"), (7, "nope6"), (8, "year"), (10, "year")},
+          f"readers of written paths mis-checked: {sorted(got)}\n{out}")
+    check("data from out/w2.tsv (written by R/14_writers.R:4)" in out and "data from out/w3.csv (written by R/14_writers.R:5)" in out
+          and "data from out/w6 (written by R/14_writers.R:8)" in out
+          and "R/15_readers.R:8: 'year' is not a column at this point (columns: region; data from out/w7.csv (written by R/14_writers.R:9))" in out
+          and "R/15_readers.R:10: 'year' is not a column at this point (columns: region, amount; data from out/w7.csv (written by R/14_writers.R:9))" in out,
+          f"written sources not named, or the reader's arguments not applied to the writer's columns:\n{out}")
+    check("R/15_readers.R:11: 'j' comes from a source the checker cannot open (read_csv(\"out/w8.csv\"): no file out/w8.csv under the project; R/14_writers.R writes that path, but what it writes there could not be worked out)" in out,
+          f"a writer of an unknown frame should be named in the note:\n{out}")
+    cm = subprocess.run([colmap, "--root", root], cwd=root, capture_output=True, text=True, timeout=180).stdout
+    check("  out/w2.tsv   written at R/14_writers.R:4 (vroom_write)   3 columns: region, year, amount   read by R/15_readers.R" in cm
+          and "  out/w4.csv   written at R/14_writers.R:6 (write.csv)   3 columns: region, year, amount   read by R/15_readers.R" in cm
+          and "  out/w5.txt   written at R/14_writers.R:7 (write.table)   3 columns: region, year, amount   read by R/15_readers.R" in cm,
+          f"colmap's written-data section lacks the package writer, or marks write.csv(row.names = F)/write.table() open:\n{cm}")
+    # Targets: a target is pinned to its own tar_target() line even when an
+    # earlier target's command mentions its name, a `# cols:` comment binds
+    # the target it is written on and no other, and tar_source() brings the
+    # functions under R/.
+    os.makedirs(os.path.join(root, ".colcheck"), exist_ok=True)
+    with open(os.path.join(root, ".colcheck", "schemas.json"), "w") as f:
+        json.dump({"K2": {"columns": [{"name": "k2col"}], "observed_at": datetime.date.today().isoformat()}}, f)
+    write("R/functions.R", "clean_sales <- function(df) df |> dplyr::filter(amount > 0) |> dplyr::select(region, year)\n")
+    write("_targets.R", "library(targets)\nlibrary(dplyr)\ntar_source()\nlist(\n  tar_target(report, nrow(summed)),\n"
+          "  tar_target(raw, readr::read_csv(\"data/sales.csv\")),\n  tar_target(clean, clean_sales(raw)),\n"
+          "  tar_target(unres, s3_read(\"k1\")),\n  tar_target(b, s3_read(\"k2\")), # cols: K2\n"
+          "  tar_target(summed, raw |> group_by(region) |> summarise(total = sum(amount)))\n)\n")
+    write("R/16_targets.R", "library(targets); library(dplyr)\nx <- tar_read(clean) |> select(regoin)\ny <- tar_read(unres) |> select(zzz)\n"
+          "z <- tar_read(b) |> select(k2col, nope)\nw <- tar_read(summed) |> select(totl)\n")
+    out = subprocess.run([tool, "--root", root, os.path.join(root, "R", "16_targets.R")], capture_output=True, text=True, timeout=120).stdout
+    got = {(int(l.split(":")[1]), l.split("'")[1]) for l in out.splitlines() if l.startswith("R/16_targets.R:") and "is not a column" in l}
+    check(got == {(2, "regoin"), (4, "nope"), (5, "totl")}, f"targets with tar_source() and a # cols: comment mis-checked: {sorted(got)}\n{out}")
+    check("data from target clean (_targets.R:7)" in out and "data from target b (_targets.R:9)" in out and "data from target summed (_targets.R:10)" in out,
+          f"targets not pinned to their own tar_target() line:\n{out}")
+    steps = subprocess.run([tool, "--steps", "--root", root, os.path.join(root, "_targets.R")], capture_output=True, text=True, timeout=120).stdout
+    check("_targets.R:10: summarise(., total = sum(amount)) => region, total" in steps and "_targets.R:5:" not in steps
+          and "R/functions.R:1: dplyr::select(., region, year) => region, year" in steps, f"_targets.R steps unexpected:\n{steps}")
 
 
 def scenario_results_cache(s):
