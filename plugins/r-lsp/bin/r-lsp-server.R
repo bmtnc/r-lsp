@@ -43,6 +43,18 @@ status_tag <- Sys.getenv("CLAUDE_PROJECT_DIR", getwd())
 # second terminal, `claude -p` from a script) share this file and their
 # lines interleave, so r-lsp-status and the post-LSP hook group by pid.
 status_pid <- Sys.getpid()
+# The file only ever grows, and every reader scans it whole: at a start, when
+# it has grown past two thousand lines, the oldest go (other live servers
+# append; a copy of the tail then a rename loses nothing they write after).
+trim_status_file <- function(keep = 500L) tryCatch({
+  if (!file.exists(status_file)) return(invisible())
+  lines <- readLines(status_file, warn = FALSE)
+  if (length(lines) <= 4L * keep) return(invisible())
+  tmp <- paste0(status_file, ".", status_pid, ".tmp")
+  writeLines(tail(lines, keep), tmp)
+  file.rename(tmp, status_file)
+}, error = function(e) NULL)
+trim_status_file()
 status <- function(text) tryCatch({
   dir.create(dirname(status_file), showWarnings = FALSE, recursive = TRUE)
   con <- file(status_file, open = "a")
@@ -110,8 +122,11 @@ if (!is.null(lintr_note)) status(lintr_note)
 # replaces the profile, and the post-edit hook runs the bug linters instead.
 note_lint_config <- function(root) {
   tryCatch({
-    if (lint_profile_off()) {
-      status("lint profile off (R_LSP_AGENT_LINTERS=false): diagnostics use lintr's defaults")
+    off <- lint_profile_off()
+    if (isTRUE(off)) {
+      # the reason comes with the answer (the environment variable as set, or a
+      # foreign R_USER_CONFIG_DIR); the fixed text serves an older lint-config.R
+      status(sprintf("lint profile off (%s): diagnostics use lintr's defaults", attr(off, "reason") %||% "R_LSP_AGENT_LINTERS=false"))
     } else {
       cfg <- lint_config_file(root)
       if (!is.null(cfg)) status(sprintf("lint profile inactive: %s takes precedence; the post-edit hook runs the plugin's bug linters instead", cfg))
@@ -188,11 +203,12 @@ refresh_workers <- function(self) {
   for (tm in list(self$parse_task_manager, self$diagnostics_task_manager)) {
     tryCatch({
       p <- tm$.__enclos_env__$private
+      if (!is.list(p$sessions) || !is.function(p$retire_session) || !is.function(p$ensure_min_sessions)) stop("the task manager's internals changed")
       for (s in p$sessions) {
         if (!identical(s$get_state(), "busy")) p$retire_session(s)
       }
       p$ensure_min_sessions()
-    }, error = function(e) NULL)
+    }, error = function(e) note("worker refresh disabled (", conditionMessage(e), "): diagnostics and hover may run without the renv library until the workers are replaced"))
   }
 }
 
@@ -244,17 +260,20 @@ activate_renv <- function(self, root) {
   TRUE
 }
 
-orig_initialized <- ns$on_initialized
-patched_initialized <- function(self, params) {
-  if (!is.null(self$rootPath)) {
-    tryCatch(activate_renv(self, self$rootPath),
-      error = function(e) note("renv activation failed: ", conditionMessage(e)))
+tryCatch({
+  orig_initialized <- ns$on_initialized
+  if (!is.function(orig_initialized)) stop("languageserver has no on_initialized() to wrap")
+  patched_initialized <- function(self, params) {
+    if (!is.null(self$rootPath)) {
+      tryCatch(activate_renv(self, self$rootPath),
+        error = function(e) note("renv activation failed: ", conditionMessage(e)))
+    }
+    orig_initialized(self, params)
+    if (!is.null(self$rootPath)) note_lint_config(self$rootPath)
+    tryCatch(if (index_busy(self)) note_busy(self, "workspace"), error = function(e) NULL)
   }
-  orig_initialized(self, params)
-  if (!is.null(self$rootPath)) note_lint_config(self$rootPath)
-  tryCatch(if (index_busy(self)) note_busy(self, "workspace"), error = function(e) NULL)
-}
-assignInNamespace("on_initialized", patched_initialized, ns = "languageserver")
+  assignInNamespace("on_initialized", patched_initialized, ns = "languageserver")
+}, error = function(e) note("renv activation patch disabled (", conditionMessage(e), "): the project's renv library is not used by the server"))
 
 # --- 2. index status events --------------------------------------------------
 
@@ -433,7 +452,7 @@ tryCatch({
 # references and call hierarchy reach them as they reach a script.
 
 load_extra_max <- suppressWarnings(as.integer(Sys.getenv("R_LSP_LOAD_MAX", "600")))
-if (is.na(load_extra_max)) load_extra_max <- 600L
+if (is.na(load_extra_max) || load_extra_max < 0L) load_extra_max <- 600L   # head(x, -n) would mean "all but n"
 extra_loaded <- new.env()   # workspace root -> uris the plugin loaded
 git_ignored <- function(root, paths) {
   if (!length(paths)) return(logical())

@@ -19,9 +19,13 @@
 SCRIPT="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 PLUGIN_ROOT="$(cd "$(dirname "$SCRIPT")/.." && pwd)"
 export R_LSP_PLUGIN_ROOT="$PLUGIN_ROOT"
-if [ "${R_LSP_AGENT_LINTERS:-true}" != "false" ] && [ -z "${R_USER_CONFIG_DIR:-}" ]; then
-  export R_USER_CONFIG_DIR="$PLUGIN_ROOT/lintr/user-config"
-fi
+# R_LSP_AGENT_LINTERS=false (also 0, no, off) keeps lintr's defaults; the
+# spellings R_LSP_HOOKS takes. A pre-set R_USER_CONFIG_DIR is left alone
+# (scripts/lint-config.R then reports the profile as off).
+case "$(printf '%s' "${R_LSP_AGENT_LINTERS:-true}" | tr '[:upper:]' '[:lower:]')" in
+  false|0|no|off) ;;
+  *) [ -n "${R_USER_CONFIG_DIR:-}" ] || export R_USER_CONFIG_DIR="$PLUGIN_ROOT/lintr/user-config" ;;
+esac
 
 # --vanilla: renv's .Rprofile must not change .libPaths() before the project
 # root is known. The server program is a file, not an -e string: no shell

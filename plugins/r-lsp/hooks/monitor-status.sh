@@ -7,13 +7,19 @@
 # projects are filtered out.
 data_dir="$1"
 [ -n "$data_dir" ] || exit 0
+# the memory the hooks keep lives under the plugin data directory, which
+# a monitor gets only as its argument
+[ -n "${CLAUDE_PLUGIN_DATA:-}" ] || export CLAUDE_PLUGIN_DATA="$data_dir"
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+. "$here/hook-lib.sh"
+hooks_off && exit 0
 # Nothing to watch outside an R project: the same test the session-start
-# hook applies (an R, Rmd or qmd file within three levels, renv and git
-# internals excepted, and Rscript on PATH), so a session in a directory
-# with no R code runs no monitor at all.
+# hook applies (an R, Rmd, qmd or Rnw file within six levels, libraries,
+# build output and VCS internals excepted, and Rscript on PATH), with the
+# same day-long memory of a directory that has none, so a session in a
+# directory with no R code runs no monitor at all and walks nothing twice.
 command -v Rscript >/dev/null 2>&1 || exit 0
-find "$PWD" -maxdepth 3 \( -name '*.R' -o -name '*.r' -o -name '*.Rmd' -o -name '*.qmd' \) \
-     -not -path '*/renv/*' -not -path '*/.git/*' -print -quit 2>/dev/null | grep -q . || exit 0
+r_project "$(cd "$PWD" && pwd -P)" "" 6 start || exit 0
 file="$data_dir/status.log"
 mkdir -p "$data_dir" 2>/dev/null
 touch "$file" 2>/dev/null || exit 0

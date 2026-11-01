@@ -2,7 +2,8 @@
 # the column names). Lines marked `# bad` must be reported; every other line
 # must stay silent. data/sales.csv has the header region,year,amount,customer;
 # data/noheader.csv has no header line; data/spaces.csv has the header
-# `my col,amount`; data/skip1.csv has a comment line before the header.
+# `my col,amount`; data/skip1.csv has a comment line before the header;
+# data/padded.csv has the header `region, year, amount` (a blank after each comma).
 library(tidyverse)
 
 r01 <- read_csv("data/sales.csv", col_select = c(region, amount)) |> mutate(z = region + amount)
@@ -53,3 +54,18 @@ r44 <- vroom::vroom("data/sales.csv", col_select = c(region, amount)) |> mutate(
 # an argument the checker cannot read: the frame is unknown and noted, never checked against the raw header
 r45 <- read_csv("data/sales.csv", col_select = all_of(wanted_cols)) |> mutate(z = year)
 r46 <- read.csv("data/sales.csv", header = has_header) |> mutate(z = year)
+# fread's sep = "auto" is its default spelled out: the separator is guessed
+r47 <- data.table::fread("data/sales.csv", sep = "auto") |> mutate(z = region + year)
+r48 <- data.table::fread("data/sales.csv", sep = "auto") |> mutate(z = regoin)                            # bad
+# read_delim() keeps the blanks around a name unless trim_ws = TRUE; the other readers trim
+r49 <- read_delim("data/padded.csv", delim = ",") |> mutate(z = year)                                      # bad
+r50 <- read_delim("data/padded.csv", delim = ",") |> mutate(z = region + ` year`)
+r51 <- read_delim("data/padded.csv", delim = ",", trim_ws = TRUE) |> mutate(z = year)
+r52 <- read_csv("data/padded.csv") |> mutate(z = year)
+r53 <- read.csv("data/padded.csv") |> mutate(z = year)
+r54 <- data.table::fread("data/padded.csv") |> mutate(z = year)
+# a path built from a variable bound to a literal above resolves as the literal does
+data_dir <- "data"
+r55 <- read_csv(file.path(data_dir, "sales.csv")) |> mutate(z = regoin)                                    # bad
+r56 <- read_csv(paste0(data_dir, "/sales.csv")) |> mutate(z = region + year)
+r57 <- read_csv(sprintf("%s/sales.csv", data_dir)) |> mutate(z = regoin)                                   # bad

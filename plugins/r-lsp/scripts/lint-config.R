@@ -25,14 +25,40 @@ lint_config_file <- function(path) {
   if (length(hit)) hit[[1L]] else NULL
 }
 
-lint_profile_off <- function() identical(Sys.getenv("R_LSP_AGENT_LINTERS", "true"), "false")
+# The R_LSP_AGENT_LINTERS setting that switches the profile off (false, 0,
+# no, off, in any case: the spellings R_LSP_HOOKS takes), as `NAME=value`
+# for the message that reports it, or NULL when the variable does not.
+# r-lint gates on this alone: it loads the profile itself, so where the
+# language server's R_USER_CONFIG_DIR points changes nothing for it.
+agent_linters_off <- function() {
+  flag <- Sys.getenv("R_LSP_AGENT_LINTERS", "true")
+  if (tolower(flag) %in% c("false", "0", "no", "off")) sprintf("R_LSP_AGENT_LINTERS=%s", flag) else NULL
+}
 
-# The profile is written against lintr 3.2.0 (Linter(linter_level =)); on an
-# older lintr it runs in a compatibility mode. Said once so a missing
-# diagnostic is not mistaken for a clean file.
+# Off when R_LSP_AGENT_LINTERS says so, or when the shell that started Claude
+# Code had R_USER_CONFIG_DIR set to another directory: the wrapper then leaves
+# it alone and lintr reads that directory's config, not the profile. The
+# logical carries the cause as attribute "reason", so the message that
+# reports it names the variable that is set rather than a fixed
+# R_LSP_AGENT_LINTERS=false.
+lint_profile_off <- function() {
+  reason <- agent_linters_off()
+  cfg <- Sys.getenv("R_USER_CONFIG_DIR", "")
+  if (is.null(reason) && nzchar(cfg)) {
+    plugin <- Sys.getenv("R_LSP_PLUGIN_ROOT", "")
+    profile <- if (nzchar(plugin)) file.path(plugin, "lintr", "user-config") else file.path(dirname(script_dir), "lintr", "user-config")
+    if (!identical(normalizePath(cfg, mustWork = FALSE), normalizePath(profile, mustWork = FALSE))) {
+      reason <- sprintf("R_USER_CONFIG_DIR=%s is set, so the language server does not use the profile", cfg)
+    }
+  }
+  structure(!is.null(reason), reason = reason)
+}
+
+# The profile is written against lintr 3.2.0 (Linter(linter_level =)); an
+# older lintr runs the same checks, registered without a level. Said once.
 lintr_version_note <- function() {
   v <- tryCatch(utils::packageVersion("lintr"), error = function(e) NULL)
   if (is.null(v) || v >= "3.2.0") return(NULL)
-  sprintf(paste("lintr %s is older than 3.2.0: the diagnostics profile runs in a compatibility mode;",
-                "upgrade with Rscript --vanilla -e 'install.packages(\"lintr\")'"), v)
+  sprintf(paste("lintr %s is older than the 3.2.0 the diagnostics profile is written for; the same checks run.",
+                "Upgrade when you can: Rscript --vanilla -e 'install.packages(\"lintr\")'"), v)
 }

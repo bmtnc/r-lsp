@@ -73,3 +73,17 @@ bad50 <- bind_rows(sales, unknown_frame) %>% select(region) %>% mutate(z = regoi
 bad51 <- sales %>% select(last_col()) %>% mutate(z = region)                                                         # bad
 bad52 <- sales %>% mutate(v = purrr::map_dbl(amuont, sd))                                                            # bad
 bad53 <- sales %>% mutate(z = sd)                                                                                    # bad
+bad54 <- sales %>% filter(year > 2019) %>% ggplot(aes(x = year, y = amount)) + geom_point(aes(colour = regionn))   # bad
+bad55 <- sales %>% filter(amuont > 0) %>% nrow() + 1                                                                  # bad
+bad56 <- sales %>% group_by(region) %>% select(reg = region, amount) %>% mutate(z = region)                          # bad
+bad57 <- sales %>% select(c(-region, -year)) %>% mutate(z = region)                                                   # bad
+bad58 <- sales %>% mutate(across(c(amount, year), round), .keep = "used") %>% select(region)                          # bad
+bad59 <- sales %>% mutate(x = year + 1, x = x * 2, .keep = "used") %>% select(amount)                                 # bad
+bad60 <- sales %>% add_count(region) %>% add_count(year) %>% select(nnn)                                              # bad
+bad61 <- sales %>% distinct(yr = year) %>% select(year)                                                               # bad
+bad62 <- sales %>% group_by(region, year) %>% ungroup(region) %>% summarise(n = n()) %>% select(region, n)          # bad
+bad63 <- sales %>% rename(yr = year) %>% select(region:yr) %>% mutate(z = amount)                                     # bad
+bad64 <- ggplot(mapping = aes(x = year, y = amuont), data = sales) + geom_point()                                      # bad
+guarded_df <- sales
+if ("year" %in% names(guarded_df)) guarded_df <- guarded_df %>% mutate(decade = year %/% 10)
+bad65 <- guarded_df %>% select(decadee)                                                                               # bad

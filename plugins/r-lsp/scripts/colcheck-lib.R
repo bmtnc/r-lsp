@@ -14,10 +14,12 @@
 # reader's own arguments that change the names (col_select, col_names,
 # header, id, skip, sheet, make.names repair, ...) are applied to the header
 # (see "reader arguments"); one the checker cannot read stops tracking with
-# a note. The moment a step makes the column set unknowable (across(),
-# tidyselect helpers, pivot_wider(), clean_names(), joins to unknown frames,
-# user functions, ...) the frame is marked unknown and nothing downstream is
-# checked. Base-R access on a known frame (`df$x`, `df[["x"]]`, `df[, "x"]`)
+# a note. The moment a step makes the column set unknowable (pivot_wider()
+# with names from the data, joins to unknown frames, functions whose code
+# cannot be read, ...) the frame is marked unknown and nothing downstream is
+# checked. A file another script writes resolves a reader of the same path
+# when the file is absent, and a targets pipeline's objects resolve through
+# tar_read()/tar_load() (see "sinks" and "targets"). Base-R access on a known frame (`df$x`, `df[["x"]]`, `df[, "x"]`)
 # is checked like a verb, and `df$x <- v` adds the column. R Markdown, Quarto
 # and Sweave files are checked chunk by chunk (parse_r_source()).
 #
@@ -36,6 +38,8 @@
 #
 # Entry points: colcheck_files(files, root) -> list of findings (kind "column"
 #               or "note"); colcheck_format(findings, root) -> character lines.
+# A file's result is kept across processes while everything it depended on
+# is unchanged (see "results cache"); R_LSP_COLCHECK_CACHE=off turns that off.
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 # Arguments of a call without empty ones (`x[, 1]`): the empty symbol cannot
@@ -192,16 +196,28 @@ schemas_path <- function(root) file.path(root, ".colcheck", "schemas.json")
 load_config <- function(root) {
   p <- file.path(root, ".colcheck.json")
   if (!file.exists(p)) return(list())
-  cfg <- quiet(jsonlite::fromJSON(p, simplifyVector = FALSE))
+  cfg <- json_memo(p, function() quiet(jsonlite::fromJSON(p, simplifyVector = FALSE)))
   if (!is.list(cfg)) list() else cfg
 }
 
 load_schemas <- function(root) {
   p <- schemas_path(root)
   if (!file.exists(p)) return(list())
-  s <- quiet(jsonlite::fromJSON(p, simplifyVector = FALSE))
+  s <- json_memo(p, function() quiet(jsonlite::fromJSON(p, simplifyVector = FALSE)))
   if (!is.list(s) || is.null(names(s))) return(list())
   s
+}
+
+# A JSON file read once per process while its mtime and size hold.
+json_memo <- function(p, read) {
+  info <- file.info(p)
+  key <- sprintf("%s|%s|%s", p, format(info$mtime, "%Y%m%d%H%M%OS6"), info$size)
+  hit <- colcheck_process$json[[key]]
+  if (!is.null(hit)) return(hit)
+  v <- read()
+  if (is.null(colcheck_process$json)) colcheck_process$json <- list()
+  colcheck_process$json[[key]] <- if (is.null(v)) list() else v
+  v
 }
 
 ttl_days <- function(cfg) {
@@ -289,11 +305,13 @@ schema_columns <- function(key, ctx) {
     }
   }
   if (length(inner)) attr(cols, "inner") <- inner
-  attr(cols, "source") <- sprintf("cached schema \"%s\"%s", key,
-                                  if (nzchar(observed)) paste0(", observed ", observed) else "")
+  cols <- with_source(cols, sprintf("cached schema \"%s\"%s", key, if (nzchar(observed)) paste0(", observed ", observed) else ""),
+                      paste0("schema:", key))
   age <- quiet(as.integer(Sys.Date() - as.Date(observed)))
   if (!is.null(age) && !is.na(age) && age > ttl_days(ctx$config) && is.null(ctx$stale[[key]])) {
-    ctx$stale[[key]] <- list(line = ctx$line, days = age, observed = observed)
+    # inside a followed helper, the line to show is the call site in the checked file
+    at <- if (length(ctx$call_sites)) suppressWarnings(as.integer(sub("^.*:", "", ctx$call_sites[[1L]]))) else ctx$line
+    ctx$stale[[key]] <- list(line = if (is.na(at)) ctx$line else at, days = age, observed = observed)
   }
   cols
 }
@@ -353,7 +371,9 @@ cached_columns <- function(e, ctx) {
       if (!is.null(cols)) return(cols)
     }
     hits <- list()
-    for (s in key_literals(e)) {
+    # a registered loader resolves through its key argument alone (an
+    # option literal of its call names no dataset)
+    if (is.null(reg)) for (s in key_literals(e)) {
       cols <- schema_columns(s, ctx)
       if (!is.null(cols)) hits[[s]] <- cols
     }
@@ -391,7 +411,7 @@ cached_columns <- function(e, ctx) {
 # `fn(type = "monthly")`, comes first; `bare = FALSE` leaves those only.
 function_keys <- function(e, ctx, bare = TRUE) {
   fn <- call_name(e)
-  if (is.na(fn)) return(character())
+  if (is.na(fn) || !grepl("^[A-Za-z.][A-Za-z0-9._]*$", fn)) return(character())   # an operator is no key
   head <- e[[1L]]
   by_name <- if (!bare) character()
     else if (is.call(head)) c(paste0(as.character(head[[2L]]), "::", fn), fn)
@@ -501,7 +521,7 @@ note_unresolved <- function(target, rhs, key, ctx) {
     # used already when the pipeline went on past the stop in this statement
     last_step <- if (is.call(rhs) && call_name(rhs) %in% c("%>%", "%<>%", "%T>%")) rhs[[3L]] else rhs
     if (is.symbol(last_step)) last_step <- as.call(list(last_step))
-    went_on <- !identical(paste(deparse(last_step), collapse = " "), ctx$stopped$expr)
+    went_on <- !identical(one_line(last_step), ctx$stopped$expr)
     ctx$unresolved[[target]] <- list(line = ctx$line, keys = character(), stopped = ctx$stopped, used = went_on)
     return(invisible())
   }
@@ -540,9 +560,20 @@ note_unresolved <- function(target, rhs, key, ctx) {
   if (fn %in% readers) {
     # a reader with a literal path that does not exist locally (an S3 URI);
     # read.csv(text = x) or read_csv(path_variable) are not learnable sources
-    path_arg <- if (length(call_args(head))) call_args(head)[[1L]] else NULL
+    path_arg <- reader_path_arg(head)
     if (!is.character(path_arg) && !(is.call(path_arg) && call_name(path_arg) %in% c("here", "file.path"))) return(invisible())
     why <- unreadable_reason(resolve_path(path_arg, ctx), fn)
+    # not on disk, and (written_columns found nothing) no script writes it,
+    # or the scripts the project index names as its writers (sink_lookups)
+    # gave no columns: the frame they write was unknown there, or their own
+    # check was under way
+    if (is.null(why) && is.character(path_arg) && !grepl("^[A-Za-z][A-Za-z0-9+.-]*://", path_arg)) {
+      asked <- Filter(function(s) !isTRUE(s$table) && same_target(s$key, path_arg, ctx$root), ctx$sink_lookups)
+      writers_of <- unique(unlist(lapply(asked, `[[`, "writers")))
+      why <- if (length(writers_of)) sprintf("no file %s under the project; %s writes that path, but what it writes there could not be worked out",
+                                             path_arg, paste(vapply(writers_of, relative_path, "", root = ctx$root), collapse = " and "))
+        else sprintf("no file %s under the project, and no script in it writes that path", path_arg)
+    }
     # parquet, feather or an arrow dataset on a bucket: the schema is in the
     # file footer, which arrow::open_dataset() reads without the rows
     if (is.character(path_arg) && grepl("^(s3|gs|az|abfs|hdfs|https?)://", path_arg) &&
@@ -599,7 +630,7 @@ loader_flags <- function(def, ctx) {
   if (file.exists(file.path(root, "DESCRIPTION")) &&
       any(startsWith(normalizePath(files, mustWork = FALSE), paste0(file.path(root, "R"), "/")))) return("--load-all")
   for (f in files) {
-    ex <- quiet(parse(f, keep.source = FALSE))
+    ex <- quiet(parse(f, keep.source = FALSE, encoding = "UTF-8"))
     if (!is.null(ex)) for (e in ex) for (p in source_calls(e)) {
       src <- resolve_path(p, ctx)
       if (!is.null(src)) files <- c(files, src)
@@ -650,9 +681,17 @@ bound_rows <- function(call, first, ctx, partial = FALSE) {
   if (!length(parts)) return(NULL)
   out <- unique(c(id, unlist(lapply(parts, as.character))))
   out <- keep_source(out, parts[[1L]])
+  attr(out, "inner") <- merged_inner(parts)
   attr(out, "groups") <- attr(parts[[1L]], "groups") %||% character()
   if (partial || any(vapply(parts, is_open, TRUE))) attr(out, "open") <- TRUE
   out
+}
+
+# The recorded inner columns of every input's list-columns, the first
+# input's winning for a name in several.
+merged_inner <- function(parts) {
+  inn <- do.call(c, lapply(parts, function(p) attr(p, "inner") %||% list()))
+  if (length(inn)) inn[!duplicated(names(inn))] else NULL
 }
 
 # One input of a row binding: a frame expression, or a literal list of them.
@@ -663,6 +702,7 @@ input_frame <- function(a, ctx) {
     parts <- lapply(els, function(el) as_frame(frame_columns(el, ctx, used = TRUE)))
     if (any(vapply(parts, is.null, TRUE))) return(NULL)
     out <- keep_source(unique(unlist(lapply(parts, as.character))), parts[[1L]])
+    attr(out, "inner") <- merged_inner(parts)
     attr(out, "groups") <- attr(parts[[1L]], "groups") %||% character()
     if (any(vapply(parts, is_open, TRUE))) attr(out, "open") <- TRUE
     return(out)
@@ -726,10 +766,12 @@ map_over <- function(call, cols, ctx, piped) {
   args <- call_args(call)
   if (!piped && length(args)) args <- args[-1L]
   nms <- names(args) %||% rep("", length(args))
+  f_named <- any(c(".f", "FUN") %in% nms)
   f <- if (".f" %in% nms) args[[".f"]] else if ("FUN" %in% nms) args[["FUN"]] else if (any(!nzchar(nms))) args[!nzchar(nms)][[1L]] else NULL
   if (is.null(f)) return(NULL)
   extra <- args[!(nms %in% c(".f", "FUN", ".x", "X", ".l"))]
-  if (any(!nzchar(nms))) extra <- extra[-match(TRUE, !nzchar(names(extra) %||% rep("", length(extra))))]
+  # the first positional is the function only when the function was not named
+  if (!f_named && any(!nzchar(nms))) extra <- extra[-match(TRUE, !nzchar(names(extra) %||% rep("", length(extra))))]
   result <- lambda_columns(f, unlisted(cols), ctx, with_index = fn == "imap", extra = extra, shown = call)
   if (is.null(result)) return(NULL)
   if (fn %in% c("map_dfr", "map_df")) unlisted(result) else listed(result)
@@ -779,9 +821,674 @@ lambda_columns <- function(f, frame, ctx, with_index = FALSE, extra = list(), sh
   ctx$annotation <- saved$annotation          # the statement's `# cols:` survives the body walk
   ctx$annotation_head <- saved$annotation_head
   if (is.null(result) && !is.null(inner)) {
-    note_stop(ctx, shown, call_name(shown) %||% "lambda", NULL, reason = sprintf("inside its lambda at %s, %s", inner$expr, inner$reason))
+    fn_shown <- call_name(shown)
+    note_stop(ctx, shown, if (is.na(fn_shown)) "lambda" else fn_shown, NULL, reason = sprintf("inside its lambda at %s, %s", inner$expr, inner$reason))
   }
   result
+}
+
+# --- data the code writes: sinks, and the scripts that read them -----------
+# `write_csv(clean, "data/clean.csv")`, `saveRDS(df, path)`, `write_parquet()`,
+# `dbWriteTable(con, "orders", df)`: the frame's columns at that line are what
+# the file (or table) holds. They are recorded (r-colmap lists them with the
+# scripts that read them), and a reader of the same path in another script,
+# or later in the same one, resolves from the writer's columns when the file
+# is not on disk (a fresh clone, an intermediate result not yet produced), so
+# a two-script pipeline is checked end to end. A path is matched when it is
+# a literal, a variable bound to one, or built from literals.
+writers <- c("write_csv", "write_csv2", "write_tsv", "write_delim", "write_excel_csv", "vroom_write", "write.csv",
+             "write.csv2", "write.table", "fwrite", "saveRDS", "write_rds", "write_parquet", "write_feather",
+             "write_ipc_file", "write_dataset", "write_xlsx", "write.xlsx", "write_dta", "write_sav", "write_fst",
+             "dbWriteTable")
+table_writers <- "dbWriteTable"
+table_readers <- c("tbl", "dbReadTable")
+# Every call that consumes a frame without naming its columns: the frame is
+# written out, and that is where it went, recorded as a "written" fate for
+# the data map (the writers above, whose path argument the checker reads,
+# are also sinks a reader of the same path resolves from). The frame keeps
+# its columns past a readr writer; saveRDS() and its kind return nothing.
+sink_calls <- unique(c(writers, table_writers, "saveRDS", "save", "write_rds", "write_ipc_file", "write_dataset", "write_xlsx",
+                       "write.xlsx", "writeData", "write_fst", "write_dta", "write_sav", "write_sas", "write_xpt", "write_json",
+                       "qsave", "dbAppendTable", "copy_to", "s3write_using", "s3saveRDS", "s3save", "write_sf", "st_write", "write_ods"))
+sink_frame_args <- c("x", "object", "value", "data", ".data", "df", "obj", "dataset", "table")
+sink_returns_nothing <- c("saveRDS", "save", "qsave", "s3saveRDS", "s3save")
+
+# A call to one of these names is a sink unless the project defines the name
+# itself (a bare call to its own write_results()). The installed package
+# behind vroom_write() or write_xlsx() is never followed into: its body says
+# nothing about the columns, and the call would leave no sink behind.
+is_sink_call <- function(e, fn, ctx) {
+  if (is.na(fn) || !(fn %in% sink_calls)) return(FALSE)
+  !is.symbol(e[[1L]]) || is.null(ctx$functions[[fn]])
+}
+
+# The frame and the path (or table name) a writer call carries.
+sink_args <- function(e, fn) {
+  args <- call_args(e)
+  nms <- names(args) %||% rep("", length(args))
+  pos <- args[!nzchar(nms)]
+  named <- args[nzchar(nms)]
+  first <- function(...) { for (k in c(...)) if (!is.null(named[[k]])) return(named[[k]]); NULL }
+  # an argument given by name is not among the positionals, so the ones
+  # after it move up: `write_csv(x = df, "p")` has the path first
+  at <- function(i) if (length(pos) >= i) pos[[i]] else NULL
+  if (fn %in% table_writers) {
+    conn_named <- !is.null(first("conn", "con"))
+    name <- first("name")
+    list(data = first("value") %||% at(3L - conn_named - !is.null(name)),
+         path = name %||% at(2L - conn_named))
+  } else {
+    data <- first("x", "object", "dataset", "df", "data")
+    list(data = data %||% at(1L),
+         path = first("file", "path", "sink", "con") %||% at(if (is.null(data)) 2L else 1L))
+  }
+}
+
+# A path the code states: a literal, a variable bound to one, here()/file.path()/
+# paste0() of such parts. NULL otherwise.
+path_literal <- function(e, ctx) {
+  if (is.character(e) && length(e) == 1L) return(e)
+  if (is.symbol(e)) {
+    v <- ctx$strings[[as.character(e)]]
+    return(if (is.character(v) && length(v) == 1L) v else NULL)
+  }
+  if (!is.call(e)) return(NULL)
+  fn <- call_name(e)
+  if (is.na(fn) || !(fn %in% c(path_builders, "here"))) return(NULL)
+  parts <- lapply(call_args(e), path_literal, ctx = ctx)
+  if (any(vapply(parts, is.null, TRUE))) return(NULL)
+  if (fn %in% c("here", "file.path")) return(do.call(file.path, parts))
+  if (fn %in% c("paste0", "paste")) return(quiet(do.call(fn, c(parts, if (fn == "paste") list(sep = "") else list()))))
+  if (fn == "sprintf") return(quiet(do.call(sprintf, parts)))
+  NULL
+}
+
+# Two stated paths name the same file: relative ones against the root. A
+# trailing slash or a doubled one does not make a path another (a dataset
+# directory written as "out/pq" and read as "out/pq/"; normalizePath()
+# leaves a path that is not there as it was spelled).
+same_target <- function(a, b, root) {
+  norm <- function(p) {
+    p <- sub("^[.]/", "", p)
+    p <- gsub("(?<!:)/{2,}", "/", p, perl = TRUE)
+    p <- sub("(.)/+$", "\\1", p)
+    if (grepl("^([A-Za-z][A-Za-z0-9+.-]*://|/|~)", p)) normalizePath(p, mustWork = FALSE) else normalizePath(file.path(root, p), mustWork = FALSE)
+  }
+  identical(norm(a), norm(b))
+}
+
+# Record what a writer call writes: the path and the frame's columns (NULL
+# when they are unknown; write.csv() adds a row-name column unless told not
+# to, so its file has at least these). Piped (`df %>% write_csv(p)`) or not.
+record_sink <- function(e, fn, ctx, cols = NULL, lookup = is.null(cols)) {
+  if (!is.null(ctx$pkg_scope)) return(invisible(as_frame(cols)))
+  # the frame: a writer's data argument, else the first argument (by these
+  # names, then positional) that resolves to a frame (`dbWriteTable(con, "t", df)`)
+  if (lookup) {
+    if (fn %in% writers) {
+      sa <- sink_args(e, fn)
+      if (!is.null(sa$data)) cols <- frame_columns(sa$data, ctx, used = TRUE)
+    } else {
+      args <- call_args(e)
+      nms <- names(args) %||% rep("", length(args))
+      for (a in c(args[nms %in% sink_frame_args], args[!nzchar(nms)])) {
+        if (!(is.symbol(a) || is.call(a))) next
+        if (is.call(a) && identical(call_name(a), "function")) next
+        cols <- as_frame(frame_columns(a, ctx))
+        if (!is.null(cols)) break
+      }
+    }
+  }
+  cols <- as_frame(cols)
+  # for the data map: where the frame went
+  if (!is.null(cols) && !is_listed(cols)) record_step(ctx, e, cols, before = cols, fate = "written", fate_fn = fn)
+  # for a reader of the same path or table: what was written there
+  if (!(fn %in% writers)) return(invisible(cols))
+  key <- path_literal(sink_args(e, fn)$path, ctx)
+  if (is.null(key) || !nzchar(key)) return(invisible(cols))
+  known <- !is.null(cols) && !is_listed(cols)
+  # write.csv() and write.csv2() head the row names with an empty field,
+  # which a reader takes for a column (X); write.table() writes no such
+  # field, and read.table() takes its shorter header to mean that the first
+  # column holds the row names, so its readers get the frame's columns exactly
+  rn <- as.list(e)[["row.names"]]
+  no_row_names <- isFALSE(rn) || (is.symbol(rn) && identical(as.character(rn), "F"))
+  open <- known && (is_open(cols) || (fn %in% c("write.csv", "write.csv2") && !no_row_names))
+  ctx$sinks[[length(ctx$sinks) + 1L]] <- list(
+    file = ctx$file, line = ctx$line, fn = fn, path = key, table = fn %in% table_writers,
+    columns = if (known) as.character(cols) else NULL, open = open, call = one_line(e))
+  invisible(cols)
+}
+
+# The columns a reader gets from a writer of the same path: the one in this
+# file first (a script that writes an intermediate result and reads it back),
+# else a writer found in the project. Memoised per process, so r-colmap over
+# a hundred files parses a writer once, however many files read its output.
+colcheck_process <- new.env()
+from_sink <- function(s, ctx) {
+  cols <- with_source(s$columns, sprintf("%s (written by %s:%d)", s$path, relative_path(s$file, ctx$root), s$line),
+                      sprintf("sink:%s:%s:%d", s$path, s$file, s$line))
+  if (isTRUE(s$open)) attr(cols, "open") <- TRUE
+  cols
+}
+written_columns <- function(path_arg, ctx, table = FALSE) {
+  key <- path_literal(path_arg, ctx)
+  if (is.null(key) || !nzchar(key)) return(NULL)
+  here <- Filter(function(s) identical(s$table, table) && !is.null(s$columns) && (if (table) identical(s$path, key) else same_target(s$path, key, ctx$root)), ctx$sinks)
+  if (length(here)) return(from_sink(here[[length(here)]], ctx))
+  found <- project_sinks_for(key, ctx, table)
+  if (length(found)) from_sink(found[[length(found)]], ctx) else NULL
+}
+
+# Every writer of `key` in the project's other files, found through the
+# project index (sink_index); each writer file is checked once per process,
+# whichever reader asks. A writer's own readers ask in turn, so a chain of
+# scripts, each reading the previous one's output, resolves end to end
+# whatever its length and whichever file is checked first. A writer whose
+# check is already under way (checked_file() keeps the set: two scripts each
+# reading what the other writes) is not entered again, and the answer that
+# leaves it out is not memoised, since it is not the answer another reader
+# would get. The reader's check then depends on the writers' files and on
+# whatever they depend on, and on the set of writers itself (a new writer
+# of the same path in another file changes the answer).
+project_sinks_for <- function(key, ctx, table = FALSE) {
+  root <- normalizePath(ctx$root, mustWork = FALSE)
+  self <- normalizePath(ctx$file, mustWork = FALSE)
+  memo_key <- paste(root, if (table) "table" else "path", key, self)
+  memo <- colcheck_process$sinks[[memo_key]]
+  if (is.null(memo)) {
+    writers_of <- sink_writers_of(key, table, root, self)
+    sinks <- list()
+    deps <- character()
+    complete <- TRUE
+    for (f in writers_of) {
+      if (f %in% colcheck_process$in_progress) {
+        complete <- FALSE
+        deps <- union(deps, f)
+        next
+      }
+      res <- quiet(checked_file(f, root))
+      deps <- union(deps, c(f, attr(res, "deps")))
+      for (s in attr(res, "sinks") %||% list()) {
+        if (identical(s$table, table) && !is.null(s$columns) && (if (table) identical(s$path, key) else same_target(s$path, key, root))) sinks[[length(sinks) + 1L]] <- s
+      }
+    }
+    memo <- list(sinks = sinks, writers = writers_of, deps = deps)
+    if (complete) {
+      if (is.null(colcheck_process$sinks)) colcheck_process$sinks <- list()
+      colcheck_process$sinks[[memo_key]] <- memo
+    }
+  }
+  dep_on(ctx, memo$deps)
+  ctx$sink_lookups[[length(ctx$sink_lookups) + 1L]] <- list(key = key, table = table, writers = memo$writers)
+  memo$sinks
+}
+
+# The files that hold a writer of `key` (a stated path, or a table name),
+# other than `self`.
+sink_writers_of <- function(key, table, root, self) {
+  idx <- sink_index(root)
+  writers_of <- character()
+  for (k in names(idx)) {
+    hit <- if (table) startsWith(k, "table:") && identical(sub("^table:", "", k), key)
+      else startsWith(k, "path:") && same_target(sub("^path:", "", k), key, root)
+    if (hit) writers_of <- union(writers_of, idx[[k]])
+  }
+  setdiff(writers_of, self)
+}
+
+# path:<stated path> or table:<name> -> the project files holding a writer
+# call with that literal (a variable bound to a literal at top level counts),
+# from the files' facts: a parse of the files that changed since the cache
+# was written, a stat of the rest.
+sink_index <- function(root) {
+  root <- normalizePath(root, mustWork = FALSE)
+  memo <- colcheck_process$sink_index[[root]]
+  if (!is.null(memo)) return(memo)
+  st <- cache_state(root)
+  found <- project_r_files(root)
+  idx <- list()
+  for (f in c(found$r, found$rmd)) {
+    fx <- file_facts(f, st)
+    for (k in fx$writers) idx[[k]] <- union(idx[[k]], fx$file)
+  }
+  if (is.null(colcheck_process$sink_index)) colcheck_process$sink_index <- list()
+  colcheck_process$sink_index[[root]] <- idx
+  idx
+}
+
+# --- results cache ------------------------------------------------------------
+# A file's check depends on files: itself; the project's .colcheck.json,
+# .colcheck/schemas.json, DESCRIPTION, renv.lock and _targets.R; the data
+# files it reads; the helper files whose functions it follows, and the names
+# every helper file defines (a new definition anywhere can resolve a call
+# that was not followed); the files whose writers resolve its readers, and
+# which files those are; the DESCRIPTION of each installed package whose code
+# it reads. The walk notes each one (dep_on()) and the result is stored
+# with their modification times and sizes; checked_file() serves it again
+# while all of them hold (entry_valid()), else checks the file again. One
+# file per project root under tools::R_user_dir("r-lsp", "cache")
+# (R_USER_CACHE_DIR moves it), written whole and atomically at the end of
+# colcheck_files(), dropped whole when this library's own text, R's version
+# or R_LSP_COLCHECK_PACKAGES changes. R_LSP_COLCHECK_CACHE=off reads and
+# writes nothing. The same file keeps the facts of each project file that
+# the project-wide indexes need (the functions it defines, the paths it
+# writes and reads, the targets it loads and defines, the names it calls),
+# so an index over a hundred files costs a stat per file, not a parse.
+
+cache_enabled <- function() !(tolower(Sys.getenv("R_LSP_COLCHECK_CACHE", "on")) %in% c("off", "0", "false", "no"))
+
+# this library's own file, for the version stamp (every entry script defines
+# script_dir before sourcing it)
+colcheck_lib_path <- local({
+  d <- get0("script_dir", inherits = TRUE)
+  if (is.character(d) && length(d) == 1L && file.exists(file.path(d, "colcheck-lib.R"))) normalizePath(file.path(d, "colcheck-lib.R")) else NA_character_
+})
+cache_version <- function() {
+  v <- colcheck_process$cache_version
+  if (!is.null(v)) return(v)
+  md5 <- if (is.na(colcheck_lib_path)) NA_character_ else unname(quiet(tools::md5sum(colcheck_lib_path), NA_character_))
+  v <- if (is.na(md5)) NA_character_ else paste(md5, R.version$major, R.version$minor, Sys.getenv("R_LSP_COLCHECK_PACKAGES", "true"))
+  colcheck_process$cache_version <- v
+  v
+}
+
+# a short hash of a string (djb2, 31 bits) for the cache file's name; the
+# root is stored in the file and checked on load, so a collision costs a
+# re-check, never a wrong answer
+str_hash <- function(s) {
+  h <- 5381
+  for (b in utf8ToInt(enc2utf8(s))) h <- (h * 33 + b) %% 2147483647
+  sprintf("%08x", as.integer(h))
+}
+cache_file <- function(root) {
+  dir <- quiet(tools::R_user_dir("r-lsp", "cache"))
+  if (!is.character(dir) || length(dir) != 1L || !nzchar(dir)) return(NULL)
+  file.path(dir, "colcheck", sprintf("%s-%s.rds", substr(gsub("[^A-Za-z0-9._-]", "_", basename(root)), 1L, 40L), str_hash(root)))
+}
+
+# "mtime:size" per path, named by path ("mtime:d" for a directory, "missing"
+# when nothing is there: a file that appears later is a change too)
+file_stamp <- function(paths) {
+  paths <- as.character(paths)
+  if (!length(paths)) return(setNames(character(), character()))
+  info <- file.info(paths, extra_cols = FALSE)
+  m <- as.numeric(info$mtime)
+  isdir <- info$isdir %in% TRUE
+  out <- ifelse(is.na(m), "missing", ifelse(isdir, sprintf("%.6f:d", m), sprintf("%.6f:%.0f", m, info$size)))
+  names(out) <- paths
+  out
+}
+
+# The cache of one project root, loaded once per process: entries (path ->
+# deps, helpers, sink_lookups, result) and facts (path -> file_facts()).
+cache_state <- function(root) {
+  root <- normalizePath(root, mustWork = FALSE)
+  st <- colcheck_process$cache[[root]]
+  if (!is.null(st)) return(st)
+  st <- new.env(parent = emptyenv())
+  st$root <- root
+  st$path <- cache_file(root)
+  st$entries <- list()
+  st$facts <- list()
+  st$dirty <- FALSE
+  if (cache_enabled() && !is.null(st$path) && !is.na(cache_version()) && file.exists(st$path)) {
+    saved <- quiet(readRDS(st$path))
+    if (is.list(saved) && identical(saved$version, cache_version()) && identical(saved$root, root)) {
+      if (is.list(saved$entries)) st$entries <- saved$entries
+      if (is.list(saved$facts)) st$facts <- saved$facts
+    }
+  }
+  if (is.null(colcheck_process$cache)) colcheck_process$cache <- list()
+  colcheck_process$cache[[root]] <- st
+  st
+}
+
+# Write what changed, one file per root, whole and atomically (two processes
+# writing at once: the later one's file stands, the other's additions are
+# checked again next time). Entries of files that are gone are dropped.
+cache_flush <- function() {
+  if (!cache_enabled() || is.na(cache_version())) return(invisible())
+  for (st in colcheck_process$cache %||% list()) {
+    if (!isTRUE(st$dirty) || is.null(st$path)) next
+    st$entries <- st$entries[file.exists(names(st$entries) %||% character())]
+    st$facts <- st$facts[file.exists(names(st$facts) %||% character())]
+    quiet({
+      dir.create(dirname(st$path), recursive = TRUE, showWarnings = FALSE)
+      tmp <- tempfile(pattern = "colcheck-", tmpdir = dirname(st$path), fileext = ".rds")
+      saveRDS(list(version = cache_version(), root = st$root, saved = Sys.time(), entries = st$entries, facts = st$facts), tmp)
+      if (!file.rename(tmp, st$path)) unlink(tmp)
+    })
+    st$dirty <- FALSE
+  }
+  invisible()
+}
+
+# Note files the current check depends on.
+dep_on <- function(ctx, paths) {
+  paths <- as.character(paths)
+  paths <- paths[!is.na(paths) & nzchar(paths)]
+  if (length(paths)) ctx$deps <- union(ctx$deps, normalizePath(paths, mustWork = FALSE))
+  invisible()
+}
+
+# The helper files a check follows functions from: R/ of a package (listed
+# afresh, so a new file counts), the files it source()s (fixed while the
+# file itself is unchanged) and the R files under the directories its
+# tar_source() names (listed afresh too), and the names each defines.
+helper_files <- function(pkg, sourced, root, self) {
+  dirs <- sourced[dir.exists(sourced)]
+  files <- c(if (isTRUE(pkg)) list.files(file.path(root, "R"), pattern = "[.][rR]$", full.names = TRUE),
+             setdiff(sourced, dirs),
+             unlist(lapply(dirs, list.files, pattern = "[.][rR]$", recursive = TRUE, full.names = TRUE)))
+  setdiff(unique(normalizePath(files, mustWork = FALSE)), self)
+}
+helper_signature <- function(files, st) {
+  files <- sort(files)
+  key <- paste(files, collapse = "\n")   # once per helper set per process (a package: every file shares one)
+  hit <- st$sig_memo[[key]]
+  if (!is.null(hit)) return(hit)
+  sig <- paste(vapply(files, function(f) paste0(f, "=", paste(file_facts(f, st)$defs, collapse = ",")), ""), collapse = ";")
+  if (is.null(st$sig_memo)) st$sig_memo <- list()
+  st$sig_memo[[key]] <- sig
+  sig
+}
+
+# A stored result still holds: every file it depended on is as it was, the
+# helper files define the same names, and the same files write what it reads.
+entry_valid <- function(entry, st) {
+  deps <- entry$deps %||% character()
+  if (!length(deps) || !identical(unname(file_stamp(names(deps))), unname(deps))) return(FALSE)
+  h <- entry$helpers
+  if (!is.null(h) && !identical(helper_signature(helper_files(h$pkg, h$sourced, st$root, entry$file), st), h$sig)) return(FALSE)
+  for (s in entry$sink_lookups %||% list()) {
+    if (!identical(sort(sink_writers_of(s$key, s$table, st$root, entry$file)), sort(s$writers))) return(FALSE)
+  }
+  TRUE
+}
+
+# A file's check: the process memo first, then the cache while the files the
+# check depended on are unchanged, else colcheck_file(). An error in the
+# check propagates (colcheck_files() turns it into a finding) and nothing is
+# stored. `fresh` checks this file whatever the cache holds (the lookups its
+# check makes still use the cache) and stores the new result.
+checked_file <- function(f, root = NULL, fresh = FALSE) {
+  key <- normalizePath(f, mustWork = FALSE)
+  hit <- colcheck_process$results[[key]]
+  if (!is.null(hit) && !(fresh && isTRUE(attr(hit, "from_cache")))) return(hit)
+  root <- normalizePath(root %||% colcheck_root(f), mustWork = FALSE)
+  st <- if (cache_enabled() && !is.na(cache_version())) cache_state(root) else NULL
+  if (is.null(colcheck_process$results)) colcheck_process$results <- list()
+  if (!fresh && !is.null(st)) {
+    entry <- st$entries[[key]]
+    if (!is.null(entry) && entry_valid(entry, st)) {
+      res <- entry$result
+      attr(res, "from_cache") <- TRUE
+      colcheck_process$results[[key]] <- res
+      return(res)
+    }
+  }
+  # checked under its normalized path, so the stored result (its findings'
+  # and sinks' file fields) reads the same whichever spelling asked for it;
+  # in progress meanwhile, so a writer that reads this file's output does
+  # not enter it again (project_sinks_for)
+  colcheck_process$in_progress <- c(colcheck_process$in_progress, key)
+  on.exit(colcheck_process$in_progress <- setdiff(colcheck_process$in_progress, key), add = TRUE)
+  # the file's own stamp is taken before the check: a file rewritten while
+  # it is checked is stored as it was read, so the next look sees a change
+  # (the hooks' ledger makes the same promise)
+  self_stamp <- unname(file_stamp(key))
+  res <- colcheck_file(key, root)
+  if (!is.null(st) && length(attr(res, "deps"))) {
+    deps <- file_stamp(attr(res, "deps"))
+    if (key %in% names(deps)) deps[[key]] <- self_stamp
+    st$entries[[key]] <- list(file = key, deps = deps, helpers = attr(res, "helpers"),
+                              sink_lookups = attr(res, "sink_lookups"), result = res)
+    st$dirty <- TRUE
+  }
+  colcheck_process$results[[key]] <- res
+  res
+}
+
+# What a project file states, for the indexes: the functions it defines, the
+# paths and tables it writes (as sink_index keys) and reads, the targets it
+# loads (tar_read, tar_load) and defines (tar_target), the names it calls.
+# From a parse alone, no check; kept with the file's stamp.
+file_facts <- function(f, st) {
+  f <- normalizePath(f, mustWork = FALSE)
+  stamp <- unname(file_stamp(f))
+  hit <- st$facts[[f]]
+  if (!is.null(hit) && identical(hit$stamp, stamp)) return(hit)
+  fx <- list(file = f, stamp = stamp, defs = character(), writers = character(), readers = character(),
+             targets = character(), tar_defs = character(), calls = character())
+  parsed <- quiet(parse_r_source(f))
+  if (!is.null(parsed)) {
+    fx$defs <- names(function_defs(parsed$exprs, f)) %||% character()
+    strings <- new.env(parent = emptyenv())
+    lit <- function(p) {
+      if (is.character(p) && length(p) == 1L) p
+      else if (is.symbol(p)) get0(as.character(p), envir = strings, inherits = FALSE)
+      else if (is.call(p)) path_literal(p, list(strings = as.list(strings)))
+      else NULL
+    }
+    add <- function(what, v) if (is.character(v) && length(v) == 1L && nzchar(v)) fx[[what]] <<- c(fx[[what]], v)
+    note <- function(e) {
+      if (!is.call(e)) return(invisible())
+      fn <- call_name(e)
+      # `df %>% write_csv(p)`: the writer's first argument is the pipe's left
+      # side, so its path is where sink_args() looks for it
+      if (!is.na(fn) && fn %in% c("%>%", "%<>%", "%T>%") && length(e) == 3L) {
+        rhs <- e[[3L]]
+        if (is.symbol(rhs)) rhs <- as.call(list(rhs))
+        if (is.call(rhs)) note(pipe_into(rhs, e[[2L]]))
+        note(e[[2L]])
+        return(invisible())
+      }
+      if (!is.na(fn)) {
+        if (fn %in% c("<-", "=") && length(e) == 3L && is.symbol(e[[2L]]) && is.character(e[[3L]]) && length(e[[3L]]) == 1L) {
+          assign(as.character(e[[2L]]), e[[3L]], envir = strings)
+        }
+        if (grepl("^[A-Za-z.][A-Za-z0-9._]*$", fn)) fx$calls <<- c(fx$calls, fn)
+        if (fn %in% writers) {
+          p <- lit(sink_args(e, fn)$path)
+          if (is.character(p) && length(p) == 1L && nzchar(p)) add("writers", paste0(if (fn %in% table_writers) "table:" else "path:", p))
+        }
+        if (fn %in% readers) {
+          p <- lit(reader_path_arg(e))
+          if (is.character(p) && length(p) == 1L && nzchar(p)) add("readers", paste0("path:", p))
+        }
+        if (fn %in% table_readers && length(e) >= 3L) {
+          p <- lit(e[[3L]])
+          if (is.character(p) && length(p) == 1L && nzchar(p)) add("readers", paste0("table:", p))
+        }
+        if (fn %in% c("tar_read", "tar_read_raw", "tar_load", "tar_load_raw") && length(e) >= 2L) {
+          spec <- e[[2L]]
+          nms <- if (is.call(spec) && identical(call_name(spec), "c")) lapply(call_args(spec), target_name) else list(target_name(spec))
+          for (nm in nms) add("targets", nm)
+        }
+        if (fn %in% c("tar_target", "tar_target_raw", "tar_file_read") && length(e) >= 2L) add("tar_defs", target_name(e[[2L]]))
+      }
+      for (a in call_args(e)) note(a)
+    }
+    for (e in parsed$exprs) note(e)
+    for (k in c("writers", "readers", "targets", "tar_defs", "calls")) fx[[k]] <- unique(fx[[k]])
+  }
+  st$facts[[f]] <- fx
+  st$dirty <- TRUE
+  fx
+}
+
+# The project files that depend on `file`: they call a function it defines,
+# read a path or table it writes, or load a target it defines (the hooks
+# check these after an edit, for what the edit broke elsewhere). From the
+# facts, so a parse of the changed files only. Named by file, each with
+# the reasons.
+dependents_of <- function(file, root) {
+  root <- normalizePath(root, mustWork = FALSE)
+  self <- normalizePath(file, mustWork = FALSE)
+  st <- cache_state(root)
+  own <- file_facts(self, st)
+  if (!length(own$defs) && !length(own$writers) && !length(own$tar_defs)) return(list())
+  found <- project_r_files(root)
+  out <- list()
+  for (f in setdiff(normalizePath(c(found$r, found$rmd), mustWork = FALSE), self)) {
+    fx <- file_facts(f, st)
+    why <- character()
+    calls <- intersect(fx$calls, own$defs)
+    if (length(calls)) why <- c(why, sprintf("calls %s()", calls))
+    for (w in own$writers) for (r in fx$readers) {
+      same <- if (startsWith(w, "table:")) identical(w, r) else startsWith(r, "path:") && same_target(sub("^path:", "", w), sub("^path:", "", r), root)
+      if (same) why <- c(why, sprintf("reads %s", sub("^(path|table):", "", w)))
+    }
+    t <- intersect(fx$targets, own$tar_defs)
+    if (length(t)) why <- c(why, sprintf("loads target %s", t))
+    if (length(why)) out[[f]] <- unique(why)
+  }
+  out
+}
+
+# --- targets pipelines ---------------------------------------------------------
+# In _targets.R, `tar_target(name, command)` binds a target to the columns of
+# its command, as an assignment would (tar_file_read(name, path, read(!!.x))
+# reads the path). In any script or Rmd, `tar_read(name)` is the target's
+# frame and `tar_load(name)` binds it, read from the project's _targets.R
+# once per process.
+target_name <- function(x) if (is.symbol(x)) as.character(x) else if (is.character(x) && length(x) == 1L) x else NULL
+
+walk_tar_target <- function(e, fn, ctx) {
+  args <- call_args(e)
+  nms <- names(args) %||% rep("", length(args))
+  pos <- args[!nzchar(nms)]
+  nm <- target_name(if ("name" %in% nms) args[["name"]] else if (length(pos)) pos[[1L]] else NULL)
+  if (fn == "tar_file_read") {
+    path <- if ("path" %in% nms) args[["path"]] else if (length(pos) >= 2L) pos[[2L]] else NULL
+    cmd <- if ("read" %in% nms) args[["read"]] else if (length(pos) >= 3L) pos[[3L]] else NULL
+    # `read_csv(!!.x)`: .x is the path; `!!.x` parses as !(!.x)
+    put_path <- function(x) {
+      if (is.call(x) && identical(call_name(x), "!") && length(x) == 2L && is.call(x[[2L]]) && identical(call_name(x[[2L]]), "!") &&
+          identical(x[[2L]][[2L]], as.name(".x"))) return(path)
+      if (is.call(x)) for (i in seq_along(x)[-1L]) if (!is.null(x[[i]])) x[[i]] <- put_path(x[[i]])
+      x
+    }
+    cmd <- if (is.null(cmd) || is.null(path)) NULL else put_path(cmd)
+  } else {
+    cmd <- if ("command" %in% nms) args[["command"]] else if (length(pos) >= 2L) pos[[2L]] else NULL
+  }
+  if (is.null(nm) || is.null(cmd)) {
+    for (p in args) if (is.call(p)) walk_expr(p, ctx)
+    return(invisible())
+  }
+  # the target's own lines inside the list() that holds the pipeline's
+  # targets: from the line that defines it to the line its call ends on, so
+  # that a `# cols:` comment on one of them is this target's and not the
+  # next one's, and a step or a finding is pinned within them
+  saved_line <- ctx$line
+  saved_end <- ctx$line_end
+  span <- target_span(ctx, nm, fn)
+  ctx$line <- span[[1L]]
+  ctx$line_end <- span[[2L]]
+  walk_expr(call("<-", as.name(nm), cmd), ctx)
+  cols <- ctx$frames[[nm]]
+  if (!is.null(cols)) {
+    cols <- keep_source(structure(as.character(cols), groups = attr(cols, "groups")), cols)
+    cols <- with_source(cols, sprintf("target %s (%s:%d)", nm, relative_path(ctx$file, ctx$root), ctx$line), paste0("target:", nm))
+    ctx$frames[[nm]] <- cols
+  }
+  ctx$targets[[nm]] <- list(columns = if (is.null(cols)) NULL else as.character(cols), open = is_open(cols), line = ctx$line, file = ctx$file)
+  ctx$line <- saved_line
+  ctx$line_end <- saved_end
+  invisible()
+}
+
+# The lines of the call that defines target `nm`, within the statement the
+# walker is in: the first line whose code names the target as the call's
+# own (`tar_target(NAME,`, `tar_target_raw("NAME",`, `name = NAME`), since
+# an earlier target's command may mention the name (`nrow(summed)`); when no
+# line does (a computed name), the first line that mentions it. The call
+# ends where its parentheses balance, counted from the `tar_target(` at or
+# before that line.
+target_span <- function(ctx, nm, fn) {
+  if (is.null(ctx$line) || is.na(ctx$line)) return(c(ctx$line, ctx$line_end))
+  txt <- file_lines(ctx, ctx$file)
+  to <- ctx$line_end
+  if (is.null(to) || is.na(to) || to < ctx$line) to <- ctx$line
+  rng <- seq.int(ctx$line, min(to, length(txt)))
+  if (!length(rng) || rng[[1L]] > length(txt)) return(c(ctx$line, to))
+  code <- sub("#.*$", "", txt[rng])
+  q <- "[\"'`]?"
+  own <- sprintf("\\b%s\\s*\\(\\s*%s\\Q%s\\E%s\\s*,|\\bname\\s*=\\s*%s\\Q%s\\E%s\\s*(,|\\)|$)", fn, q, nm, q, q, nm, q)
+  hit <- rng[grepl(own, code, perl = TRUE)]
+  from <- if (length(hit)) hit[[1L]] else pin_line(ctx, nm)
+  opens <- sprintf("\\b%s\\s*\\(", fn)
+  before <- rng[rng <= from]
+  starts <- before[grepl(opens, code[seq_along(before)], perl = TRUE)]
+  start <- if (length(starts)) starts[[length(starts)]] else from
+  depth <- 0L
+  seen <- FALSE
+  end <- to
+  for (ln in seq.int(start, max(rng))) {
+    s <- code[[ln - rng[[1L]] + 1L]]
+    if (ln == start) {
+      at <- regexpr(opens, s, perl = TRUE)
+      if (at > 0L) s <- substr(s, at, nchar(s))
+    }
+    for (ch in strsplit(s, "")[[1L]]) {
+      if (ch == "(") { depth <- depth + 1L; seen <- TRUE }
+      else if (ch == ")") depth <- depth - 1L
+      if (seen && depth <= 0L) break
+    }
+    if (seen && depth <= 0L) { end <- ln; break }
+  }
+  c(from, max(from, end))
+}
+
+# The columns of target `x` (a name or a string): from this file's own
+# tar_target() calls, else from the project's _targets.R.
+target_columns <- function(x, ctx) {
+  nm <- target_name(x)
+  if (is.null(nm)) return(NULL)
+  own <- ctx$frames[[nm]]
+  if (!is.null(own) && !is.null(ctx$targets[[nm]])) return(own)
+  root <- normalizePath(ctx$root, mustWork = FALSE)
+  memo <- colcheck_process$targets[[root]]
+  if (is.null(memo)) {
+    tf <- file.path(root, "_targets.R")
+    self <- normalizePath(ctx$file, mustWork = FALSE)
+    if (!file.exists(tf)) {
+      memo <- list(targets = list(), deps = character())
+    } else if (identical(normalizePath(tf), self) || isTRUE(colcheck_process$in_targets)) {
+      return(NULL)   # _targets.R itself, or a file its commands read: nothing to memoise
+    } else {
+      colcheck_process$in_targets <- TRUE
+      on.exit(colcheck_process$in_targets <- FALSE, add = TRUE)
+      res <- quiet(checked_file(tf, root))
+      memo <- list(targets = attr(res, "targets") %||% list(), deps = c(tf, attr(res, "deps")))
+    }
+    if (is.null(colcheck_process$targets)) colcheck_process$targets <- list()
+    colcheck_process$targets[[root]] <- memo
+  }
+  # the reader's check depends on _targets.R and on what its commands read
+  dep_on(ctx, memo$deps)
+  t <- memo$targets[[nm]]
+  if (is.null(t) || is.null(t$columns)) return(NULL)
+  cols <- with_source(t$columns, sprintf("target %s (%s:%d)", nm, relative_path(t$file, ctx$root), t$line), paste0("target:", nm))
+  if (isTRUE(t$open)) attr(cols, "open") <- TRUE
+  cols
+}
+
+# tar_load(name), tar_load(c(a, b)), tar_load_raw("name"): the targets become frames.
+load_targets <- function(e, ctx) {
+  args <- call_args(e)
+  if (!length(args)) return(invisible())
+  spec <- args[[1L]]
+  names_ <- if (is.call(spec) && identical(call_name(spec), "c")) lapply(call_args(spec), target_name) else list(target_name(spec))
+  for (nm in Filter(Negate(is.null), names_)) {
+    cols <- target_columns(nm, ctx)
+    ctx$variables <- union(ctx$variables, nm)
+    if (is.null(cols)) { ctx$frames[[nm]] <- NULL; ctx$unknown_frames <- union(ctx$unknown_frames, nm) }
+    else { ctx$frames[[nm]] <- cols; ctx$unknown_frames <- setdiff(ctx$unknown_frames, nm) }
+  }
+  invisible()
 }
 
 not_loaders <- c("bind_rows", "bind_cols", "rbind", "cbind", "merge", "rbindlist", "tryCatch", "try",
@@ -800,8 +1507,8 @@ mark_used <- function(nm, ctx) {
 # is passed to a function defined in the project, the parameter is bound to
 # that column set, the body is checked (with its own lines), and the columns
 # of the body's last expression become the columns of the call. Functions
-# come from the file itself, files it source()s, and, in an R package, every
-# file under R/.
+# come from the file itself, files it source()s or tar_source()s, and, in an
+# R package, every file under R/.
 
 function_defs <- function(exprs, file) {
   out <- list()
@@ -816,29 +1523,56 @@ function_defs <- function(exprs, file) {
 
 source_calls <- function(e, acc = character()) {
   if (!is.call(e)) return(acc)
-  if (call_name(e) %in% c("source", "sys.source") && length(e) >= 2L && is.character(e[[2L]])) acc <- c(acc, e[[2L]])
+  fn <- call_name(e)
+  if (!is.na(fn) && fn %in% c("source", "sys.source") && length(e) >= 2L && is.character(e[[2L]])) acc <- c(acc, e[[2L]])
+  # targets' tar_source(): the R files under R/ by default, else the files
+  # and directories it names (a literal, or c() of literals); a directory
+  # stands for the R files under it, which helper_files() lists afresh
+  if (identical(fn, "tar_source")) {
+    args <- call_args(e)
+    nms <- names(args) %||% rep("", length(args))
+    files <- if ("files" %in% nms) args[["files"]] else if (any(!nzchar(nms))) args[!nzchar(nms)][[1L]] else "R"
+    parts <- if (is.call(files) && identical(call_name(files), "c")) call_args(files) else list(files)
+    for (p in parts) if (is.character(p)) acc <- c(acc, p)
+  }
   for (p in call_args(e)) if (is.call(p)) acc <- source_calls(p, acc)
   acc
 }
 
 project_functions <- function(file, exprs, ctx) {
   self <- normalizePath(file, mustWork = FALSE)
-  others <- character()
-  if (file.exists(file.path(ctx$root, "DESCRIPTION"))) {
-    others <- list.files(file.path(ctx$root, "R"), pattern = "[.][rR]$", full.names = TRUE)
-  }
+  pkg <- file.exists(file.path(ctx$root, "DESCRIPTION"))
+  sourced <- character()
   for (e in exprs) for (s in source_calls(e)) {
     p <- resolve_path(s, ctx)
-    if (!is.null(p)) others <- c(others, p)
+    if (!is.null(p)) sourced <- c(sourced, p)
   }
+  files <- helper_files(pkg, sourced, ctx$root, self)
   defs <- list()
-  for (f in setdiff(unique(normalizePath(others, mustWork = FALSE)), self)) {
-    ex <- quiet(parse(f, keep.source = TRUE))
-    if (!is.null(ex)) defs[names(function_defs(ex, f))] <- function_defs(ex, f)
+  for (f in files) {
+    fd <- helper_defs(f)
+    defs[names(fd)] <- fd
   }
+  # for the results cache: which files were looked at and the names they define
+  ctx$helpers <- list(pkg = pkg, sourced = unique(normalizePath(sourced, mustWork = FALSE)), sig = helper_signature(files, cache_state(ctx$root)))
   own <- function_defs(exprs, file)
   defs[names(own)] <- own
   defs
+}
+
+# The function definitions of one helper file, parsed once per process while
+# the file's mtime and size hold (r-colmap checks every file of a package,
+# and each check used to parse all of R/ again).
+helper_defs <- function(f) {
+  info <- file.info(f)
+  key <- sprintf("%s|%s|%s", f, format(info$mtime, "%Y%m%d%H%M%OS6"), info$size)
+  hit <- colcheck_process$helper_defs[[key]]
+  if (!is.null(hit)) return(hit)
+  ex <- quiet(parse(f, keep.source = TRUE, encoding = "UTF-8"))
+  fd <- if (is.null(ex)) list() else function_defs(ex, f)
+  if (is.null(colcheck_process$helper_defs)) colcheck_process$helper_defs <- list()
+  colcheck_process$helper_defs[[key]] <- fd
+  fd
 }
 
 # Statements of a `{` block, each at its own line.
@@ -894,8 +1628,9 @@ package_skip <- c("base", "stats", "utils", "methods", "graphics", "grDevices", 
 # The project's renv library first, so in-house packages are found and
 # judged at the versions the project pins. Once per process.
 use_project_library <- function(root) {
-  if (isTRUE(getOption("r_lsp.colcheck_library_set"))) return(invisible())
-  options(r_lsp.colcheck_library_set = TRUE)
+  done <- getOption("r_lsp.colcheck_library_set", character())
+  if (isTRUE(done) || root %in% done) return(invisible())
+  options(r_lsp.colcheck_library_set = c(if (is.character(done)) done, root))
   if (!file.exists(file.path(root, "renv", "activate.R")) || !requireNamespace("renv", quietly = TRUE)) return(invisible())
   lib <- quiet(renv::paths$library(project = root))
   if (is.character(lib) && length(lib) == 1L && dir.exists(lib)) .libPaths(c(lib, .libPaths()))
@@ -919,6 +1654,7 @@ package_function <- function(pkg, fn, ctx, exported_only = TRUE) {
     if (is.function(f) && !is.primitive(f)) {
       def <- list(fn = as.call(list(as.name("function"), formals(f), body(f))),
                   file = paste0(pkg, "::", fn), pkg = pkg)
+      dep_on(ctx, file.path(quiet(find.package(pkg, quiet = TRUE), character()), "DESCRIPTION"))
     }
   }
   ctx$package_defs[[key]] <- def %||% FALSE
@@ -947,7 +1683,11 @@ lookup_function <- function(e, fn, ctx) {
     return(package_function(as.character(head[[2L]]), fn, ctx, exported_only = identical(as.character(head[[1L]]), "::")))
   }
   if (!is.null(ctx$pkg_scope)) return(package_function(ctx$pkg_scope, fn, ctx, exported_only = FALSE))
-  if (!is.null(ctx$functions[[fn]])) return(ctx$functions[[fn]])
+  if (!is.null(ctx$functions[[fn]])) {
+    def <- ctx$functions[[fn]]
+    if (is.null(def$pkg)) dep_on(ctx, def$file)   # the helper file whose code is followed
+    return(def)
+  }
   for (pkg in ctx$packages) {
     def <- package_function(pkg, fn, ctx)
     if (!is.null(def)) return(def)
@@ -960,7 +1700,9 @@ negative_expectations <- c("expect_error", "expect_warning", "expect_condition",
                            "expect_snapshot_warning", "expect_failure")
 
 call_user_function <- function(e, name, ctx, def = lookup_function(e, name, ctx), shown = e) {
-  if (is.null(def) || def$file %in% ctx$call_stack || length(ctx$call_stack) >= 4L) return(NULL)
+  # the stack holds "file#name": a helper calling its sibling in the same
+  # file is followed; a function calling itself is not
+  if (is.null(def) || paste0(def$file, "#", name) %in% ctx$call_stack || length(ctx$call_stack) >= 4L) return(NULL)
   if (isTRUE(ctx$in_negative_test)) return(NULL)
   saved <- list(frames = ctx$frames, variables = ctx$variables, unknown = ctx$unknown_frames,
                 line = ctx$line, line_end = ctx$line_end, file = ctx$file, call_stack = ctx$call_stack,
@@ -990,7 +1732,7 @@ call_user_function <- function(e, name, ctx, def = lookup_function(e, name, ctx)
   # Columns that came out of a package function: say so, since the function
   # may have dropped or renamed what the cached source had.
   if (!is.null(result) && !is.null(def$pkg) && is.null(saved$pkg_scope)) {
-    attr(result, "source") <- sprintf("%s() (read from its code)", def$file)
+    result <- with_source(result, sprintf("%s() (read from its code)", def$file), paste0("package:", def$file))
   }
   # A project function that gave no column set for a frame that went in: a
   # stop at the call site, naming the step inside the body where the columns
@@ -1043,7 +1785,12 @@ follow_function <- function(e, def, ctx) {
   }
   ctx$call_sites <- c(ctx$call_sites, sprintf("%s:%s", relative_path(ctx$file, ctx$root), ctx$line))
   ctx$file <- def$file
-  ctx$call_stack <- c(ctx$call_stack, def$file)
+  # a body without braces sets no line of its own: the definition's lines (its srcref) serve
+  if (length(fdef) >= 4L && inherits(fdef[[4L]], "srcref")) {
+    ctx$line <- as.integer(fdef[[4L]][[1L]])
+    ctx$line_end <- as.integer(fdef[[4L]][[3L]])
+  }
+  ctx$call_stack <- c(ctx$call_stack, paste0(def$file, "#", call_name(e)))
   ctx$in_function <- TRUE
   ctx$pkg_scope <- def$pkg
   body_columns(fdef[[3L]], ctx)
@@ -1087,11 +1834,14 @@ pipe_into <- function(rhs, lhs_symbol) {
 
 # The header line of a delimited file: `sep` NULL to guess it, "" for
 # whitespace (read.table's default); `skip` lines and `comment` lines
-# before it are passed over as the readers do.
-header_delim <- function(path, sep = NULL, skip = 0L, comment = "") {
+# before it are passed over as the readers do. `trim_ws` FALSE keeps the
+# blanks around a name (`region, year` gives " year"), as read_delim() does
+# unless told to trim; every other delimited reader trims them.
+header_delim <- function(path, sep = NULL, skip = 0L, comment = "", trim_ws = TRUE) {
   if (!identical(sep, "") && requireNamespace("readr", quietly = TRUE)) {
-    df <- quiet(if (is.null(sep)) readr::read_csv(path, n_max = 0, skip = skip, comment = comment, show_col_types = FALSE, progress = FALSE)
-                else readr::read_delim(path, delim = sep, n_max = 0, skip = skip, comment = comment, show_col_types = FALSE, progress = FALSE))
+    # delim = NULL makes readr guess (readr 2.0 and later), as fread() and
+    # vroom() do at run time; read_csv() itself is always a comma
+    df <- quiet(readr::read_delim(path, delim = sep, n_max = 0, skip = skip, comment = comment, trim_ws = trim_ws, show_col_types = FALSE, progress = FALSE))
     if (!is.null(df)) return(names(df))
   }
   lines <- quiet(readLines(path, n = skip + 200L, warn = FALSE))
@@ -1107,13 +1857,14 @@ header_delim <- function(path, sep = NULL, skip = 0L, comment = "") {
                 lengths(regmatches(line, gregexpr(",", line))))
     sep <- c("\t", ";", ",")[which.max(counts)]
   }
-  nm <- quiet(scan(text = line, what = "", sep = sep, quiet = TRUE, strip.white = TRUE))
+  nm <- quiet(scan(text = line, what = "", sep = sep, quiet = TRUE, strip.white = trim_ws))
   if (is.null(nm)) return(NULL)
   gsub('^"|"$', "", nm)
 }
 
 # `opts`: the reader arguments that decide where the header is (sep, skip,
-# comment; sheet, range for a workbook), as reader_columns() read them.
+# comment; sheet, range for a workbook) and whether its names are trimmed
+# (trim_ws), as reader_columns() read them.
 columns_of_file <- function(path, reader, opts = list()) {
   if (!file.exists(path)) return(NULL)
   ext <- tolower(tools::file_ext(path))
@@ -1127,8 +1878,11 @@ columns_of_file <- function(path, reader, opts = list()) {
   delim_readers <- c("read_csv", "read.csv", "fread", "vroom", "read_delim", "read.delim", "read_tsv",
                      "read_csv2", "read.csv2", "read.table")
   if (reader %in% delim_readers || ext %in% c("csv", "tsv", "txt", "dat")) {
-    sep <- opts$sep %||% switch(reader, read_tsv = "\t", read.delim = "\t", read_csv2 = ";", read.csv2 = ";", read.table = "", NULL)
-    return(header_delim(path, sep, skip = opts$skip %||% 0L, comment = opts$comment %||% ""))
+    # the separator the reader uses: fixed for most, guessed from the file
+    # by fread(), vroom() and read_delim() without delim= (NULL here)
+    sep <- opts$sep %||% switch(reader, read_csv = ",", read.csv = ",", read_tsv = "\t", read.delim = "\t", read_csv2 = ";", read.csv2 = ";",
+                                read.table = "", fread = NULL, vroom = NULL, read_delim = NULL, ",")
+    return(header_delim(path, sep, skip = opts$skip %||% 0L, comment = opts$comment %||% "", trim_ws = opts$trim_ws %||% TRUE))
   }
   if (ext %in% c("parquet", "feather", "arrow") || reader %in% c("read_parquet", "read_feather", "open_dataset")) {
     if (!requireNamespace("arrow", quietly = TRUE)) return(NULL)
@@ -1242,8 +1996,11 @@ fread_picks <- function(v, cols, ctx) {
 
 # The column names a reader call gives for the file at `path`, its
 # arguments applied (see above); NULL when the file cannot be read or an
-# argument cannot be.
-reader_columns <- function(path, e, fn, ctx) {
+# argument cannot be. `header` stands in for the file's header when the
+# file is not there to read: the columns a project script writes to the
+# path, or a cached schema. The arguments apply to it as they would to the
+# file, and its source (the writer, the schema) stays the result's.
+reader_columns <- function(path, e, fn, ctx, header = NULL) {
   args <- reader_args(e, fn)
   fam <- reader_family(fn)
   arg <- function(nm) if (nm %in% names(args)) args[[nm]] else NULL
@@ -1251,7 +2008,10 @@ reader_columns <- function(path, e, fn, ctx) {
     note_stop(ctx, e, fn, NULL, reason = sprintf("its %s argument cannot be read statically", nm))
     structure(character(), gave_up = TRUE)   # not NULL: the cache is no answer to an unreadable argument
   }
-  literal_flag <- function(v, default) if (is.null(v)) default else if (isTRUE(v) || isFALSE(v)) v else NA
+  literal_flag <- function(v, default) {
+    if (is.symbol(v) && as.character(v) %in% c("T", "F")) v <- as.character(v) == "T"
+    if (is.null(v)) default else if (isTRUE(v) || isFALSE(v)) v else NA
+  }
   # where the header is: forwarded to the file reader
   opts <- list()
   skip <- arg("skip")
@@ -1262,7 +2022,16 @@ reader_columns <- function(path, e, fn, ctx) {
   }
   for (nm in c("sep", "delim", "comment", "comment.char")) {
     v <- arg(nm)
+    # fread's sep = "auto" is its default spelled out: guess, as NULL does
+    if (fn == "fread" && nm == "sep" && identical(v, "auto")) next
     if (is.character(v) && length(v) == 1L) opts[[if (nm %in% c("sep", "delim")) "sep" else "comment"]] <- v
+  }
+  # read_delim() keeps the blanks around a name unless told to trim them;
+  # the other delimited readers trim
+  if (fn == "read_delim") {
+    tw <- literal_flag(arg("trim_ws"), FALSE)
+    if (is.na(tw)) return(give_up("trim_ws"))
+    opts$trim_ws <- tw
   }
   if (identical(fam, "excel")) {
     for (nm in c("sheet", "range")) {
@@ -1271,9 +2040,14 @@ reader_columns <- function(path, e, fn, ctx) {
       if ((is.character(v) || (nm == "sheet" && is.numeric(v))) && length(v) == 1L) opts[[nm]] <- v else return(give_up(nm))
     }
   }
-  cols <- columns_of_file(path, fn, opts)
-  if (is.null(cols)) return(NULL)
-  attr(cols, "source") <- basename(path)
+  if (is.null(header)) {
+    dep_on(ctx, path)
+    cols <- columns_of_file(path, fn, opts)
+    if (is.null(cols)) return(NULL)
+    cols <- with_source(cols, basename(path), paste0("file:", path))
+  } else {
+    cols <- header
+  }
   if (is.na(fam) || !length(args)) return(cols)
   out <- as.character(cols)
   generated <- function(n) paste0(c(readr = "X", base = "V", fread = "V", excel = "...")[[fam]], seq_len(n))
@@ -1381,43 +2155,93 @@ call_name <- function(e) {
 
 string_arg <- function(e) if (is.character(e) && length(e) == 1L) e else NULL
 
+# The argument of a reader call that names the file: file=, path=, input=
+# or sources= when given, else the first argument.
+reader_path_arg <- function(e) {
+  path_arg <- if (length(e) >= 2L) e[[2L]] else NULL
+  nms <- names(e)
+  if (!is.null(nms)) for (k in c("file", "path", "input", "sources")) if (k %in% nms) path_arg <- e[[k]]
+  path_arg
+}
+
 resolve_path <- function(e, ctx) {
   if (is.character(e) && length(e) == 1L) {
     cands <- c(e, file.path(ctx$root, e), file.path(ctx$filedir, e))
     hit <- cands[file.exists(cands)]
     return(if (length(hit)) normalizePath(hit[[1L]]) else NULL)
   }
-  if (is.call(e) && call_name(e) %in% c("here", "file.path")) {
-    parts <- lapply(call_args(e), string_arg)
-    if (any(vapply(parts, is.null, TRUE))) return(NULL)
-    return(resolve_path(do.call(file.path, parts), ctx))
+  if (is.symbol(e)) {
+    # a variable bound to a literal path above (`f <- "data/x.csv"`, a file target)
+    v <- ctx$strings[[as.character(e)]]
+    return(if (is.character(v) && length(v) == 1L) resolve_path(v, ctx) else NULL)
+  }
+  if (is.call(e)) {
+    # here(), file.path(), paste0(), sprintf() of literals and of variables
+    # bound to literals above: the path they state, as a writer's path is read
+    p <- path_literal(e, ctx)
+    return(if (is.null(p)) NULL else resolve_path(p, ctx))
   }
   NULL
 }
 
 builtin_dataset <- function(nm, ctx) {
-  for (pkg in c("datasets", ctx$packages)) {
-    if (!requireNamespace(pkg, quietly = TRUE)) next
+  if (is.null(ctx$dataset_memo)) ctx$dataset_memo <- new.env()
+  hit <- ctx$dataset_memo[[nm]]
+  if (!is.null(hit)) return(if (identical(hit, FALSE)) NULL else hit)
+  found <- builtin_dataset_lookup(nm, ctx)
+  ctx$dataset_memo[[nm]] <- found %||% FALSE
+  found
+}
+builtin_dataset_lookup <- function(nm, ctx) {
+  # attached packages are searched for a lazy-loaded dataset only when
+  # reading package namespaces is allowed (R_LSP_COLCHECK_PACKAGES)
+  for (pkg in c("datasets", if (packages_enabled()) ctx$packages)) {
+    if (!quiet(requireNamespace(pkg, quietly = TRUE), FALSE)) next
     obj <- quiet(get0(nm, envir = asNamespace(pkg), inherits = FALSE))
     if (is.null(obj)) {
       lazy <- quiet(asNamespace(pkg)[[".__NAMESPACE__."]][["lazydata"]])
       if (!is.null(lazy)) obj <- quiet(get0(nm, envir = lazy, inherits = FALSE))
     }
-    if (is.data.frame(obj)) {
-      cols <- names(obj)
-      attr(cols, "source") <- paste0(pkg, "::", nm)
-      return(cols)
-    }
+    if (is.data.frame(obj)) return(with_source(names(obj), paste0(pkg, "::", nm), paste0("dataset:", pkg, "::", nm)))
   }
   NULL
 }
 
 keep_source <- function(cols, template) {
-  attr(cols, "source") <- attr(template, "source")
-  attr(cols, "source_line") <- attr(template, "source_line")   # a literal is named by its file and line in the data map
-  attr(cols, "source_file") <- attr(template, "source_file")
-  attr(cols, "inner") <- attr(template, "inner")
-  attr(cols, "open") <- attr(template, "open")
+  for (a in c("source", "source_id", "source_line", "source_file", "inner", "open", "collect")) attr(cols, a) <- attr(template, a)
+  cols
+}
+
+# The id of a tibble()/data.frame()/tribble() literal: the file and the
+# literal's text, so the same literal keeps its id when lines above it move
+# (r-colmap --diff compares the file at two revisions); a second literal
+# with the same text in one file is told apart by its line.
+literal_id <- function(e, ctx) {
+  text <- substr(one_line(e), 1L, 120L)
+  file <- normalizePath(ctx$file, mustWork = FALSE)
+  bare <- sprintf("literal:%s:%s", file, text)
+  line <- ctx$line %||% NA_integer_
+  if (is.na(line)) return(bare)
+  if (is.null(ctx$literal_lines)) ctx$literal_lines <- list()
+  k <- paste(file, text)
+  seen <- ctx$literal_lines[[k]] %||% integer()
+  # the first literal with this text owns the bare id, at every visit of its
+  # line (a body is walked more than once); a later one is told apart by its line
+  if (!length(seen)) { ctx$literal_lines[[k]] <- line; return(bare) }
+  if (line == seen[[1L]]) return(bare)
+  if (!(line %in% seen)) ctx$literal_lines[[k]] <- c(seen, line)
+  sprintf("%s@%d", bare, line)
+}
+
+# A frame's source as two attributes: the label a message shows (`source`,
+# "sales.csv", "cached schema \"k\"") and a key the map groups by
+# (`source_id`: file:<path>, schema:<key>, literal:<file>:<text>, sink:<path>,
+# target:<name>, package:<fn>, dataset:<pkg::nm>, assertion:<file>:<line>),
+# so two files with one basename, or one literal whose line moved, are not
+# confused.
+with_source <- function(cols, label, id) {
+  attr(cols, "source") <- label
+  attr(cols, "source_id") <- id
   cols
 }
 
@@ -1444,34 +2268,6 @@ as_frame <- function(x) if (is_not_frame(x)) NULL else x
 # "used" in the sense that earns an unresolved-source note.
 terminal_calls <- c("pull", "nrow", "ncol", "dim", "names", "colnames", "deframe")
 
-# Calls that consume a frame without naming its columns: the frame is written
-# out, and that is where it went. Recorded as a "written" fate for the data
-# map; the frame keeps its columns (readr's writers return their input).
-sink_calls <- c("saveRDS", "save", "write_rds", "write_csv", "write_csv2", "write_tsv", "write_delim", "write_excel_csv",
-                "write.csv", "write.csv2", "write.table", "fwrite", "write_parquet", "write_feather", "write_ipc_file",
-                "write_dataset", "write_xlsx", "write.xlsx", "writeData", "write_fst", "write_dta", "write_sav", "write_sas",
-                "write_xpt", "write_json", "qsave", "dbWriteTable", "dbAppendTable", "copy_to", "s3write_using", "s3saveRDS",
-                "s3save", "write_sf", "st_write", "write_ods")
-# where the frame sits in a sink call: these names, else the first positional
-# argument that resolves to a frame (`dbWriteTable(con, "t", df)`)
-sink_frame_args <- c("x", "object", "value", "data", ".data", "df", "obj", "dataset", "table")
-
-record_sink <- function(e, fn, ctx, cols = NULL) {
-  if (is.null(cols)) {
-    args <- call_args(e)
-    nms <- names(args) %||% rep("", length(args))
-    for (a in c(args[nms %in% sink_frame_args], args[!nzchar(nms)])) {
-      if (!(is.symbol(a) || is.call(a))) next
-      if (is.call(a) && identical(call_name(a), "function")) next
-      cols <- as_frame(frame_columns(a, ctx))
-      if (!is.null(cols)) break
-    }
-  }
-  if (is.null(cols) || is_listed(cols)) return(invisible())
-  record_step(ctx, e, cols, before = cols, fate = "written", fate_fn = fn)
-  invisible()
-}
-
 # Column set of an expression that produces a data frame, or NULL (unknown).
 # `used`: the caller applies a column-using verb to the result, so an
 # unresolved frame here is worth a note.
@@ -1495,6 +2291,14 @@ frame_columns <- function(e, ctx, used = FALSE) {
     if (!is.call(rhs)) return(NULL)
     rhs_fn <- call_name(rhs)
     rhs_def <- lookup_function(rhs, rhs_fn, ctx)
+    # `df %>% write_csv(path)`: the frame is written, and comes back out
+    # (readr's writers return their input invisibly)
+    if (is_sink_call(rhs, rhs_fn, ctx)) {
+      lhs <- frame_columns(e[[2L]], ctx, used = TRUE)
+      if (!is_not_frame(lhs)) record_sink(pipe_into(rhs, as.name(".")), rhs_fn, ctx, lhs, lookup = FALSE)
+      # readr's writers return their input; saveRDS() and its kind return nothing
+      return(if (rhs_fn %in% sink_returns_nothing) not_frame else lhs)
+    }
     # a cache entry for a piped helper, `df %>% clean()`, beats following its
     # code, as it does for the direct call `clean(df)`; verbs never match
     cached <- if (!is.na(rhs_fn) && !(rhs_fn %in% c(verb_names, combining_calls, listed_calls, mapping_calls))) cached_columns(rhs, ctx) else NULL
@@ -1517,12 +2321,6 @@ frame_columns <- function(e, ctx, used = FALSE) {
       if (!is.null(first) && is.null(result)) note_stop(ctx, rhs, rhs_fn, NULL, reason = "its id column is computed")
       return(result)
     }
-    if (!is.na(rhs_fn) && rhs_fn %in% sink_calls && is.null(rhs_def)) {
-      lhs <- frame_columns(e[[2L]], ctx, used = used)
-      if (!is.null(lhs) && !is_not_frame(lhs)) record_sink(rhs, rhs_fn, ctx, cols = lhs)
-      # readr's writers return their input; saveRDS() and its kind return nothing
-      return(if (rhs_fn %in% c("saveRDS", "save", "qsave", "s3saveRDS", "s3save")) not_frame else lhs)
-    }
     lhs <- frame_columns(e[[2L]], ctx, used = used || rhs_fn %in% column_verbs || !is.null(rhs_def) || !is.null(cached))
     if (!is.null(cached)) return(cached)
     if (is.null(lhs)) {
@@ -1538,25 +2336,35 @@ frame_columns <- function(e, ctx, used = FALSE) {
     return(result)
   }
   if (fn %in% readers) {
-    path_arg <- if (length(e) >= 2L) e[[2L]] else NULL
-    nms <- names(e)
-    if (!is.null(nms)) {
-      for (k in c("file", "path", "input", "sources")) if (k %in% nms) path_arg <- e[[k]]
-    }
+    path_arg <- reader_path_arg(e)
     path <- resolve_path(path_arg, ctx)
-    if (is.null(path)) return(cached_columns(e, ctx))
+    # a path that is not there: the cache (the user's own statement), else a
+    # script in the project that writes that path (written_columns). Either
+    # stands in for the file's header, and the call's own arguments
+    # (col_select, col_names, select/drop, make.names) apply to it as they
+    # would to the file: a reader that drops a column does not have it.
+    fallback <- function() {
+      header <- cached_columns(e, ctx) %||% written_columns(path_arg, ctx)
+      if (is.null(header)) return(NULL)
+      cols <- reader_columns(path, e, fn, ctx, header = header)
+      if (isTRUE(attr(cols, "gave_up"))) NULL else cols
+    }
+    if (is.null(path)) return(fallback())
     # a file that is there but cannot be read (a dataset directory, a big
     # RDS, a format whose package is missing) falls back to the cache, as a
     # path that is not there does, so the learn command the note gives works
     cols <- reader_columns(path, e, fn, ctx)
-    if (is.null(cols)) return(cached_columns(e, ctx))
+    if (is.null(cols)) return(fallback())
     return(if (isTRUE(attr(cols, "gave_up"))) NULL else cols)
   }
   if (fn %in% c("tibble", "data.frame", "data_frame")) {
     nms <- names(e)[-1L]
     if (is.null(nms) || any(!nzchar(nms))) return(NULL)
-    cols <- nms
-    attr(cols, "source") <- paste0(fn, "() literal")
+    # the constructors' own options are not columns
+    options_ <- c("stringsAsFactors", "check.names", "row.names", "check.rows", ".rows", ".name_repair", "fix.empty.names")
+    e <- e[c(TRUE, !(nms %in% options_))]
+    nms <- nms[!(nms %in% options_)]
+    cols <- with_source(nms, paste0(fn, "() literal"), literal_id(e, ctx))
     attr(cols, "source_line") <- ctx$line
     attr(cols, "source_file") <- ctx$file   # a literal in a test, followed into R/, is still named by the test's line
     # data = list(tibble(d = 1, r = 2)): the inner columns of a list-column
@@ -1578,14 +2386,19 @@ frame_columns <- function(e, ctx, used = FALSE) {
     hdr <- Filter(function(a) is.call(a) && identical(a[[1L]], as.name("~")), call_args(e))
     cols <- vapply(hdr, function(a) as.character(a[[2L]]), "")
     if (!length(cols)) return(NULL)
-    attr(cols, "source") <- "tribble() literal"
+    cols <- with_source(cols, "tribble() literal", literal_id(e, ctx))
     attr(cols, "source_line") <- ctx$line
-    attr(cols, "source_file") <- ctx$file   # a literal in a test, followed into R/, is still named by the test's line
+    attr(cols, "source_file") <- ctx$file
     return(cols)
   }
-  # native pipe is parsed into nested calls: verb(frame_expr, ...); a ggplot
-  # chain is `+` calls nested the same way
-  if (fn %in% verb_names || fn == "+") {
+  # a plot built with `+`: its aes() calls are checked against the frame
+  # the chain starts from, and the plot is not a frame
+  if (fn == "+") {
+    check_ggplot(e, ctx)
+    return(not_frame)
+  }
+  # native pipe is parsed into nested calls: verb(frame_expr, ...)
+  if (fn %in% verb_names) {
     if (length(e) < 2L) return(NULL)
     inner <- frame_columns(e[[2L]], ctx, used = used || fn %in% column_verbs)
     if (is_not_frame(inner)) return(inner)
@@ -1630,11 +2443,25 @@ frame_columns <- function(e, ctx, used = FALSE) {
     if (!is.null(first) && is.null(result)) note_stop(ctx, e, fn, NULL, reason = "its id column is computed")
     return(result)
   }
+  # a sink: the frame it writes is recorded (where it went; for a writer with
+  # a stated path, what a reader of that path gets) and flows on, except
+  # from saveRDS() and its kind, which return nothing
+  if (is_sink_call(e, fn, ctx)) {
+    cols <- record_sink(e, fn, ctx)
+    return(if (fn %in% sink_returns_nothing) not_frame else cols)
+  }
+  # a targets object: the columns of the target's command
+  if (fn %in% c("tar_read", "tar_read_raw") && length(e) >= 2L) return(target_columns(e[[2L]], ctx))
   # any other call: a cache entry matching one of its literals, or the line's
   # `# cols:`, is the user's own statement of what comes out and beats reading
   # the function (a loader's columns depend on its arguments, not its code)
   cached <- cached_columns(e, ctx)
   if (!is.null(cached)) return(cached)
+  # a database table the project writes: tbl(con, "orders") after dbWriteTable(con, "orders", df)
+  if (fn %in% table_readers && length(e) >= 3L) {
+    written <- written_columns(e[[3L]], ctx, table = TRUE)
+    if (!is.null(written)) return(written)
+  }
   # a project or package function: bind its parameters, check its body, take its result
   fn_def <- lookup_function(e, fn, ctx)
   if (!is.null(fn_def)) return(call_user_function(e, fn, ctx, def = fn_def))
@@ -1645,8 +2472,8 @@ frame_columns <- function(e, ctx, used = FALSE) {
     inner <- frame_columns(e[[2L]], ctx, used = used)
     if (!is.null(inner) && fn %in% passthrough_calls) return(inner)
     # a known frame went into a call whose result the checker cannot
-    # describe (`df |> clean_names()` parses to clean_names(df)): the same
-    # stop the %>% branch records, so the statement gets its note
+    # describe (`df |> as.matrix()`, a helper from a package it does not
+    # read): the same stop the %>% branch records, so the statement gets its note
     if (!is.null(inner) && !is_not_frame(inner) && !(fn %in% not_loaders)) note_stop(ctx, e, fn, NULL)
   }
   NULL
@@ -1660,7 +2487,7 @@ passthrough_calls <- c("tryCatch", "try", "withCallingHandlers", "suppressWarnin
 quoting_calls <- c("across", "if_any", "if_all", "pick", "c_across", "where", "all_of", "any_of",
                    "starts_with", "ends_with", "contains", "matches", "num_range", "everything",
                    "last_col", "vars", "quote", "bquote", "expr", "sym", "syms", "!!", "!!!",
-                   "glue", "str_glue")
+                   "glue", "str_glue", "after_stat", "after_scale", "stage", "stat")
 
 # Names used as bare symbols inside an expression evaluated with data masking,
 # minus the names the expression itself assigns (`{ idx <- which(...); x[idx] }`)
@@ -1948,17 +2775,29 @@ walk_guarded_if <- function(e, ctx) {
   m <- names_membership(e[[2L]], ctx)
   if (is.null(m)) return(FALSE)
   nm <- m$frame
-  saved <- ctx$frames[[nm]]
-  saved_unknown <- ctx$unknown_frames
+  before <- ctx$frames
+  before_unknown <- ctx$unknown_frames
+  saved <- before[[nm]]
   if (!is.null(saved) && !is_listed(saved)) {
     ctx$frames[[nm]] <- keep_source(structure(unique(c(as.character(saved), m$cols)), groups = attr(saved, "groups") %||% character()), saved)
   } else if (is.null(saved)) {
     apply_assertion(m, ctx)
   }
+  guarded <- ctx$frames[[nm]]
   walk_expr(e[[3L]], ctx)
-  ctx$frames[[nm]] <- saved
-  ctx$unknown_frames <- saved_unknown
-  if (length(e) >= 4L) walk_expr(e[[4L]], ctx)
+  then_out <- list(frames = ctx$frames, unknown = ctx$unknown_frames)
+  # the guard's own columns hold inside the branch only: a guarded frame the
+  # branch left alone is as it was outside; one the branch reassigned
+  # (`if ("y" %in% names(df)) df <- mutate(df, z = y)`) keeps that result,
+  # merged below with the other outcome as any reassigned frame is
+  if (identical(ctx$frames[[nm]], guarded)) then_out$frames[[nm]] <- saved
+  then_out$unknown <- if (nm %in% before_unknown) union(then_out$unknown, nm) else setdiff(then_out$unknown, nm)
+  ctx$frames <- before
+  ctx$unknown_frames <- before_unknown
+  if (length(e) >= 4L && is.call(e[[4L]])) walk_expr(e[[4L]], ctx)
+  else_out <- list(frames = ctx$frames, unknown = ctx$unknown_frames)
+  # every other frame the branch reassigned has, afterwards, the columns of either outcome
+  merge_outcomes(before, list(then_out, else_out), ctx)
   TRUE
 }
 
@@ -1973,8 +2812,9 @@ apply_assertion <- function(a, ctx) {
   }
   cols <- structure(unique(c(if (!is.null(cur)) as.character(cur), a$cols)),
                     source = sprintf("the columns %s() requires on line %s", a$fn %||% "the assertion", ctx$line),
+                    source_id = sprintf("assertion:%s:%s", ctx$file, ctx$line),
                     groups = attr(cur, "groups") %||% character())
-  if (a$exact) cols <- structure(a$cols, source = attr(cols, "source"), groups = attr(cols, "groups"))
+  if (a$exact) cols <- structure(a$cols, source = attr(cols, "source"), source_id = attr(cols, "source_id"), groups = attr(cols, "groups"))
   else attr(cols, "open") <- TRUE
   ctx$frames[[nm]] <- cols
   ctx$unknown_frames <- setdiff(ctx$unknown_frames, nm)
@@ -2061,6 +2901,15 @@ selection_names <- function(args, ctx = NULL, cols = NULL, negated = FALSE) {
 select_helpers <- c("starts_with", "ends_with", "contains", "matches", "num_range", "everything",
                     "last_col", "any_of")
 
+# Whether a selection argument takes columns away: its first leaf, through
+# `c()`, parentheses and `:`, is a `-` or `!` (`-a`, `!c(a, b)`, `c(-a, -b)`,
+# `-a:-b`, `-(a:b)`), so the names selection_names() gives for it are the
+# ones to remove.
+leading_neg <- function(a) {
+  while (is.call(a) && length(a) >= 2L && call_name(a) %in% c("c", "(", ":")) a <- a[[2L]]
+  is.call(a) && call_name(a) %in% c("-", "!")
+}
+
 # One tidyselect helper expanded against the known columns, as tidyselect
 # would: `ignore.case = TRUE` by default, a vector of prefixes matching any,
 # zero matches a legal empty selection. NULL when the frame or the helper's
@@ -2140,7 +2989,7 @@ pin_line <- function(ctx, name) {
   if (is.null(to) || is.na(to) || to < ctx$line) to <- ctx$line
   rng <- seq.int(ctx$line, min(to, length(txt)))
   if (!length(rng) || rng[[1L]] > length(txt)) return(ctx$line)
-  pat <- paste0("(^|[^A-Za-z0-9._])`?", gsub("([.])", "\\\\\\1", name), "`?([^A-Za-z0-9._]|$)")
+  pat <- paste0("(^|[^A-Za-z0-9._])`?\\Q", name, "\\E`?([^A-Za-z0-9._]|$)")
   code <- sub("#.*$", "", txt[rng])
   hit <- rng[grepl(pat, code, perl = TRUE)]
   if (length(hit)) hit[[1L]] else ctx$line
@@ -2151,20 +3000,45 @@ pin_line <- function(ctx, name) {
 # visiting a pipeline twice counts it once.
 count_step <- function(ctx, kind, fn) {
   if (!(fn %in% verbs) || !is.null(ctx$pkg_scope)) return(invisible())
-  ctx$stats[[kind]] <- union(ctx$stats[[kind]], paste(ctx$file, ctx$line, fn))
+  # a step the walker visits twice (an assignment and its right-hand side)
+  # counts once, under the best outcome it had
+  key <- paste(ctx$file, ctx$line, fn)
+  rank <- c(checked = 3L, partial = 2L, skipped = 1L)
+  cur <- ctx$stats$seen[[key]]
+  if (is.null(cur) || rank[[kind]] > rank[[cur]]) ctx$stats$seen[[key]] <- kind
   invisible()
+}
+
+# The known columns a reported name is a typo of: within an edit distance
+# of a third of its length (a transposition counts two), case ignored, or a
+# name it is a prefix of (`reg` for `region`); the closest first, three at
+# most. For Claude the fix is then one edit, not a second look at the data.
+nearest_names <- function(name, cols, n = 3L) {
+  cols <- unique(as.character(cols))
+  cols <- cols[nzchar(cols) & cols != name]
+  if (!length(cols) || !nzchar(name)) return(character())
+  d <- as.integer(utils::adist(name, cols, ignore.case = TRUE))
+  exact <- as.integer(utils::adist(name, cols))
+  close <- d <= max(1L, ceiling(nchar(name) / 3))
+  prefix <- nchar(name) >= 3L & startsWith(tolower(cols), tolower(name))
+  keep <- close | prefix
+  if (!any(keep)) return(character())
+  head(cols[keep][order(d[keep], exact[keep], nchar(cols[keep]))], n)
 }
 
 report <- function(ctx, name, cols) {
   if (!is.null(ctx$pkg_scope)) return(invisible())
   src <- attr(cols, "source") %||% "the data"
   via <- if (length(ctx$call_sites)) ctx$call_sites[[length(ctx$call_sites)]] else NULL
+  near <- nearest_names(name, cols)
   ctx$findings[[length(ctx$findings) + 1L]] <- list(
     kind = "column", file = ctx$file, line = pin_line(ctx, name), name = name, source = src,
-    columns = as.character(cols), via = via, step = ctx$step_call, statement = ctx$line,
-    message = sprintf("'%s' is not a column at this point (columns: %s; data from %s%s)", name,
-                      paste(head(cols, 12), collapse = ", "), src,
-                      if (is.null(via)) "" else sprintf(", called from %s", via)))
+    columns = as.character(cols), via = via, step = ctx$step_call, statement = ctx$line, nearest = I(near),
+    message = sprintf("'%s' is not a column at this point (%s; data from %s%s)%s", name,
+                      if (length(cols) > 16L) sprintf("%d columns, `r-colmap --source %s` lists them", length(cols), shQuote(sub(",.*$", "", src)))
+                      else paste0("columns: ", paste(cols, collapse = ", ")),
+                      src, if (is.null(via)) "" else sprintf(", called from %s", via),
+                      if (length(near)) sprintf("; did you mean %s?", paste(near, collapse = " or ")) else ""))
 }
 
 # `fn_args`: the symbols among `syms` that sit as a direct argument of a
@@ -2182,7 +3056,7 @@ check_symbols <- function(syms, cols, ctx, fn_args = character()) {
     # what it expects of the frame (on a data frame bound with an unknown one
     # the name may belong to the other, so only the known ones count)
     if (!is.null(ctx$used_now)) {
-      expected <- if (startsWith(attr(cols, "source") %||% "", "parameter ")) bad else character()
+      expected <- if (startsWith(attr(cols, "source_id") %||% "", "parameter:")) bad else character()
       ctx$used_now <- union(ctx$used_now, c(syms[syms %in% cols], expected))
     }
     return(invisible(character()))
@@ -2199,22 +3073,67 @@ apply_verb <- function(call, cols, ctx, piped) {
   shown <- call
   if (!piped && length(call) >= 2L && is.call(call[[2L]])) shown[[2L]] <- as.name(".")
   saved_used <- ctx$used_now
+  saved_derived <- ctx$derived_now
+  saved_over <- ctx$overwritten_now
   saved_step <- ctx$step_call
   saved_joined <- ctx$joined_now
   # restored on every exit, an error inside the verb included
-  on.exit({ ctx$used_now <- saved_used; ctx$step_call <- saved_step; ctx$joined_now <- saved_joined }, add = TRUE)
+  on.exit({ ctx$used_now <- saved_used; ctx$derived_now <- saved_derived; ctx$overwritten_now <- saved_over; ctx$step_call <- saved_step; ctx$joined_now <- saved_joined }, add = TRUE)
   ctx$used_now <- character()
+  ctx$derived_now <- list()
+  ctx$overwritten_now <- character()
   ctx$joined_now <- NULL
   ctx$step_call <- one_line(shown)
   result <- apply_verb_impl(call, cols, ctx, piped)
   used <- ctx$used_now
-  record_step(ctx, shown, result, before = cols, used = used, joined = ctx$joined_now)
+  # pull(), nrow(): the step is recorded, with no column set, as the end of the frame
+  record_step(ctx, shown, if (is_not_frame(result)) NULL else result, before = cols, used = used, derived = ctx$derived_now,
+              overwritten = ctx$overwritten_now, terminal = is_not_frame(result), joined = ctx$joined_now)
   result
+}
+
+# The functions whose value depends on the rows a group holds: run inside
+# mutate()/filter() on a grouped frame they work per group.
+aggregate_fns <- c("sum", "mean", "median", "min", "max", "sd", "var", "n", "n_distinct", "quantile", "first", "last",
+                   "nth", "cumsum", "cummean", "cummax", "cummin", "row_number", "min_rank", "dense_rank", "percent_rank",
+                   "cume_dist", "ntile", "lag", "lead", "scale", "prod", "length")
+# The names of every call inside an expression (a lambda's body excepted).
+call_heads <- function(e, acc = character()) {
+  if (!is.call(e)) return(acc)
+  fn <- call_name(e)
+  if (!is.na(fn) && fn %in% c("~", "function")) return(acc)
+  if (!is.na(fn)) acc <- c(acc, fn)
+  for (p in call_args(e)) acc <- call_heads(p, acc)
+  acc
+}
+# A defect in the step itself (kind "logic"): certain, reported like a column.
+report_logic <- function(ctx, name, message) {
+  if (!is.null(ctx$pkg_scope)) return(invisible())
+  ctx$findings[[length(ctx$findings) + 1L]] <- list(kind = "logic", file = ctx$file, line = pin_line(ctx, name), name = name,
+                                                    source = NA_character_, columns = character(), statement = ctx$line, message = message)
+  invisible()
+}
+# A step that runs per group (kind "grouped"): said, since it may be meant.
+report_grouped <- function(ctx, verb, message) {
+  if (!is.null(ctx$pkg_scope)) return(invisible())
+  ctx$findings[[length(ctx$findings) + 1L]] <- list(kind = "grouped", file = ctx$file, line = pin_line(ctx, verb), name = verb,
+                                                    source = NA_character_, columns = character(), statement = ctx$line, message = message)
+  invisible()
+}
+
+# A column this step makes from others: `derived_now[[new]]` holds the input
+# columns its expression reads (`total = sum(amount)`: total from amount; a
+# rename: the new name from the old). The lineage r-colmap prints.
+derive <- function(ctx, new, from) {
+  if (is.null(ctx$derived_now) || !is.character(new) || length(new) != 1L || !nzchar(new)) return(invisible())
+  ctx$derived_now[[new]] <- unique(as.character(from))
+  invisible()
 }
 
 # The column set after a verb, for `r-colcheck --steps`: a per-step listing
 # of what the checker knows, the lineage a review can read. With the set
-# before the step and the columns the step read, r-colmap's raw material.
+# before the step, the columns the step read and the columns it derived from
+# which, r-colmap's raw material.
 # `fate`: a step that is not a verb but says where the frame went: "written"
 # (a sink such as saveRDS(); `fate_fn` names it) or "returned" (the last
 # expression of a named function; `fate_fn` is the function). The third fate,
@@ -2222,23 +3141,28 @@ apply_verb <- function(call, cols, ctx, piped) {
 # `before`, and needs no field. `joined`: for a join, the other frame (its
 # source, columns, the keys read from it and the columns it brought into the
 # result), so the data map can attribute those columns to their own source.
-record_step <- function(ctx, call, cols, before = NULL, used = character(), fate = NULL, fate_fn = NULL,
-                        joined = NULL, line = ctx$line) {
+record_step <- function(ctx, call, cols, before = NULL, used = character(), derived = list(), overwritten = character(), terminal = FALSE,
+                        fate = NULL, fate_fn = NULL, joined = NULL, line = ctx$line) {
   if (!is.null(ctx$pkg_scope)) return(invisible())
   groups <- attr(cols, "groups") %||% character()
   groups_before <- attr(before, "groups") %||% character()
+  derived <- Filter(length, derived)
   ctx$steps[[length(ctx$steps) + 1L]] <- list(
-    file = ctx$file, line = line, call = if (is.character(call)) call else one_line(call),
+    file = ctx$file, line = line, line_end = ctx$line_end %||% NA_integer_, call = if (is.character(call)) call else one_line(call),
     fate = fate, fate_fn = fate_fn, joined = joined,
     columns = if (is.null(cols)) NULL else as.character(cols),
     before = if (is.null(before)) NULL else as.character(before),
     groups_before = if (anyNA(groups_before)) NULL else as.character(groups_before),
     open_before = is_open(before),
     used = as.character(used),
+    overwritten = as.character(overwritten),
+    derived = if (length(derived)) derived else NULL,
     open = is_open(cols),
     listed = is_listed(cols),
     groups = if (anyNA(groups)) NULL else as.character(groups),
+    terminal = isTRUE(terminal),
     source = attr(cols, "source") %||% attr(before, "source") %||% NA_character_,
+    source_id = attr(cols, "source_id") %||% attr(before, "source_id") %||% NA_character_,
     source_line = attr(cols, "source_line") %||% attr(before, "source_line") %||% NA_integer_,
     source_file = attr(cols, "source_file") %||% attr(before, "source_file") %||% NA_character_)
   invisible()
@@ -2303,9 +3227,42 @@ kept_set_verbs <- c("replace_na", "na.omit", "separate_rows", "sample_n", "sampl
                     "complete", "add_row", "filter_at", "filter_if", "filter_all", "arrange_at", "arrange_if",
                     "arrange_all", "mutate_at", "mutate_if", "mutate_all")
 # Verbs whose result is read off their arguments: a row-name column added or
-# removed, columns added by name, united, renamed by toupper()/tolower().
+# removed, columns added by name, united, renamed by toupper()/tolower() or
+# janitor's clean_names().
 computed_verbs <- c("rownames_to_column", "rowid_to_column", "column_to_rownames", "add_column", "unite",
-                    "setNames", "rename_with", "rename_all")
+                    "setNames", "rename_with", "rename_all", "clean_names")
+
+# What janitor::clean_names() (case = "snake", its default) makes of a header,
+# computed for the names the rule is certain on: ASCII letters, digits,
+# spaces, dots, dashes and underscores. `%` and `#` become words, every
+# other run of non-alphanumerics an underscore, the name is lower-cased,
+# trimmed of underscores, prefixed with x when it starts with a digit, and
+# duplicates get _2, _3. A name with a lower-to-upper case change (`amountUSD`,
+# split by janitor's snakecase rules) or any other character is converted by
+# the same rules but marks the result partly known: the set is then open,
+# so nothing is reported against it until a select() closes it. NULL for a
+# non-ASCII name, whose transliteration is not reproduced here.
+clean_names_sim <- function(x) {
+  x <- as.character(x)
+  if (any(grepl("[^ -~]", x))) return(NULL)
+  sure <- all(grepl("^[A-Za-z0-9 ._-]*$", x)) && !any(grepl("[a-z][A-Z]|[A-Z][A-Z][a-z]", x))
+  s <- gsub("'|\"", "", x)
+  s <- gsub("%", "_percent_", s, fixed = TRUE)
+  s <- gsub("#", "_number_", s, fixed = TRUE)
+  s <- gsub("([a-z0-9])([A-Z])", "\\1_\\2", s)
+  s <- gsub("([A-Z]+)([A-Z][a-z])", "\\1_\\2", s)
+  s <- tolower(gsub("^_+|_+$", "", gsub("[^A-Za-z0-9]+", "_", s)))
+  s[!nzchar(s)] <- "x"
+  s <- ifelse(grepl("^[0-9]", s), paste0("x", s), s)
+  seen <- list()
+  for (i in seq_along(s)) {
+    k <- seen[[s[[i]]]] %||% 0L
+    seen[[s[[i]]]] <- k + 1L
+    if (k > 0L) s[[i]] <- paste0(s[[i]], "_", k + 1L)
+  }
+  if (!sure) attr(s, "open") <- TRUE
+  s
+}
 
 apply_verb_impl <- function(call, cols, ctx, piped) {
   fn <- call_name(call)
@@ -2322,17 +3279,86 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
   named <- args[nzchar(nms) & !dot_args]
   group_cols <- attr(cols, "groups") %||% character()
   groups_unknown <- anyNA(group_cols)
-  with_groups <- function(x, g = group_cols) { attr(x, "groups") <- g; keep_source(x, cols) }
-  check_all <- function() check_symbols(unlist(lapply(c(pos, named), masked_symbols)), cols, ctx,
-                                        unlist(lapply(c(pos, named), fn_arg_symbols)))
-  # mutate(a = ..., b = a + 1): each argument sees the columns made before it
+  # where the result's grouping came from travels with it (a summarise()
+  # that left its groups by default, a group_by()), and goes when the groups do
+  with_groups <- function(x, g = group_cols, from = attr(cols, "groups_from")) {
+    attr(x, "groups") <- g
+    x <- keep_source(x, cols)
+    attr(x, "groups_from") <- if (length(g) && !anyNA(g)) from else NULL
+    x
+  }
+  check_all <- function() {
+    check_symbols(unlist(lapply(c(pos, named), masked_symbols)), cols, ctx, unlist(lapply(c(pos, named), fn_arg_symbols)))
+    for (a in c(pos, named)) self_comparisons(a)
+  }
+  # `amount > amount`, `x == x`: a column compared with itself is always
+  # TRUE or always FALSE (and NA where it is NA); a typo for another column
+  self_comparisons <- function(e) {
+    if (!is.call(e)) return(invisible())
+    f <- call_name(e)
+    if (!is.na(f) && f %in% c("==", "!=", "<", ">", "<=", ">=") && length(e) == 3L && is.symbol(e[[2L]]) && identical(e[[2L]], e[[3L]]) &&
+        as.character(e[[2L]]) %in% as.character(cols)) {
+      report_logic(ctx, as.character(e[[2L]]), sprintf("'%s %s %s' compares the column with itself (always %s, NA where it is NA); one side is a typo for another column",
+                                                       as.character(e[[2L]]), f, as.character(e[[2L]]), if (f %in% c("==", "<=", ">=")) "TRUE" else "FALSE"))
+    }
+    if (!is.na(f) && f %in% c("~", "function")) return(invisible())
+    for (a in call_args(e)) self_comparisons(a)
+  }
+  # mutate(a = ..., b = a + 1): each argument sees the columns made before it;
+  # the columns an argument reads are what its new column derives from. The
+  # input columns any argument reads are also kept as a whole (`input_read`),
+  # for mutate()'s .keep: a name assigned twice keeps only its last reads as
+  # lineage, but dplyr counts the first assignment's columns as used too
+  input_read <- character()
   check_sequential <- function() {
     cur <- cols
+    assigned <- character()
     for (i in seq_along(args)) {
       if (dot_args[[i]]) next
-      check_symbols(masked_symbols(args[[i]]), cur, ctx, fn_arg_symbols(args[[i]]))
-      if (nzchar(nms[[i]])) cur <- unique(c(cur, nms[[i]]))
+      syms <- masked_symbols(args[[i]])
+      check_symbols(syms, cur, ctx, fn_arg_symbols(args[[i]]))
+      self_comparisons(args[[i]])
+      input_read <<- union(input_read, syms[syms %in% as.character(cols)])
+      if (nzchar(nms[[i]])) {
+        derive(ctx, nms[[i]], syms[syms %in% as.character(cur)])
+        # a column of the incoming frame given a new value: an overwrite (r-colmap lists it)
+        if (fn %in% c("mutate", "transmute") && nms[[i]] %in% as.character(cols) && !is.null(args[[i]]) && !is.null(ctx$overwritten_now)) {
+          ctx$overwritten_now <- union(ctx$overwritten_now, nms[[i]])
+        }
+        # the same name assigned twice in one call: the second value wins
+        # silently, unless it reads the first (a deliberate two-step rewrite)
+        if (nms[[i]] %in% assigned && !(nms[[i]] %in% syms)) report_logic(ctx, nms[[i]],
+          sprintf("%s() assigns '%s' twice; the second value replaces the first silently (rename one of them, or make the second read the first)", fn, nms[[i]]))
+        assigned <- c(assigned, nms[[i]])
+        cur <- unique(c(cur, nms[[i]]))
+      }
     }
+    # a second summarise() rolls the groups up a level, which is what
+    # drop_last is for: no note there
+    if (fn %in% c("mutate", "transmute")) grouped_aggregate_note(fn, args[!dot_args])
+  }
+  # an aggregate or window function in a step on a frame whose grouping was
+  # left behind by summarise()'s default (.groups = "drop_last"), or by
+  # tally(), which does the same: the value is computed per group, which is
+  # as often meant as not, so this is said, not reported as a finding
+  grouped_aggregate_note <- function(fn, exprs) {
+    from <- attr(cols, "groups_from")
+    if (is.null(from) || !identical(from$how, "summarise_default") || !length(group_cols) || groups_unknown) return(invisible())
+    heads <- unique(unlist(lapply(exprs, call_heads)))
+    agg <- intersect(heads, aggregate_fns)
+    if (!length(agg)) return(invisible())
+    by_tally <- identical(from$verb, "tally")
+    left_by <- if (by_tally) sprintf("tally() on line %d (it drops only the last grouping column, as summarise() does)", from$line)
+      else sprintf("summarise() on line %d (.groups defaults to \"drop_last\")", from$line)
+    remedy <- if (by_tally) "ungroup() before this step" else "add .groups = \"drop\" to that summarise() or ungroup() before this step"
+    report_grouped(ctx, fn, sprintf(
+      "%s runs per group: the frame is still grouped by %s, left by %s, so %s() is computed within each group. If the whole-table value was meant, %s.",
+      ctx$step_call %||% paste0(fn, "()"), paste(group_cols, collapse = ", "), left_by, agg[[1L]], remedy))
+  }
+  # the same for the named arguments of a verb that are not sequential
+  derive_named <- function() for (nm in names(named)) {
+    syms <- masked_symbols(named[[nm]])
+    derive(ctx, nm, syms[syms %in% as.character(cols)])
   }
   # across()/pick() as an unnamed argument: the columns it adds to a frame
   # that keeps the rest (mutate), or the columns it keeps when nothing else
@@ -2366,7 +3392,12 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     if (is.null(sel)) return(NULL)
     bad <- check_symbols(sel, cols, ctx)
     if (length(bad)) return(NULL)
-    if (fn == "unnest_longer") return(with_groups(cols))
+    if (fn == "unnest_longer") {
+      vt <- if ("values_to" %in% nms) string_vector(args[["values_to"]], ctx) else sel
+      it <- if ("indices_to" %in% nms) string_vector(args[["indices_to"]], ctx) else character()
+      if (is.null(vt) || is.null(it)) return(NULL)
+      return(with_groups(unique(c(setdiff(as.character(cols), sel), vt, it))))
+    }
     if (fn == "hoist") {
       # hoist(series, first = "d", second = list("x", 1)): each field names a
       # column inside the list-column; a string field is checked against the
@@ -2432,6 +3463,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     remove <- args[["remove"]] %||% TRUE
     if (!isTRUE(remove) && !isFALSE(remove)) return(NULL)
     known <- as.character(cols)
+    derive(ctx, nm, sel)
     kept <- if (remove) setdiff(known, sel) else known
     # the new column sits where the first united one was
     return(with_groups(append(kept, nm, after = sum(match(kept, known) < min(match(sel, known))))))
@@ -2442,16 +3474,35 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     return(with_groups(v, if (groups_unknown) group_cols else v[match(group_cols, as.character(cols))]))
   }
   if (fn %in% c("rename_with", "rename_all")) {
-    # the renaming function must be one the checker can run: toupper, tolower
+    # the renaming function must be one the checker can run: toupper,
+    # tolower, janitor's make_clean_names
     f <- if (!is.null(args[[".fn"]])) args[[".fn"]] else if (!is.null(args[[".funs"]])) args[[".funs"]] else if (length(pos)) pos[[1L]] else NULL
-    f <- if (is.symbol(f) || (is.character(f) && length(f) == 1L)) as.character(f) else NULL
-    if (is.null(f) || !(f %in% c("toupper", "tolower"))) return(NULL)
+    f <- if (is.symbol(f) || (is.character(f) && length(f) == 1L)) as.character(f) else if (!is.na(ns_name(f))) ns_name(f) else NULL
+    if (is.null(f) || !(f %in% c("toupper", "tolower", "make_clean_names"))) return(NULL)
     sel_arg <- if (!is.null(args[[".cols"]])) args[[".cols"]] else if (fn == "rename_with" && length(pos) >= 2L) pos[[2L]] else NULL
     sel <- if (!is.null(sel_arg)) selection_names(list(sel_arg), ctx, cols) else if (!is_open(cols)) as.character(cols) else NULL
     if (is.null(sel) || length(check_symbols(sel, cols, ctx))) return(NULL)
     out <- as.character(cols)
-    out[match(sel, out)] <- if (f == "toupper") toupper(sel) else tolower(sel)
-    return(with_groups(out, if (groups_unknown) group_cols else out[match(group_cols, as.character(cols))]))
+    renamed <- if (f == "toupper") toupper(sel) else if (f == "tolower") tolower(sel) else clean_names_sim(sel)
+    if (is.null(renamed)) return(NULL)
+    out[match(sel, out)] <- renamed
+    for (i in seq_along(sel)) if (!identical(sel[[i]], renamed[[i]])) derive(ctx, renamed[[i]], sel[[i]])
+    res <- with_groups(out, if (groups_unknown) group_cols else out[match(group_cols, as.character(cols))])
+    if (isTRUE(attr(renamed, "open"))) attr(res, "open") <- TRUE
+    return(res)
+  }
+  if (fn == "clean_names") {
+    # janitor::clean_names(): snake_case names, which the checker computes
+    # for plain ASCII headers (see clean_names_sim); any other `case` is unknown
+    case <- if ("case" %in% nms) args[["case"]] else if (length(pos)) pos[[1L]] else "snake"
+    case <- string_vector(case, ctx)
+    if (!identical(case, "snake") || is_open(cols) || length(named[!(names(named) %in% c("case"))])) return(NULL)
+    out <- clean_names_sim(as.character(cols))
+    if (is.null(out)) return(NULL)
+    for (i in seq_along(out)) if (!identical(out[[i]], as.character(cols)[[i]])) derive(ctx, out[[i]], as.character(cols)[[i]])
+    res <- with_groups(out, if (groups_unknown) group_cols else out[match(group_cols, as.character(cols))])
+    if (isTRUE(attr(out, "open"))) attr(res, "open") <- TRUE
+    return(res)
   }
   if (fn %in% terminal_calls) {
     # deframe() reads its first two columns (names, values) without naming them
@@ -2475,10 +3526,18 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
                 "slice_sample", "drop_na", "fill", "relocate", "ungroup", "rowwise", "glimpse", "print",
                 "head", "tail", "collect", "compute", "as_tibble", "as.data.frame")) {
     check_all()
+    if (fn %in% c("filter", "slice", "slice_head", "slice_tail", "slice_min", "slice_max")) grouped_aggregate_note(fn, c(pos, named))
+    # ungroup(a) removes only the grouping columns it names; ungroup() all of them
+    if (fn == "ungroup" && length(pos)) {
+      s <- selection_names(pos, ctx, cols)
+      if (is.null(s) || groups_unknown) return(NULL)
+      return(with_groups(cols, setdiff(group_cols, s)))
+    }
     return(with_groups(cols, if (fn == "ungroup") character() else group_cols))
   }
   if (fn == "group_by") {
     check_all()
+    derive_named()
     g <- grouping_names(pos, ctx, cols)
     computed <- names(named)
     add <- isTRUE(args[[".add"]] %||% FALSE)
@@ -2487,14 +3546,37 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     # built from the groups (summarise, transmute, count) give up instead of
     # reporting every grouping column downstream as missing
     groups <- if (is.null(g) || (add && groups_unknown)) NA_character_ else unique(c(if (add) group_cols, g, computed))
-    return(with_groups(unique(c(cols, computed)), groups))
+    return(with_groups(unique(c(cols, computed)), groups, from = list(how = "group_by", line = ctx$line)))
   }
   if (fn %in% c("mutate", "transmute")) {
     check_sequential()
     if (fn == "mutate") {
       added <- island_added()
       if (is.null(added)) return(NULL)
-      return(with_groups(unique(c(cols, names(named), added))))
+      # mutate(x = NULL) removes x, unless a later argument makes x again (it
+      # is then a new column, at the end); .keep = "none" keeps the new
+      # columns and the groups, "used"/"unused" the input columns the
+      # expressions read or not
+      is_null <- vapply(named, is.null, TRUE)
+      nulls <- names(named)[is_null & !duplicated(names(named), fromLast = TRUE)]
+      new <- setdiff(names(named), nulls)
+      keep <- if (".keep" %in% nms) string_vector(args[[".keep"]], ctx) else "all"
+      if (!is.character(keep) || length(keep) != 1L || is.na(keep)) return(NULL)
+      read <- input_read
+      # an across()/pick() island reads its selection and, when it rewrites
+      # those columns in place (no new names), makes them anew: both count
+      # for .keep; a selection the checker cannot read leaves the set unknown
+      if (keep != "all") for (p in pos) {
+        sel <- if (is.symbol(p)) as.character(p) else if (is.call(p)) island_selection(p, ctx, cols) else NULL
+        if (is.null(sel)) return(NULL)
+        read <- union(read, sel)
+        if (is.symbol(p) || !length(across_names(p, ctx, cols))) new <- union(new, sel)
+      }
+      input <- setdiff(as.character(cols), names(named)[is_null])   # an overwritten column keeps its place
+      base_cols <- switch(keep, all = input, used = intersect(input, c(read, group_cols, new)), unused = setdiff(input, setdiff(read, c(group_cols, new))),
+                          none = intersect(input, c(group_cols, new)), return(NULL))
+      res <- with_groups(unique(c(base_cols, new, added)))
+      return(if (keep == "all") res else closed(res))
     }
     kept <- island_kept()
     if (is.null(kept) || groups_unknown) return(NULL)
@@ -2510,12 +3592,14 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     # column by default (.groups = "drop_last"), none for "drop", `.by` and
     # reframe(), all of them for "keep" and "rowwise"; a .groups the code
     # does not state literally leaves them unknown
+    by_default <- !(fn == "reframe" || ".by" %in% nms || ".groups" %in% nms)
     groups <- if (fn == "reframe" || ".by" %in% nms) character() else {
       how <- if (".groups" %in% nms) string_vector(args[[".groups"]], ctx) else "drop_last"
       if (!is.character(how) || length(how) != 1L || is.na(how)) how <- NA_character_
       switch(how, drop_last = head(group_cols, -1L), drop = character(), keep = , rowwise = group_cols, NA_character_)
     }
-    return(closed(with_groups(unique(c(by, kept, names(named))), groups)))
+    return(closed(with_groups(unique(c(by, kept, names(named))), groups,
+                              from = if (by_default) list(how = "summarise_default", line = ctx$line) else list(how = "summarise", line = ctx$line))))
   }
   if (fn == "select") {
     sel <- selection_names(c(pos, unname(named)), ctx, cols)
@@ -2524,35 +3608,81 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
       return(NULL)
     }
     check_symbols(sel, cols, ctx)
-    neg <- any(vapply(pos, function(p) is.call(p) && call_name(p) %in% c("-", "!"), TRUE))
-    renamed_from <- unlist(lapply(named, function(a) if (is.symbol(a) || is.character(a)) as.character(a) else NULL))
-    kept <- if (neg) setdiff(cols, sel) else c(names(named), sel[!(sel %in% renamed_from)])
-    return(if (neg) with_groups(unique(kept)) else closed(with_groups(unique(kept))))
+    # tidyselect's set algebra, left to right: a leading negation starts from
+    # every column, a positive argument adds, a negative one removes, and
+    # `new = old` renames; dplyr keeps the grouping columns whatever the selection
+    known <- as.character(cols)
+    first_neg <- length(args) && !dot_args[[1L]] && leading_neg(args[[1L]])
+    cur <- if (first_neg) known else character()
+    g <- group_cols
+    for (i in seq_along(args)) {
+      if (dot_args[[i]]) next
+      a <- args[[i]]
+      nm_i <- selection_names(list(a), ctx, cols)
+      if (is.null(nm_i)) return(NULL)
+      if (nzchar(nms[[i]])) {
+        # `new = old` renames: a grouping column too (the frame is then grouped
+        # by the new name), and it is lineage for r-colmap as rename() is
+        derive(ctx, nms[[i]], nm_i)
+        if (!groups_unknown) g[g %in% nm_i] <- nms[[i]]
+        cur <- unique(c(setdiff(cur, nm_i), nms[[i]]))
+        next
+      }
+      cur <- if (leading_neg(a)) setdiff(cur, nm_i) else unique(c(cur, nm_i))
+    }
+    if (groups_unknown) return(if (first_neg) with_groups(unique(cur)) else NULL)
+    kept <- unique(c(g, cur))
+    return(if (first_neg) with_groups(kept, g) else closed(with_groups(kept, g)))
   }
   if (fn == "rename") {
     old <- vapply(named, function(a) if (is.symbol(a) || is.character(a)) as.character(a) else NA_character_, "")
     if (anyNA(old) || !length(old)) return(NULL)
     check_symbols(old, cols, ctx)
-    return(with_groups(unique(c(setdiff(cols, old), names(named)))))
+    for (i in seq_along(old)) derive(ctx, names(named)[[i]], old[[i]])
+    g <- group_cols
+    if (!groups_unknown && length(g)) { hit <- g %in% old; g[hit] <- names(named)[match(g[hit], old)] }
+    # the new name takes the old one's place, so that a:b ranges and
+    # last_col() after it read as dplyr does; a name that is not a column
+    # (reported above) is appended under its new name, as before
+    out <- as.character(cols)
+    found <- old %in% out
+    out[match(old[found], out)] <- names(named)[found]
+    return(with_groups(unique(c(out, names(named)[!found])), g))
   }
   if (fn %in% c("count", "tally", "add_count")) {
     check_all()
     g <- selection_names(pos, ctx, cols)
     if (is.null(g)) return(NULL)
-    nm <- if (!is.null(args[["name"]])) string_arg(args[["name"]]) %||% "n" else "n"
     if (fn != "add_count" && groups_unknown) return(NULL)
+    nm <- if (!is.null(args[["name"]])) string_vector(args[["name"]], ctx) else {
+      # the default name is n, or nn, nnn, ... when that is taken: by any
+      # column of the frame for add_count(), by a grouping (counted) column
+      # for count() and tally(), as dplyr's n_name() has it
+      taken <- if (fn == "add_count") as.character(cols) else c(group_cols, g)
+      default <- "n"
+      while (default %in% taken) default <- paste0("n", default)
+      default
+    }
+    if (!is.character(nm) || length(nm) != 1L || is.na(nm)) return(NULL)
+    if (fn == "add_count") return(with_groups(unique(c(cols, nm))))
     # count() and add_count() keep the frame's groups; tally() is a
-    # summarise(), which drops the last one
-    return(if (fn == "add_count") with_groups(unique(c(cols, nm)))
-           else closed(with_groups(unique(c(group_cols, g, nm)), if (fn == "tally") head(group_cols, -1L) else group_cols)))
+    # summarise(), which drops the last one by default and leaves the rest
+    # behind, which a mutate()/filter() aggregate after it is told about
+    if (fn == "count") return(closed(with_groups(unique(c(group_cols, g, nm)))))
+    return(closed(with_groups(unique(c(group_cols, g, nm)), head(group_cols, -1L),
+                              from = list(how = "summarise_default", verb = "tally", line = ctx$line))))
   }
   if (fn == "distinct") {
     check_all()
+    derive_named()
     g <- selection_names(pos, ctx, cols)
     if (is.null(g)) return(NULL)
-    if (!length(g) || isTRUE(args[[".keep_all"]] %||% FALSE)) return(with_groups(cols))
+    # distinct(yr = year) computes a column and keeps it, as group_by() does;
+    # with .keep_all the rest stays too, and distinct() alone keeps everything
+    keep <- c(g, names(named))
+    if (!length(keep) || isTRUE(args[[".keep_all"]] %||% FALSE)) return(with_groups(unique(c(as.character(cols), names(named)))))
     if (groups_unknown) return(NULL)
-    return(closed(with_groups(unique(c(group_cols, g)))))
+    return(closed(with_groups(unique(c(group_cols, keep)))))
   }
   # nest(): the nested columns leave the frame and a list-column takes their
   # place. `nest(data = -id)`, `nest(data = c(a, b))`, several named
@@ -2596,6 +3726,7 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     vt <- if ("values_to" %in% nms) string_vector(args[["values_to"]], ctx) else "value"
     if (is.null(nt) || is.null(vt) || length(vt) != 1L) return(NULL)
     nt <- nt[!is.na(nt)]
+    for (nm in c(setdiff(nt, ".value"), vt)) derive(ctx, nm, gone)
     if (".value" %in% nt) {
       # names_to = c(".value", "set"), names_sep = "_": the pivoted columns'
       # names are split and the pieces at .value become the value columns;
@@ -2646,9 +3777,8 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     # not one of them)
     sfx <- if (!is.null(args[["suffix"]])) string_vector(args[["suffix"]], ctx) else c(".x", ".y")
     x_suffixed <- if (!is.null(keys) && length(sfx) == 2L) paste0(setdiff(as.character(cols), keys$x), sfx[[1L]]) else character()
-    ctx$joined_now <- list(source = attr(other, "source"), source_line = attr(other, "source_line"),
-                           source_file = attr(other, "source_file"),
-                           columns = as.character(other), keys = keys$y %||% character(),
+    ctx$joined_now <- list(source = attr(other, "source"), source_id = attr(other, "source_id"), source_line = attr(other, "source_line"),
+                           source_file = attr(other, "source_file"), columns = as.character(other), keys = keys$y %||% character(),
                            brought = setdiff(setdiff(as.character(joined), as.character(cols)), x_suffixed))
     return(joined)
   }
@@ -2660,20 +3790,46 @@ apply_verb_impl <- function(call, cols, ctx, piped) {
     return(NULL)
   }
   if (fn == "ggplot") {
-    for (a in c(pos, named)) if (is.call(a) && identical(call_name(a), "aes")) check_symbols(masked_symbols(a), cols, ctx, fn_arg_symbols(a))
+    for (a in c(pos, named)) if (is.call(a) && identical(call_name(a), "aes")) check_symbols(aes_symbols(a), cols, ctx, fn_arg_symbols(a))
     return(with_groups(cols))
   }
   NULL
 }
 
-# ggplot chains: ggplot(df, aes(...)) + layer(aes(...)) ...
+# The data argument of a ggplot() call, as an index into the call: the one
+# named `data`, else the first unnamed one (`ggplot(df, aes(...))` and
+# `ggplot(mapping = aes(...), data = df)` alike); NULL when there is none.
+ggplot_data_index <- function(call) {
+  nms <- names(call) %||% rep("", length(call))
+  if ("data" %in% nms) return(match("data", nms))
+  pos <- which(!nzchar(nms))[-1L]   # the head is unnamed too
+  if (length(pos)) pos[[1L]] else NULL
+}
+
+# ggplot chains: ggplot(df, aes(...)) + layer(aes(...)) ... Returns TRUE when
+# the `+` chain is a plot (handled here, whether or not its data is known),
+# FALSE when it is some other sum, which the caller walks itself.
 check_ggplot <- function(e, ctx) {
-  if (!is.call(e) || !identical(call_name(e), "+") || length(e) != 3L) return(invisible())
+  if (!is.call(e) || !identical(call_name(e), "+") || length(e) != 3L) return(invisible(FALSE))
   base <- e[[2L]]
   while (is.call(base) && identical(call_name(base), "+")) base <- base[[2L]]
-  if (!is.call(base) || !identical(call_name(base), "ggplot") || length(base) < 2L) return(invisible())
-  cols <- as_frame(frame_columns(base[[2L]], ctx, used = TRUE))
-  if (is.null(cols)) return(invisible())
+  # ggplot(df, aes(...)), or df %>% ... %>% ggplot(aes(...)): the frame is the
+  # data argument, or what the pipe brings (its steps are checked on the way)
+  data <- NULL
+  plot <- NULL
+  data_i <- NULL
+  if (is.call(base) && identical(call_name(base), "ggplot")) {
+    plot <- base
+    data_i <- ggplot_data_index(base)
+    if (!is.null(data_i)) data <- base[[data_i]]
+  } else if (is.call(base) && call_name(base) %in% c("%>%", "%<>%", "%T>%") && length(base) == 3L &&
+             is.call(base[[3L]]) && identical(call_name(base[[3L]]), "ggplot")) {
+    data <- base[[2L]]
+    plot <- base[[3L]]
+  }
+  if (is.null(plot)) return(invisible(FALSE))
+  cols <- if (is.null(data)) NULL else as_frame(frame_columns(data, ctx, used = TRUE))
+  if (is.null(cols)) return(invisible(TRUE))
   layers <- list()
   node <- e
   while (is.call(node) && identical(call_name(node), "+")) {
@@ -2681,20 +3837,29 @@ check_ggplot <- function(e, ctx) {
     node <- node[[2L]]
   }
   # the plot is a step that reads columns and keeps the frame as it is
-  shown <- base
-  if (length(shown) >= 2L && is.call(shown[[2L]])) shown[[2L]] <- as.name(".")
+  shown <- plot
+  if (identical(plot, base)) { if (is.call(shown[[data_i]])) shown[[data_i]] <- as.name(".") }
+  else shown <- as.call(c(list(as.name("ggplot"), as.name(".")), as.list(plot)[-1L]))
   saved_used <- ctx$used_now
   saved_step <- ctx$step_call
   ctx$used_now <- character()
   ctx$step_call <- one_line(shown)
-  for (l in c(list(base), layers)) {
+  for (l in c(list(plot), layers)) {
     if (!is.call(l)) next
-    for (a in as.list(l)[-1L]) if (is.call(a) && identical(call_name(a), "aes")) check_symbols(masked_symbols(a), cols, ctx, fn_arg_symbols(a))
+    for (a in as.list(l)[-1L]) if (is.call(a) && identical(call_name(a), "aes")) check_symbols(aes_symbols(a), cols, ctx, fn_arg_symbols(a))
   }
   record_step(ctx, shown, cols, before = cols, used = ctx$used_now)
   ctx$used_now <- saved_used
   ctx$step_call <- saved_step
-  invisible()
+  invisible(TRUE)
+}
+
+# The bare names an aes() reads from the data: ggplot's computed variables
+# (`..count..`, and what after_stat()/after_scale()/stage() compute) are
+# not columns.
+aes_symbols <- function(a) {
+  syms <- masked_symbols(a)
+  syms[!grepl("^[.][.].*[.][.]$", syms)]
 }
 
 # Verb calls the walker checks when they appear on their own.
@@ -2859,6 +4024,16 @@ walk_expr <- function(e, ctx) {
     saved_unknown <- ctx$unknown_frames
     saved_frames <- ctx$frames
     saved_strings <- ctx$strings
+    saved_in <- ctx$in_function
+    # restored however the body walk ends, so a checker error inside a body
+    # does not leave the file's scope as the function's
+    on.exit({
+      ctx$in_function <- saved_in
+      ctx$variables <- saved_vars
+      ctx$unknown_frames <- saved_unknown
+      ctx$frames <- saved_frames
+      ctx$strings <- saved_strings
+    }, add = TRUE)
     ctx$variables <- union(ctx$variables, params)
     ctx$unknown_frames <- union(ctx$unknown_frames, params)
     for (p in params) ctx$frames[[p]] <- NULL   # a parameter shadows a frame of the same name
@@ -2868,10 +4043,10 @@ walk_expr <- function(e, ctx) {
     # recorded, and nothing is reported against it. The data map lists it as
     # a source of its own, "parameter df of f()".
     if (!is.null(name)) for (p in params) if (param_used_as_frame(body, p)) {
-      ctx$frames[[p]] <- structure(character(), open = TRUE, source = sprintf("parameter %s of %s()", p, name))
+      ctx$frames[[p]] <- structure(character(), open = TRUE, source = sprintf("parameter %s of %s()", p, name),
+                                   source_id = sprintf("parameter:%s:%s", name, p))
       ctx$unknown_frames <- setdiff(ctx$unknown_frames, p)
     }
-    saved_in <- ctx$in_function
     ctx$in_function <- TRUE
     if (is.null(name)) walk_expr(body, ctx) else {
       # the frame a named function returns went to its callers: recorded as a
@@ -2886,11 +4061,6 @@ walk_expr <- function(e, ctx) {
                     fate_fn = name, line = last_line)
       }
     }
-    ctx$in_function <- saved_in
-    ctx$variables <- saved_vars
-    ctx$unknown_frames <- saved_unknown
-    ctx$frames <- saved_frames
-    ctx$strings <- saved_strings
     return(invisible())
   }
   # negative tests pass deliberately wrong frames: do not follow calls inside
@@ -2910,16 +4080,21 @@ walk_expr <- function(e, ctx) {
     frame_columns(e, ctx)
     return(invisible())
   }
+  # a `+` that is not a plot chain (`nrow(df %>% filter(x > 0)) + 1`,
+  # `df$a + df$b`) is walked like any other call, so the pipelines and the
+  # column accesses on either side of it are checked
   if (!is.na(fn) && fn == "+") {
-    check_ggplot(e, ctx)
+    if (!check_ggplot(e, ctx)) for (p in call_args(e)) if (is.call(p)) walk_expr(p, ctx)
     return(invisible())
   }
   if (!is.na(fn) && fn == "{") return(walk_block(e, ctx))
   if (!is.na(fn) && fn == "if" && length(e) >= 3L && walk_guarded_if(e, ctx)) return(invisible())
   if (!is.na(fn) && fn %in% c("if", "for", "while", "repeat")) return(walk_branches(e, fn, ctx))
+  if (!is.na(fn) && fn %in% c("tar_target", "tar_target_raw", "tar_file_read")) return(walk_tar_target(e, fn, ctx))
+  if (!is.na(fn) && fn %in% c("tar_load", "tar_load_raw")) { load_targets(e, ctx); return(invisible()) }
+  if (!is.na(fn) && fn %in% sink_calls && is.null(ctx$functions[[fn]])) frame_columns(e, ctx)
   if (!is.na(fn) && fn %in% c("$", "[[", "[", "setnames")) check_access(e, ctx)
   if (!is.na(fn) && !is.null(ctx$functions[[fn]])) check_call_args(e, fn, ctx)
-  if (!is.na(fn) && fn %in% sink_calls && is.null(ctx$functions[[fn]])) record_sink(e, fn, ctx)
   if (!is.na(fn) && (fn %in% verbs || !is.null(ctx$functions[[fn]]))) frame_columns(e, ctx)
   for (p in call_args(e)) if (is.call(p)) walk_expr(p, ctx)
   invisible()
@@ -2948,6 +4123,14 @@ walk_branches <- function(e, fn, ctx) {
   }
   # an if without else, a loop body: the block may have done nothing
   if (fn != "if" || length(bodies) < 2L) outcomes <- c(list(list(frames = before, unknown = before_unknown)), outcomes)
+  merge_outcomes(before, outcomes, ctx)
+  invisible()
+}
+
+# After two possible outcomes of a block, a frame has the columns both give
+# it when they agree, the union (an open set when one is) when they differ,
+# and is unknown when either outcome left it so.
+merge_outcomes <- function(before, outcomes, ctx) {
   a <- outcomes[[1L]]$frames
   b <- outcomes[[2L]]$frames
   merged <- list()
@@ -3107,9 +4290,15 @@ colcheck_file <- function(file, root = NULL) {
   ctx$src_lines <- quiet(readLines(file, warn = FALSE), character())
   ctx$line_cache <- list()
   ctx$line_end <- NA_integer_
-  ctx$stats <- list(checked = character(), partial = character(), skipped = character())
+  ctx$stats <- list(seen = list())
   ctx$steps <- list()
   ctx$follow_known <- logical()
+  ctx$sinks <- list()
+  ctx$targets <- list()
+  # what the result depends on besides the file (see "results cache")
+  ctx$deps <- normalizePath(c(file, file.path(ctx$root, c(".colcheck.json", file.path(".colcheck", "schemas.json"), "DESCRIPTION", "renv.lock", "_targets.R"))), mustWork = FALSE)
+  ctx$helpers <- NULL
+  ctx$sink_lookups <- list()
   ctx$pkg_name <- if (file.exists(file.path(ctx$root, "DESCRIPTION")))
     quiet(unname(read.dcf(file.path(ctx$root, "DESCRIPTION"), fields = "Package")[1L, 1L])) else NULL
   ctx$imports <- description_imports(ctx$root)
@@ -3118,7 +4307,7 @@ colcheck_file <- function(file, root = NULL) {
                        "desc", "n", "everything", "where", "across", "pi", "letters", "LETTERS",
                        "month.name", "month.abb", "self", "private")
   parsed <- tryCatch(suppressWarnings(parse_r_source(file)), error = function(err) err)
-  if (inherits(parsed, "error")) return(syntax_finding(file, parsed))
+  if (inherits(parsed, "error")) return(structure(syntax_finding(file, parsed), deps = ctx$deps))
   exprs <- parsed$exprs
   src <- attr(exprs, "srcref")
   # A chunk of a literate file that does not parse: said in its own finding;
@@ -3141,10 +4330,12 @@ colcheck_file <- function(file, root = NULL) {
   # (the same step reached from a parameter's open frame and from a caller's
   # known one is two steps: the source tells them apart)
   step_keys <- vapply(ctx$steps, function(s) paste(s$file, s$line, s$call, s$source, isTRUE(s$open_before)), "")
+  sink_keys <- vapply(ctx$sinks, function(s) paste(s$file, s$line, s$path), "")
+  seen <- unlist(ctx$stats$seen) %||% character()
   structure(c(ctx$findings, source_notes(ctx), error_findings(ctx)),
-            stats = list(checked = length(ctx$stats$checked), partial = length(ctx$stats$partial),
-                         skipped = length(ctx$stats$skipped)),
-            steps = ctx$steps[!duplicated(step_keys)])
+            stats = list(checked = sum(seen == "checked"), partial = sum(seen == "partial"), skipped = sum(seen == "skipped")),
+            steps = ctx$steps[!duplicated(step_keys)], sinks = ctx$sinks[!duplicated(sink_keys)], targets = ctx$targets,
+            deps = unique(ctx$deps), helpers = ctx$helpers, sink_lookups = ctx$sink_lookups)
 }
 
 # A file that does not parse: said in its own finding, on the line the parser
@@ -3167,7 +4358,8 @@ syntax_finding <- function(file, err, chunk = NULL) {
 }
 
 # Notes about data sources: frames the checker could not resolve that are
-# then piped into verbs, and cache entries older than 90 days.
+# then piped into verbs, and cache entries older than the configured age
+# (schema_ttl_days in .colcheck.json, 90 by default) that findings rest on.
 source_notes <- function(ctx) {
   notes <- list()
   note <- function(line, name, message, ...) {
@@ -3224,6 +4416,7 @@ source_notes <- function(ctx) {
   # Age is only worth mentioning when it could explain a finding: a column
   # reported against an old entry may be a column the data has since gained.
   cited <- unique(vapply(ctx$findings, function(f) f$source %||% "", ""))
+  cited <- cited[!is.na(cited)]   # a syntax finding carries NA
   for (key in names(ctx$stale)) {
     s <- ctx$stale[[key]]
     if (!any(startsWith(cited, sprintf("cached schema \"%s\"", key)))) next
@@ -3238,7 +4431,7 @@ source_notes <- function(ctx) {
 # (the call map, the session context and `discover` share this).
 # inst/doc holds built copies of the vignettes and *.Rcheck a copy of the
 # package: the same code twice.
-project_skip_dirs <- "/(renv|packrat|[.]git|node_modules|inst/doc|[^/]*[.]Rcheck)/"
+project_skip_dirs <- "/(renv|packrat|[.]git|node_modules|inst/doc|[^/]*[.]Rcheck|_targets|_freeze|_site|revdep|[.]Rproj[.]user)/"
 project_r_files <- function(root) {
   r <- list.files(root, pattern = "[.][Rr]$", recursive = TRUE, full.names = TRUE)
   m <- list.files(root, pattern = "[.](Rmd|rmd|Rmarkdown|qmd|Rnw|rnw)$", recursive = TRUE, full.names = TRUE)
@@ -3309,39 +4502,49 @@ discover_format <- function(d) {
 
 # Findings for FILES, with a "stats" attribute: pipeline steps checked
 # against known columns, steps skipped (columns unknowable), files read.
-colcheck_files <- function(files, root = NULL) {
+colcheck_files <- function(files, root = NULL, fresh = FALSE) {
   all <- list()
   steps <- list()
-  stats <- list(checked = 0L, partial = 0L, skipped = 0L, files = 0L, errors = 0L, unparsed = 0L)
+  sinks <- list()
+  stats <- list(checked = 0L, partial = 0L, skipped = 0L, files = 0L, errors = 0L, unparsed = 0L, cached = 0L)
   for (f in files) {
     if (!file.exists(f)) next
-    res <- tryCatch(colcheck_file(f, root), error = function(err) list(list(
+    res <- tryCatch(checked_file(f, root, fresh = fresh), error = function(err) list(list(
       kind = "error", file = f, line = 1L, name = NA_character_, source = NA_character_, columns = character(),
       message = sprintf("r-colcheck could not check this file at all (%s). This is a checker bug worth reporting.",
                         conditionMessage(err)))))
     st <- attr(res, "stats")
     all <- c(all, res)
     steps <- c(steps, attr(res, "steps"))
+    sinks <- c(sinks, attr(res, "sinks"))
     stats$files <- stats$files + 1L
+    if (isTRUE(attr(res, "from_cache"))) stats$cached <- stats$cached + 1L
     stats$checked <- stats$checked + (st$checked %||% 0L)
     stats$partial <- stats$partial + (st$partial %||% 0L)
     stats$skipped <- stats$skipped + (st$skipped %||% 0L)
     stats$errors <- stats$errors + sum(vapply(res, function(x) identical(x$kind, "error"), TRUE))
     stats$unparsed <- stats$unparsed + (st$unparsed %||% 0L)
   }
-  # The walker can visit a pipeline twice (assignment and its right-hand side).
-  keys <- vapply(all, function(x) paste(x$file, x$line, x$name, x$source), "")
-  structure(all[!duplicated(keys)], stats = stats, steps = steps)
+  cache_flush()
+  structure(dedup_findings(all), stats = stats, steps = steps, sinks = sinks)
+}
+
+# The walker can visit a pipeline twice (assignment and its right-hand side),
+# so a file's result can hold one finding more than once.
+dedup_findings <- function(findings) {
+  keys <- vapply(findings, function(x) paste(x$file, x$line, x$kind %||% "column", x$name, x$source,
+                                             if (identical(x$kind %||% "column", "column")) "" else x$message), "")
+  findings[!duplicated(keys)]
 }
 
 # One line per step for `--steps`: file:line, the call, the columns after it.
 steps_format <- function(steps, root = NULL) {
   vapply(steps, function(s) sprintf("%s:%s: %s => %s", relative_path(s$file, root), s$line, s$call,
-    if (!is.null(s$fate)) sprintf("%s %s(): %s", if (s$fate == "written") "written by" else "returned by", s$fate_fn,
-                                  paste(s$columns, collapse = ", "))
-    else if (is.null(s$columns)) "(unknown)" else paste0(
+    if (!is.null(s$fate)) sprintf("%s %s(): %s", if (s$fate == "written") "written by" else "returned by", s$fate_fn, paste(s$columns, collapse = ", "))
+    else if (isTRUE(s$terminal)) "(not a frame)" else if (is.null(s$columns)) "(unknown)" else paste0(
       if (isTRUE(s$listed)) "each: " else "", if (isTRUE(s$open)) "at least " else "", paste(s$columns, collapse = ", "),
-      if (length(s$groups)) sprintf(" [grouped by %s]", paste(s$groups, collapse = ", ")) else "")), "")
+      if (length(s$groups)) sprintf(" [grouped by %s]", paste(s$groups, collapse = ", ")) else "",
+      if (length(s$overwritten)) sprintf(" (%s overwritten)", paste(s$overwritten, collapse = ", ")) else "")), "")
 }
 
 relative_path <- function(file, root) {

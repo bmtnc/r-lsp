@@ -45,13 +45,12 @@ cat("The R language server starts on the first LSP call or .R/.Rmd edit. Answers
     "first open. Column-name and argument mistakes are checked after each change to an R file, through Edit, Write or a",
     "Bash command (r-colcheck); r-callmap --diff lists what a change touches and the tests to run, r-colmap the data sources",
     "and their columns.\n")
-if (subagent) {
-  cat("You are a subagent: the language server's diagnostics stay in the main conversation. Your check is the plugin's note",
+subagent_paragraph <- paste("You are a subagent: the language server's diagnostics stay in the main conversation. Your check is the plugin's note",
       "after each Edit, Write or Bash command that changes an R file (r-colcheck column and argument findings, parse errors,",
       "and the plugin's bug linters: undefined functions, non-exported pkg::fun, deprecated or superseded calls). Silence",
       "there means checked and clean. Prefer Edit/Write for R files; a change made through Bash is checked after the",
-      "command, up to 10 files, and the server does not see it.\n")
-}
+      "command, up to 10 files; the server re-reads changed files before its next answer.\n")
+if (subagent) cat(subagent_paragraph)
 # Diagnostics: which lintr config the server will use. A project or home
 # .lintr replaces the plugin's profile; say so, or a missing diagnostic reads
 # as a clean file.
@@ -60,8 +59,12 @@ lint_profile_off <- function() FALSE
 lintr_version_note <- function() NULL
 tryCatch(source(file.path(script_dir, "lint-config.R"), local = TRUE), error = function(e) NULL)
 cfg <- tryCatch(lint_config_file(root), error = function(e) NULL)
-if (lint_profile_off()) {
-  cat("Lint profile off (R_LSP_AGENT_LINTERS=false): after-edit diagnostics are lintr's defaults.\n")
+off <- lint_profile_off()
+if (off) {
+  # the cause travels as an attribute: the variable that is set, not a fixed one
+  reason <- attr(off, "reason")
+  cat(sprintf("Lint profile off (%s): after-edit diagnostics are lintr's defaults.\n",
+              if (is.null(reason)) "R_LSP_AGENT_LINTERS=false" else reason))
 } else if (!is.null(cfg)) {
   cat(sprintf(paste("Lint profile inactive: %s takes precedence in the language server, so LSP diagnostics are that",
                     "file's rules. The plugin's bug linters (undefined functions, non-exported pkg::fun, deprecated,",
@@ -84,8 +87,41 @@ cat(sprintf(paste("`r-callmap` prints a static call map of%s (what calls what, t
                   "`r-lint FILE` (the bug profile), `r-lsp-status`. The r-refactor, r-review and r-data skills give the order of",
                   "operations; the r-lsp skill is the reference.\n"),
             if (is.na(n_defs)) " the project's functions" else sprintf(" all %d functions", n_defs)))
+# The data side, from the cache r-colcheck keeps (a file's result holds while
+# everything it depended on is unchanged): one line when the cache covers
+# the project, since a cold build reads every file and the background
+# pre-warm (prewarm-index.R) does that for the next session.
+data_line <- if (have_callmap) tryCatch({
+  source(file.path(script_dir, "colmap-lib.R"), local = TRUE)
+  files <- normalizePath(c(found$r, found$rmd), mustWork = FALSE)
+  st <- cache_state(root)
+  cold <- sum(!vapply(files, function(f) { e <- st$entries[[f]]; !is.null(e) && entry_valid(e, st) }, TRUE))
+  map <- if (length(files) && cold <= 3L && cache_enabled()) quiet(colmap_build(root, files)) else NULL
+  srcs <- if (is.null(map)) list() else Filter(function(e) identical(e$kind %||% "data", "data"), map$sources)   # not the function parameters
+  if (!length(srcs)) NULL else {
+    n_read <- length(unique(unlist(lapply(srcs, `[[`, "files"))))
+    top <- vapply(srcs, `[[`, "", "key")[order(-vapply(srcs, function(x) length(x$files), 1L))]
+    sprintf(paste("Data: %d source%s read by %d file%s (%s%s), %d written by the code. `r-colmap` maps every column and where it is",
+                  "used, `r-colmap --diff` what a change touches, `r-colmap --at FILE:LINE` the columns at a line.\n"),
+            length(srcs), if (length(srcs) == 1L) "" else "s", n_read, if (n_read == 1L) "" else "s",
+            paste(head(top, 3L), collapse = ", "), if (length(top) > 3L) ", ..." else "", length(map$sinks))
+  }
+}, error = function(e) NULL) else NULL
+if (!is.null(data_line)) cat(data_line)
 text <- paste(out, collapse = "")
+subagent_json <- function(lines) {
+  jsonlite::toJSON(list(hookSpecificOutput = list(hookEventName = "SubagentStart", additionalContext = sub("\n$", "", paste(lines, collapse = "")))),
+                   auto_unbox = TRUE)
+}
 if (subagent) {
-  base::cat(jsonlite::toJSON(list(hookSpecificOutput = list(hookEventName = "SubagentStart", additionalContext = sub("\n$", "", text))),
-                             auto_unbox = TRUE), "\n")
-} else base::cat(text)
+  base::cat(subagent_json(out), "\n")
+} else {
+  base::cat(text)
+  # the same context, with the subagent paragraph after the first two lines,
+  # saved for this session's subagents (hooks/subagent-start.sh prints it)
+  sd <- Sys.getenv("R_LSP_HOOK_SESSION", "")
+  if (nzchar(sd) && dir.exists(sd)) {
+    sub_lines <- append(out, subagent_paragraph, after = min(2L, length(out)))
+    tryCatch(writeLines(as.character(subagent_json(sub_lines)), file.path(sd, "context-subagent.json")), error = function(e) NULL)
+  }
+}

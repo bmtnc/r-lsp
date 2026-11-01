@@ -18,8 +18,8 @@ usage <- function(status = 0) {
       "--diff lists the definitions the diff changed (new, arguments changed, body changed),\n",
       "the definitions it removed with where they are still mentioned, the top-level code it\n",
       "changed, then the callers and callees of the changed definitions and the tests that\n",
-      "reach them. Only functions defined in the project are listed. Exits 0; 2 when the root is\n",
-      "not a directory or has no R, Rmd or qmd file under it.\n", sep = "", file = if (status) stderr() else stdout())
+      "reach them. Only functions defined in the project are listed. Exits 0; 2 on an unknown option,\n",
+      "or when the root is not a directory or has no R, Rmd or qmd file under it.\n", sep = "", file = if (status) stderr() else stdout())
   quit(save = "no", status = status)
 }
 as_json <- FALSE
@@ -32,7 +32,7 @@ file <- NULL
 i <- 1L
 while (i <= length(args)) {
   a <- args[[i]]
-  if (a %in% c("-h", "--help")) usage()
+  if (a %in% c("-h", "--help") || (a == "help" && !length(names))) usage()   # `help` as the first name, as r-colcheck takes it
   if (a == "--json") { as_json <- TRUE; i <- i + 1L; next }
   if (a == "--diff") {
     mode <- "diff"
@@ -45,13 +45,16 @@ while (i <= length(args)) {
     mode <- "file"; file <- args[[i + 1L]]; i <- i + 2L; next
   }
   # The last --root wins, so the wrapper's default can be overridden.
-  if (a == "--root" && i < length(args)) { root <- args[[i + 1L]]; i <- i + 2L; next }
-  if (a == "--depth" && i < length(args)) {
+  if (a %in% c("--root", "--depth") && i == length(args)) { cat("r-callmap: ", a, " needs a value\n", sep = "", file = stderr()); usage(2) }
+  if (a == "--root") { root <- args[[i + 1L]]; i <- i + 2L; next }
+  if (a == "--depth") {
     depth <- suppressWarnings(as.integer(args[[i + 1L]]))
     if (is.na(depth) || depth < 1L) depth <- 1L
     i <- i + 2L
     next
   }
+  # an unknown option is an error, never a function name that reads as "not defined"
+  if (startsWith(a, "-")) { cat("r-callmap: unknown option ", a, "\n", sep = "", file = stderr()); usage(2) }
   names <- c(names, a)
   i <- i + 1L
 }
@@ -76,6 +79,10 @@ if (mode == "diff") {
   ids <- attr(lines, "ids")
 } else if (mode == "file") {
   ids <- callmap_file_ids(map, file)
+  if (!length(ids)) {
+    # said whatever the mode, since JSON mode prints `[]` otherwise
+    message(sprintf("%s: %s", file, if (file.exists(file)) "no function is defined in that file (or it is not under the root)" else "no such file"))
+  }
   lines <- if (length(ids)) callmap_neighbourhood(map, unique(map$defs$label[ids]), depth)
     else c(callmap_header(map), "", sprintf("%s: no function is defined in that file (or it is not in the map).", file))
 } else if (length(names)) {
