@@ -144,7 +144,9 @@ r_files_under() {
     return 0
   fi
   # shellcheck disable=SC2046
-  q="$(find "$root" -maxdepth "$depth" $(prune_expr) -type f -name '*.qmd' -print 2>/dev/null | head -20)"
+  # the first two hundred Quarto files are inspected for an R chunk (a site or a
+  # book has many; one grep per file is cheap, an unbounded walk is not)
+  q="$(find "$root" -maxdepth "$depth" $(prune_expr) -type f -name '*.qmd' -print 2>/dev/null | head -200)"
   set +f
   [ -n "$q" ] || return 1
   printf '%s\n' "$q" | tr '\n' '\0' | xargs -0 grep -l -m1 -E '^[[:space:]]*(```+|~~~+)[[:space:]]*\{[[:space:]]*[rR]([ ,}]|$)' 2>/dev/null | grep -q .

@@ -607,7 +607,10 @@ def scenario_colcheck(s):
           f"verb steps unexpected:\n{vsteps}")
     tricky = subprocess.run([tool, "--root", root, os.path.join(root, "R", "tricky_ok.R")],
                             capture_output=True, text=True, timeout=120).stdout
-    tricky_findings = [l for l in tricky.splitlines() if "is not a column" in l or "no argument" in l]
+    # the certain kinds all stay silent on correct code: column and argument
+    # names, and the logic findings (a name assigned twice, a self-comparison)
+    tricky_findings = [l for l in tricky.splitlines()
+                       if "is not a column" in l or "no argument" in l or "compares the column with itself" in l or " twice" in l]
     check(not tricky_findings, f"r-colcheck flagged correct tricky code:\n{tricky}")
     check("'s5' is known up to purrr::map(~.x %>% select(all_of(unknown_cols)))" in tricky and "inside its lambda at select(all_of(unknown_cols))" in tricky
           and "'s7' is known up to" not in tricky, f"lambda notes unexpected:\n{tricky}")
@@ -2667,7 +2670,7 @@ def scenario_hooks_dormant(s):
     check("this command changed 1 R file (src/new.R)" in ctx, f"post-bash did not look again after a checkout in the first minute:\n{ctx}")
     os.remove(os.path.join(sdir, "r-project"))
     with open(os.path.join(sdir, "no-r-project"), "w") as f:
-        f.write(root)
+        f.write(os.path.realpath(root))   # the hooks key markers on the physical path (pwd -P): /var is a symlink on macOS
     check(not hook("post-bash.sh", tool_name="Bash", tool_input={"command": "git -C . checkout feature"}).strip()
           and not os.path.exists(os.path.join(sdir, "r-project")),
           "post-bash looked again within a minute of the last look for the same command")
@@ -2679,12 +2682,12 @@ def scenario_hooks_dormant(s):
     # so does one that can make the files the walk looks for (R CMD, a DESCRIPTION, an .Rproj, ln)
     os.remove(os.path.join(sdir, "r-project"))
     with open(os.path.join(sdir, "no-r-project"), "w") as f:
-        f.write(root)
+        f.write(os.path.realpath(root))   # the hooks key markers on the physical path (pwd -P): /var is a symlink on macOS
     hook("post-bash.sh", tool_name="Bash", tool_input={"command": "R CMD INSTALL ../pkg"})
     check(os.path.exists(os.path.join(sdir, "r-project")), "post-bash did not look again after `R CMD INSTALL`")
     os.remove(os.path.join(sdir, "r-project"))
     with open(os.path.join(sdir, "no-r-project"), "w") as f:
-        f.write(root)
+        f.write(os.path.realpath(root))   # the hooks key markers on the physical path (pwd -P): /var is a symlink on macOS
     old = time.time() - 120
     os.utime(os.path.join(sdir, "last-recheck"), (old, old))
     time.sleep(1.1)
@@ -2698,7 +2701,7 @@ def scenario_hooks_dormant(s):
     # only the command decides a second look, never the command's output
     os.remove(os.path.join(sdir, "r-project"))
     with open(os.path.join(sdir, "no-r-project"), "w") as f:
-        f.write(root)
+        f.write(os.path.realpath(root))   # the hooks key markers on the physical path (pwd -P): /var is a symlink on macOS
     os.utime(os.path.join(sdir, "last-recheck"), (old, old))
     chatty = hook("post-bash.sh", tool_name="Bash", tool_input={"command": "npm test"},
                   tool_response={"stdout": "Installed with curl; see src/new.R and renv; running Rscript later\n", "stderr": ""})
@@ -2714,7 +2717,7 @@ def scenario_hooks_dormant(s):
     check("src/new.R" in ctx or os.path.exists(os.path.join(sdir, "r-project")), f"a marker written for another root was trusted:\n{ctx}")
     # a stale memory is corrected by an edit of an R file
     with open(os.path.join(sdir, "no-r-project"), "w") as f:
-        f.write(root)
+        f.write(os.path.realpath(root))   # the hooks key markers on the physical path (pwd -P): /var is a symlink on macOS
     if os.path.exists(os.path.join(sdir, "r-project")):
         os.remove(os.path.join(sdir, "r-project"))
     ctx = hook_context(hook("post-edit.sh", tool_name="Edit", tool_input={"file_path": new_r}))
@@ -2782,13 +2785,13 @@ def scenario_hooks_dormant(s):
         f.write("---\ntitle: x\n---\n\n```{python}\nprint(1)\n```\n")
     os.remove(os.path.join(sdir, "r-project"))
     with open(os.path.join(sdir, "no-r-project"), "w") as f:
-        f.write(root)
+        f.write(os.path.realpath(root))   # the hooks key markers on the physical path (pwd -P): /var is a symlink on macOS
     out = run_hook(os.path.join(hooks, "post-edit.sh"), dict({"session_id": sid, "cwd": root}, tool_name="Edit", tool_input={"file_path": py_qmd}), env=fake_env)
     check(not out.strip() and os.path.exists(os.path.join(sdir, "no-r-project")) and not os.path.exists(ran),
           f"a .qmd without an R chunk woke the session or started R:\n{out}")
     os.remove(os.path.join(sdir, "no-r-project"))
     with open(os.path.join(sdir, "r-project"), "w") as f:
-        f.write(root)
+        f.write(os.path.realpath(root))   # the hooks key markers on the physical path (pwd -P): /var is a symlink on macOS
     # a Quarto project without R chunks is not an R project; one with an R chunk is
     qmd = os.path.join(s.scratch, "dormant_qmd")
     os.makedirs(qmd)
