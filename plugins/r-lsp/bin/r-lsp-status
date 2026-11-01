@@ -8,6 +8,16 @@
 # session's own when it can be told apart (the session id, or the server's
 # parent process being an ancestor of this shell), else every live one; a
 # project whose only server has exited is pointed out.
+case "${1:-}" in
+  -h|--help|help)
+    echo "usage: r-lsp-status [-n N]   the last N (default 8) index events of this project's R language server"
+    exit 0 ;;
+  -n) shift; lines="${1:-}"; shift ;;
+  "") lines="" ;;
+  *[!0-9]*) echo "r-lsp-status: unknown argument '$1' (usage: r-lsp-status [-n N])" >&2; exit 2 ;;
+  *) lines="$1"; shift ;;
+esac
+case "$lines" in ""|*[!0-9]*) lines=8 ;; esac
 shopt -s nullglob
 files=("${R_LSP_STATUS_FILE:-}")
 [ -n "${R_LSP_STATUS_FILE:-}" ] || files=("$HOME"/.claude/plugins/data/*/status.log)
@@ -24,8 +34,8 @@ if [ -z "$project" ]; then
   [ -n "$project" ] || project="$PWD"
 fi
 ancestors() {
-  local p=$$ pp i
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  local p=$$ pp
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
     pp="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
     case "$pp" in ''|0|1) break ;; esac
     printf '%s\n' "$pp"
@@ -76,7 +86,7 @@ for f in "${files[@]}"; do
     [ "${#show[@]}" -gt 1 ] && echo "${#show[@]} servers are running for this project (another session's, or a restart's); each one's events:"
   fi
   for p in "${show[@]}"; do
-    printf '%s\n' "$tagged" | awk -F'\t' -v p="$p" '$1 == p { sub(/^[^\t]*\t/, ""); print }' | tail -n "${1:-8}" | sed -e 's/ \[[^]]*\]//'
+    printf '%s\n' "$tagged" | awk -F'\t' -v p="$p" '$1 == p { sub(/^[^\t]*\t/, ""); print }' | tail -n "$lines" | sed -e 's/ \[[^]]*\]//'
   done
 done
 if [ "$found" = 0 ]; then

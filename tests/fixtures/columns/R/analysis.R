@@ -73,3 +73,4 @@ bad50 <- bind_rows(sales, unknown_frame) %>% select(region) %>% mutate(z = regoi
 bad51 <- sales %>% select(last_col()) %>% mutate(z = region)                                                         # bad
 bad52 <- sales %>% mutate(v = purrr::map_dbl(amuont, sd))                                                            # bad
 bad53 <- sales %>% mutate(z = sd)                                                                                    # bad
+bad54 <- sales %>% filter(year > 2019) %>% ggplot(aes(x = year, y = amount)) + geom_point(aes(colour = regionn))   # bad

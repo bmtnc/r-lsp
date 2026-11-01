@@ -17,7 +17,13 @@ if (!length(args) || any(args %in% c("-h", "--help", "help"))) { usage(); quit(s
 as_json <- "--json" %in% args
 args <- setdiff(args, "--json")
 root <- NULL
-if (length(args) >= 2L && args[[1L]] == "--root") { root <- args[[2L]]; args <- args[-(1:2)] }
+# --root DIR anywhere among the arguments (the last one wins)
+while (length(i <- which(args == "--root"))) {
+  i <- i[[length(i)]]
+  if (i == length(args)) { cat("r-lint: --root needs a directory\n", file = stderr()); usage(stderr()); quit(save = "no", status = 2) }
+  root <- args[[i + 1L]]
+  args <- args[-c(i, i + 1L)]
+}
 flags <- args[startsWith(args, "-")]
 missing <- args[!startsWith(args, "-") & !file.exists(args)]
 if (length(flags) || length(missing) || !length(args)) {
@@ -31,12 +37,14 @@ if (lint_profile_off()) {
   cat("r-lint: the profile is off (R_LSP_AGENT_LINTERS=false); nothing to run\n", file = stderr())
   quit(save = "no", status = 0)
 }
-root <- normalizePath(root %||% colcheck_root(args[[1L]]), mustWork = FALSE)
+given_root <- if (is.null(root)) NULL else normalizePath(root, mustWork = FALSE)
 lines <- character()
 failures <- character()
 parse_errors <- 0L
 for (f in args) {
   f <- normalizePath(f, mustWork = FALSE)
+  # each file against its own project (its renv library, its paths), as r-colcheck does, unless --root says otherwise
+  root <- given_root %||% normalizePath(colcheck_root(f), mustWork = FALSE)
   # a file that does not parse: the parser's message, as the hooks give it
   perr <- tryCatch({ parse(f, keep.source = TRUE); NULL }, error = function(e) conditionMessage(e))
   if (!is.null(perr)) {

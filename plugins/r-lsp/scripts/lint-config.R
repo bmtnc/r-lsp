@@ -25,14 +25,24 @@ lint_config_file <- function(path) {
   if (length(hit)) hit[[1L]] else NULL
 }
 
-lint_profile_off <- function() identical(Sys.getenv("R_LSP_AGENT_LINTERS", "true"), "false")
+# Off when R_LSP_AGENT_LINTERS says so (false, 0, no, off, in any case: the
+# spellings R_LSP_HOOKS takes), or when the shell that started Claude Code
+# had R_USER_CONFIG_DIR set to another directory: the wrapper then leaves it
+# alone and lintr reads that directory's config, not the profile.
+lint_profile_off <- function() {
+  if (tolower(Sys.getenv("R_LSP_AGENT_LINTERS", "true")) %in% c("false", "0", "no", "off")) return(TRUE)
+  cfg <- Sys.getenv("R_USER_CONFIG_DIR", "")
+  plugin <- Sys.getenv("R_LSP_PLUGIN_ROOT", "")
+  if (!nzchar(cfg)) return(FALSE)
+  profile <- if (nzchar(plugin)) file.path(plugin, "lintr", "user-config") else file.path(dirname(script_dir), "lintr", "user-config")
+  !identical(normalizePath(cfg, mustWork = FALSE), normalizePath(profile, mustWork = FALSE))
+}
 
-# The profile is written against lintr 3.2.0 (Linter(linter_level =)); on an
-# older lintr it runs in a compatibility mode. Said once so a missing
-# diagnostic is not mistaken for a clean file.
+# The profile is written against lintr 3.2.0 (Linter(linter_level =)); an
+# older lintr runs the same checks, registered without a level. Said once.
 lintr_version_note <- function() {
   v <- tryCatch(utils::packageVersion("lintr"), error = function(e) NULL)
   if (is.null(v) || v >= "3.2.0") return(NULL)
-  sprintf(paste("lintr %s is older than 3.2.0: the diagnostics profile runs in a compatibility mode;",
-                "upgrade with Rscript --vanilla -e 'install.packages(\"lintr\")'"), v)
+  sprintf(paste("lintr %s is older than the 3.2.0 the diagnostics profile is written for; the same checks run.",
+                "Upgrade when you can: Rscript --vanilla -e 'install.packages(\"lintr\")'"), v)
 }

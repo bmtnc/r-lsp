@@ -28,14 +28,17 @@
 # them top to bottom, so a function defined in a chunk is private to its
 # document.
 #
-# Entry points: callmap_build(root) -> map; callmap_format(map),
-#               callmap_neighbourhood(map, names, depth), callmap_json(map, ids).
-# Helpers (call_name, call_args, quiet, local_names, relative_path, %||%) come
-# from colcheck-lib.R, sourced by the caller.
+# Entry points: callmap_build(root) -> map; callmap_format(map), callmap_header(map),
+#               callmap_neighbourhood(map, names, depth), callmap_json(map, ids),
+#               callmap_file_ids, callmap_tests, callmap_tests_view, test_command,
+#               callmap_diff(map, ref, depth), callmap_diff_json; git_changes(root, ref)
+#               and in_ranges() are also used by colmap-lib.R for r-colmap --diff.
+# Helpers (call_name, call_args, ns_name, quiet, local_names, relative_path,
+# parse_r_source, is_literate_file, literate_r_chunks, source_calls,
+# project_r_files, %||%) come from colcheck-lib.R, sourced by the caller first.
 
-# Same discovery as session-context.R, so the counts agree.
-callmap_skip_dirs <- "/(renv|packrat|[.]git|node_modules)/"
-
+# callmap_files() is project_r_files(): the same discovery as the column
+# checker, discover and the session context, so the counts agree.
 callmap_files <- function(root) project_r_files(root)
 
 # Base and recommended generics a project commonly writes methods for. A
@@ -248,7 +251,9 @@ scan_file <- function(path, rel, defs) {
   parsed <- tryCatch(parse_r_source(path), error = function(e) e)
   if (inherits(parsed, "error")) {
     msg <- strsplit(conditionMessage(parsed), "\n", fixed = TRUE)[[1L]]
-    return(list(rel = rel, error = paste("does not parse:", sub(paste0("^", path, ":"), "", msg[nzchar(msg)][1L] %||% "parse error"))))
+    first <- msg[nzchar(msg)][1L] %||% "parse error"
+    if (startsWith(first, paste0(path, ":"))) first <- substring(first, nchar(path) + 2L)   # the path is not a regex
+    return(list(rel = rel, error = paste("does not parse:", first)))
   }
   ex <- parsed$exprs
   srcrefs <- attr(ex, "srcref")
@@ -308,7 +313,7 @@ resolve_source <- function(s, file_rel, root) {
 
 # The line of the call: the first line of the statement that names it in
 # code (comments are stripped, so a comment naming the callee does not win).
-pin_line <- function(w, nm, l1, l2) {
+pin_edge_line <- function(w, nm, l1, l2) {
   if (is.na(l2) || l2 <= l1) return(l1)
   pat <- w$patterns[[nm]]
   if (is.null(pat)) {
@@ -324,7 +329,7 @@ pin_line <- function(w, nm, l1, l2) {
 add_edge <- function(w, to, kind, l1, l2, pin = to) {
   w$n <- w$n + 1L
   w$edges[[w$n]] <- list(from_def = w$owner_def, from = w$owner, file = w$file, to = to, kind = kind,
-                         line = pin_line(w, pin, l1, l2), bare = isTRUE(w$bare))
+                         line = pin_edge_line(w, pin, l1, l2), bare = isTRUE(w$bare))
 }
 
 is_project_fn <- function(w, nm) !is.na(nm) && nzchar(nm) && !is.null(w$names[[nm]])
@@ -532,7 +537,7 @@ walk_node <- function(e, l1, l2, w) {
 walk_target <- function(e, fn, l1, l2, w) {
   name <- arg_name(e[[2L]])
   hit <- if (!is.na(l2) && l2 > l1) grep(paste0(rx_escape(fn), "\\(\\s*[\"']?", rx_escape(name), "[\"']?\\s*[,)]"), w$code[l1:l2]) else integer()
-  line <- if (length(hit)) l1 + hit[[1L]] - 1L else pin_line(w, name, l1, l2)
+  line <- if (length(hit)) l1 + hit[[1L]] - 1L else pin_edge_line(w, name, l1, l2)
   id <- add_def(w$defs, name, paste("target", name), w$file, line, "", "target", end = l2)
   saved <- list(w$owner, w$owner_def, w$in_target)
   w$owner <- paste("target", name)
@@ -662,6 +667,17 @@ callmap_build <- function(root) {
   map <- list(root = root, pkg = pkg, is_pkg = is_pkg, files = files, skipped = skipped,
               rmd = vapply(found$rmd, relative_path, "", root = root, USE.NAMES = FALSE),
               n_files = length(paths))
+  # a target inside list(tar_target(a, ...), tar_target(b, ...)) spans to the
+  # line before the next target, not to the end of the list
+  tkind <- vapply(defs$rows, `[[`, "", "kind")
+  for (f in unique(vapply(defs$rows[tkind == "target"], `[[`, "", "file"))) {
+    ids <- which(tkind == "target" & vapply(defs$rows, `[[`, "", "file") == f)
+    ids <- ids[order(vapply(defs$rows[ids], `[[`, 1L, "line"))]
+    for (j in seq_along(ids)[-length(ids)]) {
+      nxt <- defs$rows[[ids[[j + 1L]]]]$line
+      if (defs$rows[[ids[[j]]]]$end >= nxt) defs$rows[[ids[[j]]]]$end <- max(defs$rows[[ids[[j]]]]$line, nxt - 1L)
+    }
+  }
   map$defs <- finish_defs(defs$rows, ns, unique(unlist(lapply(files, `[[`, "classes"))), do.call(c, c(list(), lapply(files, `[[`, "s3reg"))))
   script <- stats::setNames(vapply(files, `[[`, TRUE, "script"), vapply(files, `[[`, "", "rel"))
   map$defs$private <- !startsWith(map$defs$file, "R/") & script[map$defs$file] %in% TRUE
@@ -1205,7 +1221,8 @@ git_changes <- function(root, ref = NULL) {
       # a pure deletion sits after line `start` of the new file: it touches a
       # definition spanning that line, but names no top-level code (what was
       # removed is only in the old file, whose definitions are read apart)
-      files[[cur]]$ranges[[length(files[[cur]]$ranges) + 1L]] <- c(max(start, 1L), max(start + n - 1L, start, 1L), as.integer(n == 0L))
+      # a pure deletion above the first line has new-side position 0: kept as 0, so it touches nothing
+      files[[cur]]$ranges[[length(files[[cur]]$ranges) + 1L]] <- if (n == 0L) c(start, start, 1L) else c(max(start, 1L), max(start + n - 1L, start, 1L), 0L)
     }
   }
   untracked <- git("-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "--", shQuote(pats))
@@ -1238,15 +1255,17 @@ in_ranges <- function(a, b, ranges) any(vapply(ranges, function(r) {
 }, TRUE))
 
 # Lines in a file (outside every definition) that mention a name.
+# Lines in any file (code and comments alike) that mention a name, the
+# first `limit` of them.
 mention_sites <- function(map, name, limit = 12L) {
-  pat <- paste0("(^|[^A-Za-z0-9._])", gsub("([][{}()+*^$|\\\\?.])", "\\\\\\1", name), "($|[^A-Za-z0-9._])")
+  pat <- paste0("(^|[^A-Za-z0-9._])", rx_escape(name), "($|[^A-Za-z0-9._])")
   out <- character()
   for (f in map$files) {
     hit <- grep(pat, f$lines)
     if (length(hit)) out <- c(out, sprintf("%s:%d", f$rel, hit))
     if (length(out) >= limit) break
   }
-  out
+  head(out, limit)
 }
 
 # What the working tree's diff against REF touches: the definitions whose
@@ -1295,6 +1314,11 @@ callmap_diff <- function(map, ref = NULL, depth = 2L) {
     text <- map$files[[match(ch$path, vapply(map$files, `[[`, "", "rel"))]]$lines
     free <- unlist(lapply(Filter(function(r) r[[3L]] == 0L, ch$ranges), function(r) seq.int(r[[1L]], min(r[[2L]], length(text)))))
     free <- setdiff(free, covered)
+    # the prose of an Rmd/qmd file is not code: only its chunks' lines count
+    if (is_literate_file(ch$path)) {
+      body <- unlist(lapply(literate_r_chunks(text), function(c0) if (c0$end >= c0$start) seq.int(c0$start, c0$end) else integer()))
+      free <- intersect(free, body)
+    }
     # blank and comment lines are not code
     free <- free[grepl("[^[:space:]]", text[free]) & !grepl("^[[:space:]]*#", text[free])]
     if (length(free)) {

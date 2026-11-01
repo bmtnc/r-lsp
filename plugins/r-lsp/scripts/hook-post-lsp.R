@@ -188,7 +188,8 @@ project_files <- function() {
   } else {
     f <- list.files(root, pattern = pat, recursive = TRUE, full.names = TRUE, all.files = FALSE)
   }
-  f[!grepl("/(renv|packrat|[.]git|node_modules|[.]Rproj[.]user)/", f) & file.exists(f)]
+  # library, check and build output left out, as hooks/hook-lib.sh and colcheck-lib.R's project_skip_dirs do
+  f[!grepl("/(renv|packrat|[.]git|node_modules|[.]Rproj[.]user|inst/doc|[^/]*[.]Rcheck|_targets|_freeze|_site|revdep)/", f) & file.exists(f)]
 }
 
 # The (file, line) pairs the server's answer names. Claude Code prints the

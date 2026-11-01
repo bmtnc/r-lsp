@@ -235,6 +235,19 @@ local({
     start
   }
 
+  # Every name base R and the default packages define: what is in scope in
+  # any R process, whichever process runs the profile (the server's lint
+  # worker, or an Rscript whose global environment holds the plugin's own
+  # helpers).
+  default_names <- function() {
+    hit <- get0("default_names", envir = cache, inherits = FALSE)
+    if (!is.null(hit)) return(hit)
+    nms <- unique(c(ls(baseenv(), all.names = TRUE), unlist(lapply(c("stats", "utils", "methods", "graphics", "grDevices", "datasets"),
+      function(p) tryCatch(getNamespaceExports(p), error = function(e) character())))))
+    assign("default_names", nms, envir = cache)
+    nms
+  }
+
   # Names assigned anywhere in the project's R code, so helpers defined in a
   # script that is not source()d here are not reported as undefined.
   # Returns NULL when the project is too large to scan.
@@ -248,8 +261,11 @@ local({
       recursive = TRUE, full.names = TRUE, all.files = TRUE), character())
     files <- files[!grepl("/(renv|packrat|\\.git|node_modules|\\.Rproj\\.user)/", files)]
     defs <- if (length(files) > 3000L) NULL else {
+      # `name <- ...`, `name <<- ...`, or `name = function(...)`: a named
+      # argument at the start of a line (`  na.rm = TRUE,`) and `a == b`
+      # are not definitions
       patterns <- c(
-        "^\\s*`?([A-Za-z.][A-Za-z0-9._]*)`?\\s*(<<?-|=)",
+        "^\\s*`?([A-Za-z.][A-Za-z0-9._]*)`?\\s*(<<?-|=\\s*(\\\\|function)\\s*\\()",
         "assign\\(\\s*[\"']([A-Za-z.][A-Za-z0-9._]*)[\"']"
       )
       unique(unlist(lapply(files, function(f) {
@@ -490,8 +506,7 @@ local({
     }
     top_names <- xml2::xml_text(top)
     is_undefined <- function(fun) {
-      !(fun %in% in_file) && !(fun %in% ctx$known) && !(fun %in% defs) &&
-        !exists(fun, envir = globalenv())
+      !(fun %in% in_file) && !(fun %in% ctx$known) && !(fun %in% defs) && !(fun %in% default_names())
     }
     unique_names <- unique(top_names)
     undefined_names <- unique_names[vapply(unique_names, is_undefined, logical(1L))]

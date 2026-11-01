@@ -5,6 +5,12 @@
 root <- normalizePath(commandArgs(TRUE)[1], mustWork = FALSE)
 quit_quietly <- function() quit(save = "no", status = 0)
 if (!dir.exists(root) || !requireNamespace("languageserver", quietly = TRUE)) quit_quietly()
+# A cache that exists is the server's to keep current (it reloads entries
+# whose size and mtime still match and re-parses the rest): re-indexing
+# everything here would compete with it for up to two minutes.
+cache <- tryCatch(file.path(tools::R_user_dir("languageserver", "cache"), "workspace-index",
+                            paste0(digest::digest(root, algo = "xxhash64"), ".rds")), error = function(e) "")
+if (nzchar(cache) && file.exists(cache)) quit_quietly()
 tryCatch({
   ns <- asNamespace("languageserver")
   idx <- ns$WorkspaceIndex$new(root)

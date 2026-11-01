@@ -30,16 +30,24 @@ hook_session_dir <- function(input) {
 }
 
 # "mtime:size<TAB>path": whole seconds, as `stat` prints them, so the shell
-# can compare; the size tells a rewrite within the same second apart.
-record_checked <- function(files, session_dir) {
+# can compare; the size tells a rewrite within the same second apart. The
+# Bash and Stop hooks pass the keys they found the files under (`stamps`),
+# so a file rewritten while the check ran is recorded as it was checked and
+# comes back at the next hook; the edit hook records the file as it is.
+record_checked <- function(files, session_dir, stamps = NULL) {
   if (is.null(session_dir) || !length(files)) return(invisible())
   files <- normalizePath(files, mustWork = FALSE)
-  info <- file.info(files)
-  m <- floor(as.numeric(info$mtime))
-  ok <- !is.na(m)
-  if (!any(ok)) return(invisible())
-  tryCatch(cat(sprintf("%.0f:%.0f\t%s", m[ok], info$size[ok], files[ok]), file = file.path(session_dir, "checked.tsv"), sep = "\n", append = TRUE),
-           error = function(e) NULL)
+  if (!is.null(stamps) && length(stamps) == length(files)) {
+    ok <- !is.na(stamps) & nzchar(stamps)
+    keys <- sprintf("%s\t%s", stamps[ok], files[ok])
+  } else {
+    info <- file.info(files)
+    m <- floor(as.numeric(info$mtime))
+    ok <- !is.na(m)
+    keys <- sprintf("%.0f:%.0f\t%s", m[ok], info$size[ok], files[ok])
+  }
+  if (!length(keys)) return(invisible())
+  tryCatch(cat(keys, file = file.path(session_dir, "checked.tsv"), sep = "\n", append = TRUE), error = function(e) NULL)
   invisible()
 }
 
@@ -89,7 +97,36 @@ lint_file <- function(file, root) {
 # the server will not report on (changed through Bash, or edited inside a
 # subagent, whose diagnostics stay in the main conversation). Returns the
 # note's lines (none when the file is clean) and whether anything was found.
-check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_subagent = FALSE) {
+# Said once per session (a marker in the session directory): the sentences
+# that explain how to read a finding, and the long remedy of a note about a
+# data source, which repeats on every edit of the file otherwise.
+once <- function(session_dir, what) {
+  if (is.null(session_dir)) return(TRUE)
+  marker <- file.path(session_dir, paste0("said-", gsub("[^A-Za-z0-9._-]", "_", what)))
+  if (file.exists(marker)) return(FALSE)
+  tryCatch(file.create(marker), error = function(e) NULL)
+  TRUE
+}
+
+# Column findings for one name, over several lines, as one line: a typo
+# repeated through a file is one mistake to fix.
+collapse_columns <- function(columns, root) {
+  by_name <- split(columns, vapply(columns, function(x) paste(x$name, x$source), ""))
+  lines <- character()
+  order_ <- vapply(by_name, function(g) min(vapply(g, function(x) x$line, 1L)), 1L)
+  for (g in by_name[order(order_)]) {
+    if (length(g) <= 2L) { lines <- c(lines, colcheck_format(g, root)); next }
+    x <- g[[1L]]
+    near <- x$nearest %||% character()
+    lines <- c(lines, sprintf("%s: '%s' is not a column at lines %s (%d times; data from %s%s)%s", relative_path(x$file, root), x$name,
+                              paste(sort(unique(vapply(g, function(y) y$line, 1L))), collapse = ", "), length(g), x$source,
+                              if (!is.null(x$via)) sprintf(", called from %s", x$via) else "",
+                              if (length(near)) sprintf("; did you mean %s?", paste(near, collapse = " or ")) else ""))
+  }
+  lines
+}
+
+check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_subagent = FALSE, session_dir = NULL) {
   lint <- match.arg(lint)
   # The file's own project, not the session's: a file in another repository
   # (opened after /add-dir, or edited by a subagent) or in a package nested
@@ -106,13 +143,15 @@ check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_sub
   run_lint <- !lint_profile_off() && (lint == "always" || (lint == "auto" && !is.null(lint_winner)))
   lints <- if (run_lint) lint_file(file, root) else list(lines = character(), failure = NULL)
 
-  if (!length(findings) && !length(lints$lines) && is.null(lints$failure)) return(list(lines = character(), any = FALSE))
+  if (!length(findings) && !length(lints$lines) && is.null(lints$failure)) return(list(lines = character(), any = FALSE, blocking = FALSE))
   kinds <- vapply(findings, function(x) x$kind %||% "column", "")
   columns <- findings[kinds == "column"]
   arguments <- findings[kinds == "argument"]
   notes <- findings[kinds == "note"]
   errors <- findings[kinds == "error"]
   syntax <- findings[kinds == "syntax"]
+  logic <- findings[kinds == "logic"]
+  grouped <- findings[kinds == "grouped"]
   from_cache <- any(vapply(columns, function(x) startsWith(x$source %||% "", "cached schema"), TRUE))
   parts <- if (length(findings)) sprintf("r-colcheck (this plugin) on %s:", basename(file)) else character()
   if (length(syntax)) {
@@ -122,10 +161,10 @@ check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_sub
   if (length(columns)) {
     parts <- c(parts,
       "Column names that cannot exist at that point in the pipeline, checked against the columns of the data the code reads:",
-      clip(colcheck_format(columns, root)),
-      if (from_cache)
+      clip(collapse_columns(columns, root)),
+      if (from_cache && once(session_dir, "stale-cache"))
         "If the data really has that column, the cached schema is stale: refresh it with `r-colcheck learn KEY 'EXPR'` (the key is named above). Otherwise, if another step adds the column, ignore this."
-      else
+      else if (!from_cache && once(session_dir, "column-finding"))
         "If the data really has that column (e.g. the file on disk is stale or another step adds it), ignore this.")
   }
   if (length(arguments)) {
@@ -133,11 +172,27 @@ check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_sub
       "Calls to functions defined in this project whose argument names do not match the definition (R only fails at run time, or partial-matches silently):",
       clip(colcheck_format(arguments, root)))
   }
+  if (length(logic)) {
+    parts <- c(parts, "Steps whose result cannot be what the code means (R runs them without a word):", clip(colcheck_format(logic, root)))
+  }
+  if (length(grouped)) {
+    parts <- c(parts,
+      "Steps that run per group because an earlier summarise() left the frame grouped (as often meant as not; nothing to do if the per-group value is the one wanted):",
+      clip(colcheck_format(grouped, root), 5))
+  }
   if (length(notes)) {
+    # the full note the first time a source or a stop is met in the session; one line after
+    note_lines <- vapply(notes, function(x) {
+      key <- x$key %||% paste(x$name, x$line)
+      if (once(session_dir, paste0("note-", key))) return(sprintf("%s:%s: %s", relative_path(x$file, root), x$line, x$message))
+      if (!is.null(x$command)) sprintf("%s:%s: '%s' from %s cannot be opened; nothing downstream is checked (%s)", relative_path(x$file, root), x$line, x$name, x$expr %||% "its source", x$command)
+      else sprintf("%s:%s: '%s' is known up to %s; nothing downstream is checked (said in full earlier this session)", relative_path(x$file, root), x$line, x$name, sub("^'[^']*' is known up to ([^,]*),.*$", "\\1", x$message))
+    }, "")
     parts <- c(parts,
       "Data sources the checker cannot open (nothing downstream of these is checked):",
-      clip(colcheck_format(notes, root), 5),
-      "Run the learn command once per dataset (--source names the file that defines the loader), or `r-colcheck discover` for every uncached source in the project and `r-colcheck learn --all` to learn them in one run; never from a hook.")
+      clip(note_lines, 5),
+      if (once(session_dir, "learn-advice"))
+        "Run the learn command once per dataset (--source names the file that defines the loader), or `r-colcheck discover` for every uncached source in the project and `r-colcheck learn --all` to learn them in one run; never from a hook.")
   }
   if (length(errors)) {
     parts <- c(parts,
@@ -154,28 +209,34 @@ check_r_file <- function(file, root, lint = c("auto", "always", "never"), in_sub
       sprintf("Diagnostics from the plugin's bug linters on %s (%s):", basename(file), why),
       if (length(lints$lines)) clip(lints$lines) else sprintf("the linters could not run: %s", lints$failure))
   }
-  list(lines = parts, any = TRUE)
+  # what is worth holding a turn for: a defect in the code (a parse error, a
+  # column or argument name, a lint), not a source the checker cannot open,
+  # a checker bug or a linter that could not run
+  list(lines = parts, any = TRUE, blocking = length(syntax) + length(columns) + length(arguments) + length(logic) + length(lints$lines) > 0L)
 }
 
 # Check several files within a time budget; the ones not reached are listed,
 # never passed over in silence (the caller records the ledger after the note
 # is out, so a hook killed by its timeout loses nothing).
-check_r_files <- function(files, root, lint, budget = 40) {
+check_r_files <- function(files, root, lint, budget = 40, session_dir = NULL) {
   started <- Sys.time()
   out <- character()
   any <- FALSE
+  blocking <- FALSE
   unchecked <- character()
   for (f in files) {
     if (as.numeric(Sys.time() - started, units = "secs") > budget) { unchecked <- c(unchecked, f); next }
-    r <- check_r_file(f, root, lint)
+    r <- check_r_file(f, root, lint, session_dir = session_dir)
     if (r$any) { any <- TRUE; out <- c(out, r$lines) }
+    if (isTRUE(r$blocking)) blocking <- TRUE
   }
   if (length(unchecked)) {
     out <- c(out, sprintf("Not checked (the hook's time ran out): %s. Run `r-colcheck FILE` and `r-lint FILE` on them yourself.",
                           paste(vapply(unchecked, relative_path, "", root = root), collapse = ", ")))
     any <- TRUE
+    blocking <- TRUE   # unchecked code may hold a defect
   }
-  list(lines = out, any = any)
+  list(lines = out, any = any, blocking = blocking)
 }
 
 hook_json <- function(text) {

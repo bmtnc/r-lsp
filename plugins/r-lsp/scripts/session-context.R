@@ -45,13 +45,12 @@ cat("The R language server starts on the first LSP call or .R/.Rmd edit. Answers
     "first open. Column-name and argument mistakes are checked after each change to an R file, through Edit, Write or a",
     "Bash command (r-colcheck); r-callmap --diff lists what a change touches and the tests to run, r-colmap the data sources",
     "and their columns.\n")
-if (subagent) {
-  cat("You are a subagent: the language server's diagnostics stay in the main conversation. Your check is the plugin's note",
+subagent_paragraph <- paste("You are a subagent: the language server's diagnostics stay in the main conversation. Your check is the plugin's note",
       "after each Edit, Write or Bash command that changes an R file (r-colcheck column and argument findings, parse errors,",
       "and the plugin's bug linters: undefined functions, non-exported pkg::fun, deprecated or superseded calls). Silence",
       "there means checked and clean. Prefer Edit/Write for R files; a change made through Bash is checked after the",
-      "command, up to 10 files, and the server does not see it.\n")
-}
+      "command, up to 10 files; the server re-reads changed files before its next answer.\n")
+if (subagent) cat(subagent_paragraph)
 # Diagnostics: which lintr config the server will use. A project or home
 # .lintr replaces the plugin's profile; say so, or a missing diagnostic reads
 # as a clean file.
@@ -85,7 +84,19 @@ cat(sprintf(paste("`r-callmap` prints a static call map of%s (what calls what, t
                   "operations; the r-lsp skill is the reference.\n"),
             if (is.na(n_defs)) " the project's functions" else sprintf(" all %d functions", n_defs)))
 text <- paste(out, collapse = "")
+subagent_json <- function(lines) {
+  jsonlite::toJSON(list(hookSpecificOutput = list(hookEventName = "SubagentStart", additionalContext = sub("\n$", "", paste(lines, collapse = "")))),
+                   auto_unbox = TRUE)
+}
 if (subagent) {
-  base::cat(jsonlite::toJSON(list(hookSpecificOutput = list(hookEventName = "SubagentStart", additionalContext = sub("\n$", "", text))),
-                             auto_unbox = TRUE), "\n")
-} else base::cat(text)
+  base::cat(subagent_json(out), "\n")
+} else {
+  base::cat(text)
+  # the same context, with the subagent paragraph after the first two lines,
+  # saved for this session's subagents (hooks/subagent-start.sh prints it)
+  sd <- Sys.getenv("R_LSP_HOOK_SESSION", "")
+  if (nzchar(sd) && dir.exists(sd)) {
+    sub_lines <- append(out, subagent_paragraph, after = min(2L, length(out)))
+    tryCatch(writeLines(as.character(subagent_json(sub_lines)), file.path(sd, "context-subagent.json")), error = function(e) NULL)
+  }
+}
