@@ -122,8 +122,11 @@ if (!is.null(lintr_note)) status(lintr_note)
 # replaces the profile, and the post-edit hook runs the bug linters instead.
 note_lint_config <- function(root) {
   tryCatch({
-    if (lint_profile_off()) {
-      status("lint profile off (R_LSP_AGENT_LINTERS=false): diagnostics use lintr's defaults")
+    off <- lint_profile_off()
+    if (isTRUE(off)) {
+      # the reason comes with the answer (the environment variable as set, or a
+      # foreign R_USER_CONFIG_DIR); the fixed text serves an older lint-config.R
+      status(sprintf("lint profile off (%s): diagnostics use lintr's defaults", attr(off, "reason") %||% "R_LSP_AGENT_LINTERS=false"))
     } else {
       cfg <- lint_config_file(root)
       if (!is.null(cfg)) status(sprintf("lint profile inactive: %s takes precedence; the post-edit hook runs the plugin's bug linters instead", cfg))

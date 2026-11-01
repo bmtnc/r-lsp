@@ -5,7 +5,7 @@ name: smoke-test
 # this repository has not changed. A scenario whose packages are missing is
 # a failure here (--no-skip), so a package that fails to install cannot turn
 # the run green. The hooks promise macOS (bash 3.2, BSD tools): the macOS
-# job runs the hook, checker and map scenarios.
+# job runs every scenario that does not start the server.
 on:
   push:
     branches: [main, develop]
@@ -66,10 +66,14 @@ jobs:
             any::testthat
             any::pkgload
 
-      - name: Hooks, checker and maps on macOS (bash 3.2, BSD tools)
+      # every scenario that does not start the language server: the hooks,
+      # the checker and its cache, the linters, the maps and the tools' arguments
+      - name: Hooks, checker, linters and maps on macOS (bash 3.2, BSD tools)
         run: |
           python3 tests/smoke_test.py --no-skip -k hooks_changes
           python3 tests/smoke_test.py --no-skip -k hooks_dormant
-          python3 tests/smoke_test.py --no-skip -k colcheck_flow
+          python3 tests/smoke_test.py --no-skip -k colcheck
+          python3 tests/smoke_test.py --no-skip -k results_cache
+          python3 tests/smoke_test.py --no-skip -k lint_fallback
           python3 tests/smoke_test.py --no-skip -k callmap
           python3 tests/smoke_test.py --no-skip -k colmap

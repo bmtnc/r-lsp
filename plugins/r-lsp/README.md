@@ -19,7 +19,7 @@ What Claude (and its subagents) get, with no setup beyond the install:
 | `r-lint FILE` | the bug profile by hand (exit 1 with findings or when a linter could not run, 2 on a bad argument) |
 | `r-lsp-status [-n N]` | the server's last index events |
 | Skills `r-lsp`, `r-refactor`, `r-review`, `r-data` | the reference, and the order of operations for a refactor, a review of a change, and code against data you cannot see |
-| In a directory without R code | nothing: one walk at the session start, remembered (for a day across sessions; the Bash and Stop hooks look again every ten minutes); `R_LSP_HOOKS=off` turns every hook off anywhere |
+| In a directory without R code | nothing: one walk per new session, remembered for the session (a resume, a compaction, a subagent and the monitor trust it, and for a day the directory's memory); the Bash and Stop hooks look again every ten minutes; `R_LSP_HOOKS=off` turns every hook off anywhere |
 
 ## Prerequisites
 

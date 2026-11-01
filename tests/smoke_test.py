@@ -2061,7 +2061,13 @@ def scenario_hooks(s):
     tag = os.path.realpath(root)
     proc = subprocess.Popen(["bash", monitor, data_dir], cwd=tag, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             text=True, start_new_session=True)
-    time.sleep(1.0)
+    # the monitor creates the log right before it starts tailing: wait for
+    # that, then a moment for tail to attach, instead of a fixed sleep a
+    # loaded runner can outlast
+    deadline = time.time() + 10
+    while not os.path.exists(os.path.join(data_dir, "status.log")) and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.5)
     with open(os.path.join(data_dir, "status.log"), "a") as f:
         f.write(f"12:00:00 [{tag}] R LSP: server started (pid 1, languageserver 0.3.20)\n"
                 f"12:00:01 [{tag}] R LSP: loaded 3 test/script files as documents\n"
@@ -2644,7 +2650,11 @@ def main():
     os.environ["CLAUDE_PLUGIN_DATA"] = os.path.join(scratch, "plugin-data")
     os.environ["CLAUDE_CODE_SESSION_ID"] = ""
     os.environ["R_USER_CACHE_DIR"] = os.path.join(scratch, "r-cache")
-    os.environ.pop("R_LSP_HOOKS", None)
+    # renv's shared cache and sandbox too: a developer's RENV_PATHS_ROOT would
+    # otherwise receive the renv scenarios' libraries
+    os.environ["RENV_PATHS_ROOT"] = os.path.join(scratch, "renv-root")
+    for v in ("RENV_PATHS_CACHE", "RENV_PATHS_SANDBOX", "RENV_PATHS_LIBRARY", "R_LSP_HOOKS"):
+        os.environ.pop(v, None)
     s = Scenario(scratch)
     failures = passed = skipped = ran = 0
     for scenario in SCENARIOS:
