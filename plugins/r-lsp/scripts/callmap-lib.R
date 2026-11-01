@@ -532,13 +532,36 @@ walk_node <- function(e, l1, l2, w) {
   invisible()
 }
 
+# The pseudo-definition `target name` of a tar_target(name, command) call,
+# pinned to the line of its own `tar_target(name`; its id.
+target_def <- function(e, fn, l1, l2, w) {
+  name <- arg_name(e[[2L]])
+  hit <- if (!is.na(l2) && l2 > l1) grep(paste0(rx_escape(fn), "\\(\\s*[\"']?", rx_escape(name), "[\"']?\\s*[,)]"), w$code[l1:l2]) else integer()
+  line <- if (length(hit)) l1 + hit[[1L]] - 1L else pin_edge_line(w, name, l1, l2)
+  add_def(w$defs, name, paste("target", name), w$file, line, "", "target", end = l2)
+}
+
+# The target pseudo-definitions of a scanned _targets.R, with no edges: the
+# pass walk_target() makes over the current file, for the old text of the
+# file in --diff, so an edited target compares against its old self.
+collect_targets <- function(f, defs) {
+  w <- new.env()
+  w$defs <- defs; w$file <- f$rel; w$code <- f$code; w$patterns <- new.env()
+  visit <- function(e, l1, l2) {
+    if (!is.call(e)) return(invisible())
+    fn <- call_name(e)
+    if (!is.na(fn) && grepl(callmap_target_calls, fn) && length(e) >= 3L && !is.na(arg_name(e[[2L]]))) target_def(e, fn, l1, l2, w)
+    for (p in call_args(e)) visit(p, l1, l2)
+  }
+  for (i in seq_along(f$exprs)) visit(f$exprs[[i]], f$srcrefs[[i]][[1L]], f$srcrefs[[i]][[3L]])
+  invisible()
+}
+
 # tar_target(name, command): a pseudo-definition `target name` that owns the
 # calls in its command, pinned to the line of its own `tar_target(name`.
 walk_target <- function(e, fn, l1, l2, w) {
   name <- arg_name(e[[2L]])
-  hit <- if (!is.na(l2) && l2 > l1) grep(paste0(rx_escape(fn), "\\(\\s*[\"']?", rx_escape(name), "[\"']?\\s*[,)]"), w$code[l1:l2]) else integer()
-  line <- if (length(hit)) l1 + hit[[1L]] - 1L else pin_edge_line(w, name, l1, l2)
-  id <- add_def(w$defs, name, paste("target", name), w$file, line, "", "target", end = l2)
+  id <- target_def(e, fn, l1, l2, w)
   saved <- list(w$owner, w$owner_def, w$in_target)
   w$owner <- paste("target", name)
   w$owner_def <- id
@@ -1244,6 +1267,10 @@ old_definitions <- function(root, prefix, base, old_path) {
   defs <- new_defs()
   f <- quiet(scan_file(tmp, old_path, defs))
   if (is.null(f) || !is.null(f$error)) return(NULL)
+  # Targets are definitions of pass 2 (walk_target), not of scan_file: without
+  # this pass over the old text every touched target read as [new] and a
+  # removed one was never listed as gone.
+  if (basename(old_path) == "_targets.R") quiet(collect_targets(f, defs))
   defs$rows
 }
 
@@ -1348,7 +1375,8 @@ callmap_diff <- function(map, ref = NULL, depth = 2L) {
     out <- c(out, "", "Definitions no longer in the project:")
     for (o in deleted) {
       sites <- mention_sites(map, o$name)
-      out <- c(out, sprintf("  %s(%s)   was %s:%d   %s", o$label, o$args, o$file, o$line,
+      # a target has no argument list, as def_signature() shows it
+      out <- c(out, sprintf("  %s   was %s:%d   %s", if (o$kind == "target") o$label else sprintf("%s(%s)", o$label, o$args), o$file, o$line,
                             if (length(sites)) paste0("still mentioned at: ", paste(sites, collapse = ", ")) else "no mention left"))
     }
   }

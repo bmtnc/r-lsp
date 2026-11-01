@@ -261,11 +261,15 @@ local({
       recursive = TRUE, full.names = TRUE, all.files = TRUE), character())
     files <- files[!grepl("/(renv|packrat|\\.git|node_modules|\\.Rproj\\.user)/", files)]
     defs <- if (length(files) > 3000L) NULL else {
-      # `name <- ...`, `name <<- ...`, or `name = function(...)`: a named
-      # argument at the start of a line (`  na.rm = TRUE,`) and `a == b`
-      # are not definitions
+      # `name <- ...` or `name <<- ...` wherever a line starts, whatever the
+      # value (`sq <- Vectorize(f)` defines sq as `sq <- function(x)` does),
+      # and `name = ...` only at column 1: a named argument sits inside a
+      # call, so it is indented (`  na.rm = TRUE,`, `  callback = function(x)
+      # x,`), while a top-level `sq = Vectorize(f)` is not. `a == b` is not a
+      # definition.
       patterns <- c(
-        "^\\s*`?([A-Za-z.][A-Za-z0-9._]*)`?\\s*(<<?-|=\\s*(\\\\|function)\\s*\\()",
+        "^\\s*`?([A-Za-z.][A-Za-z0-9._]*)`?\\s*<<?-",
+        "^`?([A-Za-z.][A-Za-z0-9._]*)`?\\s*=([^=]|$)",
         "assign\\(\\s*[\"']([A-Za-z.][A-Za-z0-9._]*)[\"']"
       )
       unique(unlist(lapply(files, function(f) {

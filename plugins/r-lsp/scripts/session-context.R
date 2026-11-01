@@ -59,8 +59,12 @@ lint_profile_off <- function() FALSE
 lintr_version_note <- function() NULL
 tryCatch(source(file.path(script_dir, "lint-config.R"), local = TRUE), error = function(e) NULL)
 cfg <- tryCatch(lint_config_file(root), error = function(e) NULL)
-if (lint_profile_off()) {
-  cat("Lint profile off (R_LSP_AGENT_LINTERS=false): after-edit diagnostics are lintr's defaults.\n")
+off <- lint_profile_off()
+if (off) {
+  # the cause travels as an attribute: the variable that is set, not a fixed one
+  reason <- attr(off, "reason")
+  cat(sprintf("Lint profile off (%s): after-edit diagnostics are lintr's defaults.\n",
+              if (is.null(reason)) "R_LSP_AGENT_LINTERS=false" else reason))
 } else if (!is.null(cfg)) {
   cat(sprintf(paste("Lint profile inactive: %s takes precedence in the language server, so LSP diagnostics are that",
                     "file's rules. The plugin's bug linters (undefined functions, non-exported pkg::fun, deprecated,",

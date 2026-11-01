@@ -160,6 +160,30 @@ load_package <- function() {
   pkg
 }
 
+# Where a --source file is: as given (absolute, or relative to the project
+# root, where bin/r-colcheck runs this script), else relative to where the
+# command was typed. NULL when neither exists.
+find_source <- function(f) {
+  if (file.exists(f)) return(f)
+  invoked <- Sys.getenv("R_LSP_INVOKE_DIR", "")
+  if (nzchar(invoked) && file.exists(file.path(invoked, f))) return(file.path(invoked, f))
+  NULL
+}
+
+# The form a --source path is recorded in: relative to the project root when
+# the file is inside it (the wrapper hands over an absolute path for a file
+# that exists where the command was typed), so a committed cache refreshes
+# in another checkout or after the project moves, as `learn --all` records
+# its sources; absolute only when the file is outside the root. A path that
+# does not exist stays as typed, and observe() reports it.
+recorded_source <- function(f) {
+  hit <- find_source(f)
+  if (is.null(hit)) return(f)
+  abs <- normalizePath(hit)
+  top <- paste0(normalizePath(root), "/")
+  if (startsWith(abs, top)) substring(abs, nchar(top) + 1L) else abs
+}
+
 # Evaluate one loader expression as `learn` does: in a fresh environment
 # under the package namespace (--load-all) or the global one, with the
 # --source files sourced first. Errors carry the stage that failed.
@@ -167,12 +191,10 @@ observe <- function(expr, sources = character(), load_all = FALSE) {
   env <- if (load_all) new.env(parent = asNamespace(load_package())) else new.env(parent = globalenv())
   invoked <- Sys.getenv("R_LSP_INVOKE_DIR", "")
   for (f in sources) {
-    # a path relative to where the command was typed, when it is not one
-    # relative to the project root (bin/r-colcheck changes to the root)
-    if (!file.exists(f) && nzchar(invoked) && file.exists(file.path(invoked, f))) f <- file.path(invoked, f)
-    if (!file.exists(f)) stop("--source file not found: ", f, " (looked under the project root ", root,
-                              if (nzchar(invoked)) paste0(" and ", invoked) else "", ")")
-    tryCatch(sys.source(f, envir = env), error = function(e) stop("sourcing ", f, " failed: ", conditionMessage(e)))
+    hit <- find_source(f)
+    if (is.null(hit)) stop("--source file not found: ", f, " (looked under the project root ", root,
+                           if (nzchar(invoked)) paste0(" and ", invoked) else "", ")")
+    tryCatch(sys.source(hit, envir = env), error = function(e) stop("sourcing ", hit, " failed: ", conditionMessage(e)))
   }
   parsed <- tryCatch(parse(text = expr, keep.source = FALSE), error = function(e) stop("cannot parse expression: ", conditionMessage(e)))
   if (!length(parsed)) stop("empty expression")
@@ -236,6 +258,8 @@ if (cmd == "learn") {
   if (length(positional) != 2L) die_usage("usage: r-colcheck learn KEY 'EXPR' [--source FILE.R ...] [--load-all]")
   key <- positional[[1L]]
   expr <- positional[[2L]]
+  # a source inside the project is recorded relative to the root, so the cache travels
+  sources <- vapply(sources, recorded_source, "", USE.NAMES = FALSE)
   d <- tryCatch(observe(expr, sources, load_all), error = function(e) die(conditionMessage(e)))
   loaded <- loaded_package
   s <- read_cache()

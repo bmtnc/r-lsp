@@ -8,16 +8,21 @@
 # session's own when it can be told apart (the session id, or the server's
 # parent process being an ancestor of this shell), else every live one; a
 # project whose only server has exited is pointed out.
+usage="usage: r-lsp-status [-n N]"
 case "${1:-}" in
   -h|--help|help)
-    echo "usage: r-lsp-status [-n N]   the last N (default 8) index events of this project's R language server"
+    echo "$usage   the last N (default 8) index events of this project's R language server"
     exit 0 ;;
-  -n) shift; count="${1:-}"; shift ;;
-  "") count="" ;;
-  *[!0-9]*) echo "r-lsp-status: unknown argument '$1' (usage: r-lsp-status [-n N])" >&2; exit 2 ;;
+  -n)
+    # a value that is not a number is a usage error, as a bare one is
+    case "${2:-}" in ""|*[!0-9]*) echo "r-lsp-status: -n needs a number ($usage)" >&2; exit 2 ;; esac
+    count="$2"; shift 2 ;;
+  "") count=8 ;;
+  *[!0-9]*) echo "r-lsp-status: unknown argument '$1' ($usage)" >&2; exit 2 ;;
   *) count="$1"; shift ;;
 esac
-case "$count" in ""|*[!0-9]*) count=8 ;; esac
+# anything left over is not an option this tool has
+if [ $# -gt 0 ]; then echo "r-lsp-status: unknown argument '$1' ($usage)" >&2; exit 2; fi
 shopt -s nullglob
 files=("${R_LSP_STATUS_FILE:-}")
 [ -n "${R_LSP_STATUS_FILE:-}" ] || files=("$HOME"/.claude/plugins/data/*/status.log)
