@@ -22,6 +22,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -259,6 +260,15 @@ def scenario_renv_old_purrr(s):
         n = line_of(src, text)
         check(any("purrr 0.3.5" in d["message"] for d in lines.get(n, [])),
               f"list_rbind() on line {n} not reported as missing from purrr 0.3.5", diags)
+    # r-lint, where the only purrr loaded is the project's own 0.3.5 (as in a
+    # server whose dependencies do not load purrr, languageserver 0.3.21 on):
+    # the newer copy is found on disk, and the message names it
+    lint = subprocess.run([os.path.join(REPO, "plugins", "r-lsp", "bin", "r-lint"), os.path.join(root, "R", "use.R")],
+                          capture_output=True, text=True, timeout=180).stdout
+    for text in ("stacked <- list_rbind", "purrr::list_rbind", "h <- function(xs) list_rbind"):
+        n = line_of(src, text)
+        check(any(line.startswith(f"R/use.R:{n}:") and "is not in purrr 0.3.5" in line for line in lint.splitlines()),
+              f"r-lint does not report list_rbind() on line {n} as missing from purrr 0.3.5:\n{lint}")
 
 
 def hook_timeouts():
@@ -407,10 +417,13 @@ def scenario_shared_scope(s):
     check("loaded 2 test/script files as documents, plus 1 Rmd/qmd" in log,
           "status log has no 'loaded ... test/script files ..., plus 1 Rmd/qmd' event")
     # On a languageserver whose discover() fills the file list later from a
-    # worker (git master), the server walks the tree itself with the index's
-    # rules; here discover() is synchronous, so the walk must not have run,
-    # and run by hand it must list what the index lists (R/ excepted).
-    check("walked" not in log, f"the fallback walk ran although the index had its file list:\n{log}")
+    # worker (0.3.21 on), the server walks the tree itself with the index's
+    # rules; up to 0.3.20 discover() is synchronous, so the walk must not
+    # have run; either way, run by hand it must list what the index lists
+    # (R/ excepted).
+    m = re.search(r"languageserver (\d+)\.(\d+)\.(\d+)", log)
+    if m and tuple(map(int, m.groups())) < (0, 3, 21):
+        check("walked" not in log, f"the fallback walk ran although the index had its file list:\n{log}")
     server_r = os.path.join(os.path.dirname(WRAPPER), "r-lsp-server.R")
     same = rscript(f"""
         ns <- asNamespace("languageserver")

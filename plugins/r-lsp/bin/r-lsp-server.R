@@ -141,7 +141,7 @@ index_busy <- function(self) {
   tryCatch({
     pm <- self$parse_task_manager
     if (is.function(pm$has_work) && isTRUE(pm$has_work())) return(TRUE)
-    # languageserver's git master (October 2026) discovers and parses in an
+    # languageserver 0.3.21 discovers and parses in an
     # index worker: its task manager, and the index's discovering and
     # worker_running flags, are NULL in 0.3.20 and read as "not busy".
     im <- self$index_task_manager
@@ -304,7 +304,7 @@ drain_index <- function(self) {
     busy <- FALSE
     pm <- self$parse_task_manager
     if (!is.function(pm$has_work)) break   # before 0.3.19 there is nothing to wait for
-    im <- self$index_task_manager          # git master's index worker; NULL in 0.3.20
+    im <- self$index_task_manager          # 0.3.21's index worker; NULL in 0.3.20
     if (!is.null(im) && is.function(im$check_tasks)) im$check_tasks()
     pm$check_tasks()
     pm$run_tasks()
@@ -320,6 +320,16 @@ drain_index <- function(self) {
     if (!is.null(im) && is.function(im$run_tasks)) {
       im$run_tasks()
       if (isTRUE(im$has_work())) busy <- TRUE
+    }
+    # 0.3.21 loads the workspace's documents from a queue, twenty per tick
+    # of the event loop: a hover on a function defined in a file still in
+    # the queue answered "no information"
+    queue <- self$.__enclos_env__$private$workspace_document_queue
+    if (is.function(self$process_workspace_documents) && !is.null(queue) && queue$size()) {
+      self$process_workspace_documents(max_documents = 50L, time_budget_ms = 200)
+      # what is left, and the parse tasks the loaded documents queued, run
+      # in the next round
+      busy <- TRUE
     }
     if (!busy || (proc.time()[[3L]] - t0) > index_wait_secs) break
     Sys.sleep(0.005)
@@ -482,7 +492,7 @@ load_literate_document <- function(self, workspace, uri) {
 }
 
 # The index's own walk, for a languageserver whose discover() returns before
-# the file list is filled (git master, October 2026, fills it later from a
+# the file list is filled (0.3.21 on fills it later from a
 # helper process): the same rules as WorkspaceIndex$discover (include and
 # exclude globs, size and count limits, entries that resolve outside the
 # root), minus the package's R/ files, which the server loads itself. On
@@ -536,7 +546,7 @@ tryCatch({
       idx <- workspace$index
       if (is.null(idx) || !isTRUE(idx$enabled)) return(invisible(NULL))
       if (!idx$files$size() || isTRUE(idx$discovering)) {
-        # the list is filled later by a worker (git master): walk it now
+        # the list is filled later by a worker (0.3.21 on): walk it now
         uris <- vapply(walk_index_files(idx, workspace$root), ns$path_to_uri, "", USE.NAMES = FALSE)
         status(sprintf("index has no file list after discovery (filled later by a worker): walked %s for test/script files myself, %d found",
                        workspace$root, length(uris)))
@@ -555,7 +565,7 @@ tryCatch({
       uris <- uris[uris %in% kept]
       lit_uris <- lit_uris[lit_uris %in% kept]
       for (uri in uris) {
-        # where an index worker exists (git master) it owns the summaries
+        # where an index worker exists (0.3.21 on) it owns the summaries
         if (is.null(idx$task_manager) && !idx$summaries$has(uri)) idx$update_path(ns$path_from_uri(uri))
         self$load_index_document(workspace, uri)
       }
@@ -690,15 +700,17 @@ refresh_changed_documents <- function(self) {
 # The stat of every document the server reads is taken as it is loaded.
 # The original must be a top-level object: R6 encloses a method in the
 # object's environment, whose parent chain ends in the namespace and the
-# global environment, so a local() capture is invisible to it.
+# global environment, so a local() capture is invisible to it. Arguments
+# past the two this patch reads are passed on as given (0.3.21 added
+# `reload`, and its workspace queue calls with it).
 tryCatch({
   orig_lid <- ns$LanguageServer$public_methods$load_index_document
   if (!is.function(orig_lid)) stop("no index-backed loader in this version")
-  ns$LanguageServer$set("public", "load_index_document", function(workspace, uri) {
+  ns$LanguageServer$set("public", "load_index_document", function(workspace, uri, ...) {
     f <- orig_lid
     environment(f) <- environment()
     stat <- file_stat(ns$path_from_uri(uri))
-    doc <- f(workspace, uri)
+    doc <- f(workspace, uri, ...)
     if (!is.null(doc) && !is.null(stat)) doc_stat[[uri]] <- stat
     invisible(doc)
   }, overwrite = TRUE)

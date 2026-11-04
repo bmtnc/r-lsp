@@ -89,8 +89,10 @@ local({
     memo(paste0("version:", pkg), function() {
       path <- pkg_path(pkg)
       if (is.na(path)) return(NA_character_)
-      quiet(read.dcf(file.path(path, "DESCRIPTION"), fields = "Version")[1L, 1L],
-        NA_character_)
+      # unnamed: read.dcf() names the field, and identical() against
+      # getNamespaceVersion() would never hold
+      unname(quiet(read.dcf(file.path(path, "DESCRIPTION"), fields = "Version")[1L, 1L],
+        NA_character_))
     })
   }
 
@@ -129,13 +131,37 @@ local({
     })
   }
 
-  # Exports of the copy of `pkg` loaded in this process, if that is a
-  # different version from the project's copy.
-  loaded_exports_if_different <- function(pkg) {
-    if (!isNamespaceLoaded(pkg)) return(character())
-    if (identical(as.character(getNamespaceVersion(pkg)), pkg_version(pkg))) return(character())
-    getNamespaceExports(pkg)
+  # A copy of `pkg` in a different version from the project's: the one
+  # loaded in this process if it differs, else the newest other copy on any
+  # library (the server's own, and the site and system libraries that renv's
+  # sandbox takes off the path), read from disk. Not only the loaded one:
+  # languageserver 0.3.21 no longer imports styler, so purrr is often not
+  # loaded at all. list(version, exports), or NULL.
+  other_copy <- function(pkg) {
+    memo(paste0("other:", pkg), function() {
+      mine <- pkg_version(pkg)
+      if (is.na(mine)) return(NULL)
+      if (isNamespaceLoaded(pkg)) {
+        v <- as.character(getNamespaceVersion(pkg))
+        # the project's own copy loaded tells nothing: look on disk
+        if (!identical(v, mine)) return(list(version = v, exports = getNamespaceExports(pkg)))
+      }
+      env_libs <- unlist(strsplit(Sys.getenv(c("R_LSP_SERVER_LIB", "R_LIBS", "R_LIBS_USER", "R_LIBS_SITE")), .Platform$path.sep, fixed = TRUE))
+      libs <- unique(c(.libPaths(), path.expand(env_libs[nzchar(env_libs)]), .Library.site, R.home("library")))
+      paths <- unique(normalizePath(file.path(libs, pkg)[dir.exists(file.path(libs, pkg))], mustWork = FALSE))
+      versions <- vapply(paths, function(p) quiet(read.dcf(file.path(p, "DESCRIPTION"), fields = "Version")[1L, 1L], NA_character_), "")
+      keep <- !is.na(versions) & versions != mine
+      if (!any(keep)) return(NULL)
+      paths <- paths[keep]
+      versions <- versions[keep]
+      best <- order(numeric_version(versions, strict = FALSE), decreasing = TRUE)[[1L]]
+      info <- quiet(readRDS(file.path(paths[[best]], "Meta", "nsInfo.rds")))
+      if (is.null(info)) return(NULL)
+      list(version = versions[[best]], exports = unlist(info$exports, use.names = FALSE))
+    })
   }
+
+  loaded_exports_if_different <- function(pkg) other_copy(pkg)$exports %||% character()
 
   # Packages attached along with `pkg`: its Depends, plus the `core` vector
   # that meta-packages built on the tidyverse template (tidyverse,
@@ -538,7 +564,7 @@ local({
       pkg <- other_version[[fun]]
       message <- if (is.null(pkg)) sprintf('could not find function "%s"', fun) else {
         sprintf("%s() is not in %s %s, the version installed for this project (it exists in %s %s).",
-          fun, pkg, pkg_version(pkg), pkg, as.character(getNamespaceVersion(pkg)))
+          fun, pkg, pkg_version(pkg), pkg, other_copy(pkg)$version)
       }
       lintr::xml_nodes_to_lints(node, source_expression = source_expression,
         lint_message = message, type = "warning")

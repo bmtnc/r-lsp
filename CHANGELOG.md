@@ -2,6 +2,10 @@
 
 One entry per release, newest first. The version is the one in `plugins/r-lsp/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`; each release is a commit whose subject starts with the version, tagged `vX.Y.Z` by the maintainer (a cloud session cannot push tags). The commit message carries the full account; this file carries the headline.
 
+## 1.10.1 (2026-11-04)
+
+languageserver 0.3.21 support. The server no longer crashes when 0.3.21 loads a workspace document (`load_index_document()` gained a `reload` argument the re-read patch did not pass on), answers wait for 0.3.21's queue of workspace documents too (a cold hover on a function defined in a file still queued came back empty), and the fallback walk of the index's files is expected where 0.3.21 fills the file list from a worker. The check for a function that only another version of an attached package has finds that version on disk when it is not loaded (0.3.21 no longer imports styler, so purrr often is not) and no longer takes the project's own loaded copy for another version (the version read from `DESCRIPTION` kept its field name, so the comparison never held); `r-lint` and the hooks now name the version that has the function too.
+
 ## 1.10.0 (2026-11-01)
 
 Dormant outside R projects, a results cache that makes every map and check cheap to ask again, an edit hook that says what a change broke in other files, a data map that knows lineage, what the code writes and what a diff touches, data followed across scripts and targets, logic findings, and the sweep's fixes.
