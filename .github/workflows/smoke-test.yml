@@ -5,7 +5,13 @@ name: smoke-test
 # this repository has not changed. A scenario whose packages are missing is
 # a failure here (--no-skip), so a package that fails to install cannot turn
 # the run green. The hooks promise macOS (bash 3.2, BSD tools): the macOS
-# job runs every scenario that does not start the server.
+# job runs every scenario that does not start the server, on a push, a pull
+# request and a manual run. It does not run on the weekly schedule: every
+# scenario it runs also runs on Ubuntu in the same run, nothing it covers
+# changes between releases of this repository, and a macOS runner is scarce
+# (the weekly run of 2026-11-16 was cancelled by GitHub after fifteen minutes
+# in the queue with no runner assigned, which turned the run red with the
+# Ubuntu job green and the code unchanged).
 on:
   push:
     branches: [main, develop]
@@ -48,6 +54,7 @@ jobs:
 
   smoke-test-macos:
     runs-on: macos-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
 
